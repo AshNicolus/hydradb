@@ -16,9 +16,9 @@ Do not test against a deployment you do not own. Run HydraDB locally instead
 
 - **The admin port has no authentication for `/livez`, `/readyz` and
   `/metrics`.** This is on purpose: health probes and metrics scrapers use
-  them. The admin server binds to `0.0.0.0:9090` by default. Put it behind a
-  network policy or a firewall (the Helm chart ships a `NetworkPolicy`), or set
-  `GRAPH_ADMIN_ADDR` to a loopback address.
+  them. The admin server binds to `0.0.0.0:9090` by default. Put the port
+  behind a network policy or a firewall. The Helm chart includes a
+  `NetworkPolicy`. You can also set `GRAPH_ADMIN_ADDR` to a loopback address.
 - **`GRAPH_ALLOW_PLAINTEXT=true` turns off TLS.** This setting exists for local
   development. Do not use it in a deployment that other people can reach.
 
