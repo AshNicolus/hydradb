@@ -29,13 +29,17 @@ jobs:
             const roster = JSON.parse(Buffer.from(got.data.content, 'base64').toString('utf8'));
             const maintainers = roster.maintainers || [];
             const vouched = roster.vouched || {};
+            // Anyone with write access (the backend team) counts as a maintainer.
+            const isTeam = async (login) => maintainers.includes(login) ||
+              ['admin', 'write'].includes(await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner, repo: context.repo.repo, username: login }).then(r => r.data.permission, () => 'none'));
 
-            if (!maintainers.includes(commenter)) {
+            if (!await isTeam(commenter)) {
               await react('-1');
               await reply(`@${commenter} only maintainers can \`/approved\` an issue.`);
               return;
             }
-            const isVouched = maintainers.includes(author) || Object.prototype.hasOwnProperty.call(vouched, author);
+            const isVouched = Object.prototype.hasOwnProperty.call(vouched, author) || await isTeam(author);
             if (!isVouched) {
               await react('-1');
               await reply(`This issue cannot be approved yet: its author @${author} has not been vouched. A maintainer must \`/vouch @${author}\` first (see CONTRIBUTING.md).`);

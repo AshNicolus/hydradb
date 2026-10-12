@@ -26,7 +26,7 @@ Being vouched means a maintainer is willing to shepherd your contributions.
 - Only maintainers vouch, by commenting `/vouch @your-github-handle` on an issue.
 - Each maintainer may vouch at most 5 people.
 - The roster is [`.github/vouched.json`](.github/vouched.json), recording who vouched whom.
-- Maintainers are implicitly vouched.
+- Maintainers are implicitly vouched. A maintainer is anyone in the roster's `maintainers` list or with write access to this repository.
 
 If you are not vouched yet, you can still open and discuss issues; you just need
 a vouch before an issue of yours can be `/approved`. Ask on Discord.
@@ -35,6 +35,7 @@ a vouch before an issue of yours can be `/approved`. Ask on Discord.
 
 - A linked `/approved` issue is required (`Closes #N`), or the PR is closed.
 - At most 3 open PRs per person. The newest over that is closed; get an earlier one merged or closed first (ask in `#pr-discussion` on Discord).
+- These two rules apply to PRs opened after 2026-10-08 and skip bot PRs. A maintainer can override them by reopening a closed PR, which adds the `gate-override` label.
 - Keep PRs small and scoped. Large or unrelated changes are asked to split.
 - Describe breaking changes explicitly.
 - Fill in the AI-assistance section of the PR template and do not remove it. You are responsible for every line you submit.
