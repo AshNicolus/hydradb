@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Email **security@hydradb.com**. Do not open a public issue for a
+Email **cloud@hydradb.com**. Do not open a public issue for a
 vulnerability.
 
 Include what you can: what you found, how to reproduce it, and what an attacker

@@ -19,7 +19,7 @@ with respect, whatever their background or level of experience.
 
 ## Reporting
 
-Report a problem to **conduct@hydradb.com**. Reports stay private. The
+Report a problem to **cloud@hydradb.com**. Reports stay private. The
 maintainers will review each one and respond.
 
 ## Scope
