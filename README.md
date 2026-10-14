@@ -356,8 +356,12 @@ paths, cache outcomes, consistency mode, scope, cell, storage sequence, and
 planner decisions. Build with `--features server-runtime,otlp` or
 `--features indexer-runtime,otlp` to export OpenTelemetry data.
 
-Prometheus duration histograms have deliberately different units. Check each
-metric's unit before building latency dashboards or alerts.
+Prometheus duration histograms have deliberately different units, and the name
+suffix is the only place the unit is stated: `/metrics` emits no `# HELP` text.
+Client operation latencies such as `graph_client_operation_read_duration_seconds`
+are in seconds; the bookmark-wait, query, mutation-batch, and query-transport
+histograms end in `_microseconds`. Check the suffix before building latency
+dashboards or alerts, and never sum, divide, or compare series across the two.
 
 ## Development
 
