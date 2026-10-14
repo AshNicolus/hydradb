@@ -2,7 +2,7 @@
 
 Contributions follow a gated flow to keep review load sustainable. Please read
 this before opening a pull request. Join us on
-[Discord](https://discord.gg/YPtwenvxY8): discussing a PR, getting it reviewed
+[Discord](https://discord.gg/HcBKJHXmnu): discussing a PR, getting it reviewed
 and merged, and getting an open PR closed all happen in the `#pr-discussion`
 channel.
 
