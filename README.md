@@ -466,6 +466,10 @@ documented above.
 |---|---|
 | [Architecture](architecture.md) | End-to-end design, snapshots, writer ownership, query execution, and indexing |
 | [Using HydraDB](USING-HYDRADB.md) | Getting started, querying, and operating HydraDB |
+| [OpenCypher subset](cypher-compat.md) | What the engine accepts today, and what it rejects at parse time |
+| [Helm chart guide](charts/hydradb/README.md) | Kubernetes configuration, TLS, authentication, upgrades, and verification |
+| [Agent notes](AGENTS.md) | How to build, run, and not trip over `RUST_MIN_STACK` |
+| [Development](DEVELOPMENT.md) | Verification recipes and local harnesses |
 
 ## Contributing
 
