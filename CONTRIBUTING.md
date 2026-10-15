@@ -19,7 +19,11 @@ open an issue  ->  issue /approved  ->  open a PR  ->  review & merge
 3. Open a PR. Link the approved issue with `Closes #123`.
 4. Keep the PR small. Change only what the issue asks for.
 
-If a PR does not link an approved issue, a bot closes it.
+Only the issue author or a person assigned to the issue can open the PR for it.
+To work on an issue that another person opened, comment on the issue. Ask a
+maintainer to assign it to you.
+
+If a PR does not link an approved issue that is yours, a bot closes it.
 
 A maintainer is a person in the `maintainers` list of
 [`.github/vouched.json`](.github/vouched.json), or a person with write access
@@ -27,7 +31,7 @@ to this repository.
 
 ## Pull request rules
 
-- Link an approved issue with `Closes #N`. If you do not, a bot closes the PR.
+- Link an approved issue with `Closes #N`. You must be the issue author or an assignee. If not, a bot closes the PR.
 - Keep a maximum of 3 open PRs. If you open more, a bot closes your newest PR. Get an earlier PR merged or closed first. To ask, post in `#pr-discussion` on Discord.
 - These two rules apply only to PRs opened after 2026-10-08. They do not apply to bot PRs. A maintainer can reopen a closed PR. The reopened PR gets the `gate-override` label, and the two rules do not apply to it.
 - Keep each PR small. If a PR is large or has unrelated changes, we ask you to split it.

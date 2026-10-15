@@ -46,4 +46,4 @@ jobs:
             }
             await github.rest.issues.addLabels({ owner: context.repo.owner, repo: context.repo.repo, issue_number, labels: [LABEL] });
             await react('+1');
-            await reply(`Approved by @${commenter}. @${author} may now open a PR that links this issue with \`Closes #${issue_number}\` (max 3 open PRs at a time).`);
+            await reply(`Approved by @${commenter}. @${author} or an assignee of this issue can now open a PR that links it with \`Closes #${issue_number}\` (max 3 open PRs at a time).`);
