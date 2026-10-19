@@ -14,7 +14,10 @@ use ulid::Ulid;
 
 use crate::{validate_component, GraphError, GraphScope, Result};
 
-const WRITER_LEASE_FORMAT: &str = "hydradb-writer-lease2";
+// This value identifies the durable lease wire format. It must remain stable
+// across the HydraDB rename so old and new nodes coordinate on the same lease.
+// This value is stored in S3 and must remain readable across the product rename.
+const WRITER_LEASE_FORMAT: &str = "turbolay-writer-lease2";
 const DEFAULT_WRITER_LEASE_DURATION: Duration = Duration::from_secs(30);
 const SERVER_TIMESTAMP_RESOLUTION_GUARD: Duration = Duration::from_secs(1);
 const MAX_WRITER_LEASE_CAS_ATTEMPTS: usize = 16;

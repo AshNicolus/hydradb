@@ -21,7 +21,7 @@
 //! - A DDSketch crate has a *non-fixed* bucket set, which is precisely what
 //!   neither Prometheus nor OTel explicit-bucket exposition can represent.
 //!
-//! So: 18 relaxed counters and a sum. The entire correctness surface is
+//! So: 21 relaxed counters and a sum. The entire correctness surface is
 //! [`AtomicDurationHistogram::bucket_index`] and one constant table.
 //!
 //! # What this buys, and what it does not
@@ -37,32 +37,56 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 // Only `record` names this, and `record` is gated; an ungated import would be
 // an `unused_imports` error under `-D warnings` with `default = []`.
-#[cfg(any(feature = "opencypher", test))]
 use std::time::Duration;
 
 /// Inclusive upper bounds, in microseconds.
 ///
 /// Prometheus `le` semantics: a value *equal* to a bound belongs to that
-/// bound's bucket. Three of these rungs are fixed by the code rather than by
-/// taste, and moving them silently breaks a cross-check:
+/// bound's bucket. Four of these rungs are fixed by the code and the deployed
+/// configuration rather than by taste, and moving them silently breaks a
+/// cross-check:
 ///
 /// - **500 ms** is [`crate::query::coordination`]'s `slow_query_log_threshold`
 ///   default. The cumulative count at this bound and the `slow_queries` counter
 ///   measure the same event, so they must be reconcilable.
 /// - **30 s** is both `DEFAULT_MAX_QUERY_RUNTIME_MS` and
-///   `DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS`. Above this bound means "timed out",
-///   which is what the overflow bucket should be saying.
+///   `DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS`, so it stays as the rung where a
+///   deployment left on the defaults reads its timeouts off.
+/// - **120 s** is the raised `GRAPH_MAX_QUERY_RUNTIME_MS` staging runs with. The
+///   top rung is **300 s** rather than 120 s so that the overflow bucket keeps
+///   meaning "past every budget anyone configures" instead of collapsing
+///   "timed out at 120 s" together with "took 45 s and succeeded" — and so
+///   `histogram_quantile` has somewhere above the budget to interpolate into
+///   rather than clamping p99 to the budget forever.
 /// - **100 µs** is the floor because nothing user-facing in an object-store
 ///   backed graph completes below it except a pure cache hit. Everything under
 ///   the floor lands in bucket 0, which is all the resolution that region
 ///   deserves.
 ///
-/// 17 finite bounds rather than a ~104-bucket quarter-octave ladder: in
+/// 20 finite bounds rather than a ~104-bucket quarter-octave ladder: in
 /// Prometheus each bound is a series per label set, and the cardinality budget
 /// is the constraint the rest of the metrics design is built around.
-pub const DURATION_BUCKET_BOUNDS_US: [u64; 17] = [
-    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
-    1_000_000, 2_500_000, 5_000_000, 10_000_000, 30_000_000,
+pub const DURATION_BUCKET_BOUNDS_US: [u64; 20] = [
+    100,
+    250,
+    500,
+    1_000,
+    2_500,
+    5_000,
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_500_000,
+    5_000_000,
+    10_000_000,
+    30_000_000,
+    60_000_000,
+    120_000_000,
+    300_000_000,
 ];
 
 /// Number of buckets, including the `+Inf` overflow bucket at the end.
@@ -92,7 +116,6 @@ impl AtomicDurationHistogram {
     ///
     /// Gated with the two recording methods for the reason given on
     /// [`Self::record_micros`]; it has no caller but them.
-    #[cfg(any(feature = "opencypher", test))]
     #[inline]
     fn bucket_index(micros: u64) -> usize {
         DURATION_BUCKET_BOUNDS_US.partition_point(|bound| *bound < micros)
@@ -107,22 +130,7 @@ impl AtomicDurationHistogram {
     /// derived from the buckets rather than stored, so `_count` and the
     /// `+Inf` bucket agree by construction regardless.
     ///
-    /// # Why this is gated and [`Self::snapshot`] is not
-    ///
-    /// Every non-test caller of either recording method sits behind
-    /// `opencypher`: `src/shard/query.rs` records `query_rows_latency` from
-    /// three `#[cfg(feature = "opencypher")]` functions, `src/query/
-    /// coordination.rs` is a module `src/query/mod.rs` declares only under
-    /// that feature, and `src/client/service.rs` reaches it through
-    /// `client-api → query-transport → opencypher`. With `default = []` these
-    /// methods are genuinely unreachable, so an ungated `pub(crate)` fn is a
-    /// `dead_code` error under the six `-D warnings` clippy lines in `ci.yml`.
-    /// `test` is the other arm because `src/core/histogram/tests.rs` and
-    /// `src/core/metrics/tests.rs` both record without `opencypher` on.
-    ///
-    /// [`Self::snapshot`] stays ungated: `GraphOperationalMetrics::snapshot`
-    /// in `src/core/metrics.rs` calls it on every build.
-    #[cfg(any(feature = "opencypher", test))]
+    /// Also used by process memory diagnostics under default features.
     #[inline]
     pub(crate) fn record_micros(&self, micros: u64) {
         self.buckets[Self::bucket_index(micros)].fetch_add(1, Ordering::Relaxed);
@@ -131,8 +139,6 @@ impl AtomicDurationHistogram {
 
     /// Record one observation from a [`Duration`].
     ///
-    /// Same gate as [`Self::record_micros`], for the same reason.
-    #[cfg(any(feature = "opencypher", test))]
     #[inline]
     pub(crate) fn record(&self, duration: Duration) {
         self.record_micros(crate::codec::duration_micros_u64(duration));

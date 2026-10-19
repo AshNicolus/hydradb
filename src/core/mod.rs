@@ -1,7 +1,9 @@
 pub(crate) mod cache;
 pub(crate) mod config;
+pub(crate) mod db_cache;
 pub(crate) mod error;
 pub(crate) mod histogram;
+pub(crate) mod memory_diagnostics;
 pub(crate) mod metrics;
 pub(crate) mod model;
 pub(crate) mod namespace;

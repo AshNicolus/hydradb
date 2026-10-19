@@ -36,7 +36,7 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use slatedb_graph_kernel::{
+use hydradb::{
     GraphCacheMetricsSnapshot, GraphId, GraphOperationalMetricsSnapshot, GraphScope,
     GraphShardRuntimeMetrics, NamespaceId, ScopedGraphShardRuntimeMetrics,
 };
@@ -148,6 +148,7 @@ fn shards() -> Vec<ScopedGraphShardRuntimeMetrics> {
                 cache: GraphCacheMetricsSnapshot::default(),
                 cache_entries: Default::default(),
                 cache_resident_bytes: Default::default(),
+                storage: Default::default(),
             },
         },
     )

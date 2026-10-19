@@ -34,7 +34,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use slatedb_graph_kernel::PlacementView;
+use hydradb::PlacementView;
 use hydradb_placement::liveness::HeartbeatAction;
 
 /// The node's readiness, shared by the admin server and the heartbeat
@@ -98,14 +98,14 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use futures::StreamExt;
+    use hydradb::PlacementConfig;
+    use hydradb_placement::liveness::LiveView;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
     use slatedb::object_store::{
         self as object_store, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
         ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use slatedb_graph_kernel::PlacementConfig;
-    use hydradb_placement::liveness::LiveView;
 
     const FLEET: &[&str] = &["graph-node-0", "graph-node-1"];
 

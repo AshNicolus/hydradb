@@ -32,17 +32,78 @@ pub trait BoltRoutingTableProvider: Send + Sync {
     ) -> Result<BoltRoutingTable>;
 }
 
+/// Which nodes the `READ` role names.
+///
+/// Both modes are correct — every node can serve a read of any cell, and both
+/// satisfy the same bookmark — so this is a latency knob, not a consistency
+/// one. It exists as a switch rather than a decision because flipping it
+/// changes the load shape of the entire fleet, and reverting that has to be an
+/// env change rather than an image build
+/// (`docs/plans/2026-08-21-cell-affine-read-routing.md`, change 2). A typed
+/// enum rather than a bool so a third mode stays expressible without churning
+/// every call site.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BoltReadRouting {
+    /// `READ` names the whole live fleet, and the driver load-balances across
+    /// it. Reads scale out per tenant; the ones that land on a non-owner pay
+    /// the bookmark wait. The default, so the switch is inert until set.
+    #[default]
+    Fleet,
+    /// `READ` names the cell's owner — the same single address `WRITE` gets.
+    /// Reads become cell-affine, which is the whole point: the owner's
+    /// `durable_seq` already satisfies the bookmark, so the causal wait exits
+    /// on its first check instead of polling the object store for it.
+    Owner,
+}
+
+impl BoltReadRouting {
+    /// The `hydradb.read_routing` span value, and the `GRAPH_READ_ROUTING`
+    /// spelling.
+    ///
+    /// One function for both so a trace and the env var an operator would grep
+    /// for can never disagree — the whole value of the field is that it lets
+    /// someone reading a captured routing table say which setting produced it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fleet => "fleet",
+            Self::Owner => "owner",
+        }
+    }
+}
+
 /// Bolt routing for object-store-native nodes.
 ///
-/// Every advertised node can read any configured cell, so `READ` and `ROUTE`
-/// name the whole live fleet. `WRITE` names exactly one node: the rendezvous
-/// owner of the target cell, the same answer
-/// [`RoutedGraphCluster::ensure_local_writer`] enforces. Advertising anything
-/// else builds a loop no timeout breaks — routing sends the write to a node
-/// that then refuses it as a non-owner, and the driver bounces between the two.
-/// That is why decision 9 of `docs/plans/2026-07-25-rendezvous-placement.md`
-/// deletes the old `with_preferred_writer_node` override rather than keeping it
-/// as a pin.
+/// `WRITE` names exactly one node: the rendezvous owner of the target cell, the
+/// same answer [`RoutedGraphCluster::ensure_local_writer`] enforces. Advertising
+/// anything else builds a loop no timeout breaks — routing sends the write to a
+/// node that then refuses it as a non-owner, and the driver bounces between the
+/// two. That is why decision 9 of
+/// `docs/plans/2026-07-25-rendezvous-placement.md` deletes the old
+/// `with_preferred_writer_node` override rather than keeping it as a pin.
+///
+/// `ROUTE` always names the whole live fleet. Routers have to stay redundant: a
+/// driver that cannot reach one router must be able to ask another, and it is
+/// the `ROUTE` list it re-fetches from after invalidating a dead reader.
+///
+/// # `READ` is one address, or the whole fleet — never a preference order
+///
+/// [`BoltReadRouting`] picks between the two. Every node can read any cell, so
+/// [`Fleet`] is correct and was the only behaviour until
+/// `docs/plans/2026-08-21-cell-affine-read-routing.md`; it is also the reason
+/// reads that follow a write on another node spend 17–38s polling their own
+/// manifest until it catches up, because `durable_sequence()` is free on the
+/// writer and a poll loop everywhere else. [`Owner`] hands `READ` the same
+/// single address `WRITE` gets — resolved once, above, so `READ` follows the
+/// *lease* holder through a handoff exactly as `WRITE` does rather than
+/// re-deriving raw rendezvous.
+///
+/// In [`Owner`] mode `READ` must be **exactly one address**, never the owner
+/// plus fallbacks. A Neo4j driver load-balances across every address in a role
+/// (least-connected by default); it does not read the list as an ordered
+/// preference. An owner-plus-fallback list would send most reads back to
+/// non-owners and buy nothing. The cost of that is real and named in the plan:
+/// when the owner dies, the query in flight fails through to the application
+/// un-retried, where before it was one of three nodes' worth of failures.
 ///
 /// # Liveness comes from the shared placement view, not from a probe
 ///
@@ -56,6 +117,8 @@ pub trait BoltRoutingTableProvider: Send + Sync {
 /// itself is untouched — the k8s readiness probe, the runtime smoke script and
 /// the Jepsen harness still use it; only routing stopped calling it.
 ///
+/// [`Fleet`]: BoltReadRouting::Fleet
+/// [`Owner`]: BoltReadRouting::Owner
 /// [`RoutedGraphCluster::ensure_local_writer`]: crate::RoutedGraphCluster
 #[derive(Clone)]
 pub struct ObjectStoreBoltRoutingTableProvider {
@@ -66,6 +129,7 @@ pub struct ObjectStoreBoltRoutingTableProvider {
     placement: PlacementView,
     routing_ttl_secs: i64,
     writer_leases: Option<Arc<ObjectStoreWriterLeaseDirectory>>,
+    read_routing: BoltReadRouting,
 }
 
 impl ObjectStoreBoltRoutingTableProvider {
@@ -95,6 +159,7 @@ impl ObjectStoreBoltRoutingTableProvider {
             placement,
             routing_ttl_secs,
             writer_leases: None,
+            read_routing: BoltReadRouting::default(),
         })
     }
 
@@ -103,6 +168,15 @@ impl ObjectStoreBoltRoutingTableProvider {
         writer_leases: Arc<ObjectStoreWriterLeaseDirectory>,
     ) -> Self {
         self.writer_leases = Some(writer_leases);
+        self
+    }
+
+    /// Opt into cell-affine reads. A builder rather than a `new` parameter for
+    /// the same reason [`Self::with_writer_lease_directory`] is one: every
+    /// existing embedder keeps the fleet-wide `READ` list it already had, and
+    /// the new behaviour is reached only by asking for it.
+    pub fn with_read_routing(mut self, read_routing: BoltReadRouting) -> Self {
+        self.read_routing = read_routing;
         self
     }
 }
@@ -165,6 +239,12 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
             hydradb.placement.state = view.state().as_str(),
             hydradb.placement.live_nodes = view.nodes().len(),
             hydradb.placement.ownership = ownership,
+            // Which mode produced the table below. Without it a routing table
+            // captured in a trace is ambiguous: a single-node fleet renders
+            // identically under both modes, and a three-node fleet's `READ`
+            // list only tells you the mode if you already know the fleet size.
+            // `hydradb_telemetry::semconv::READ_ROUTING`.
+            hydradb.read_routing = self.read_routing.as_str(),
             hydradb.writer.lease_generation = lease_owner
                 .as_ref()
                 .map_or(0, |owner| owner.generation),
@@ -211,11 +291,22 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
                     None => return routing_unavailable("no live node owns this cell"),
                 };
 
+            // The owner is `writer`, already resolved above from `owner` — which
+            // prefers the durable lease holder over the raw rendezvous winner.
+            // Reusing it rather than re-deriving is what makes a read follow the
+            // *actual* writer through a handoff, which is the only version of
+            // this that is worth having: a read routed to yesterday's rendezvous
+            // winner pays exactly the wait this exists to remove.
+            let read_addresses = match self.read_routing {
+                BoltReadRouting::Fleet => live_addresses.clone(),
+                BoltReadRouting::Owner => vec![writer.clone()],
+            };
+
             BoltRoutingTable::new(
                 self.routing_ttl_secs,
                 vec![
-                    BoltRoutingServer::new("ROUTE", live_addresses.clone())?,
-                    BoltRoutingServer::new("READ", live_addresses)?,
+                    BoltRoutingServer::new("ROUTE", live_addresses)?,
+                    BoltRoutingServer::new("READ", read_addresses)?,
                     BoltRoutingServer::new("WRITE", [writer])?,
                 ],
             )

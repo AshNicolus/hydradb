@@ -114,7 +114,16 @@ pub struct TelemetryConfig {
     /// instruments, and therefore how often the two cache-gauge sets take their
     /// mutexes — the one metrics cost that is not a relaxed atomic load.
     pub metric_export_interval: Duration,
-    /// `service.version`.
+    /// `service.version`, and the `version` field `layers.rs` stamps on every
+    /// log line.
+    ///
+    /// Defaults to [`BuildInfo::version_string`] — `0.1.0+a1b2c3d4e5f6` — not
+    /// the bare `CARGO_PKG_VERSION`. That single substitution is what puts the
+    /// commit on all of a deployment's logs: the Vector agent buckets any field
+    /// without a dedicated column into ClickHouse's `attributes` map, so this
+    /// lands as `attributes['version']` on every row with no pipeline change.
+    ///
+    /// [`BuildInfo::version_string`]: crate::BuildInfo::version_string
     pub service_version: String,
     /// `service.instance.id` — the pod name.
     pub instance_id: String,
@@ -155,7 +164,7 @@ impl TelemetryConfig {
             sample_ratio: Self::DEFAULT_SAMPLE_RATIO,
             export_timeout: Duration::from_secs(10),
             metric_export_interval: Self::DEFAULT_METRIC_EXPORT_INTERVAL,
-            service_version: env!("CARGO_PKG_VERSION").to_string(),
+            service_version: crate::build_info::BUILD_INFO.version_string(),
             instance_id: "unknown".to_string(),
             deployment_environment: None,
             slow_query_ms: Self::DEFAULT_SLOW_QUERY_MS,
@@ -246,6 +255,11 @@ impl TelemetryConfig {
             config.metric_export_interval = interval;
         }
 
+        // Kept as an escape hatch, but no longer the way the build is
+        // identified: the default now carries the commit, and an operator who
+        // sets this replaces a value the compiler proved with one a chart
+        // asserts. Worth doing to name a release train; not worth doing to
+        // restate a version.
         if let Some(version) = get("GRAPH_BUILD_VERSION") {
             config.service_version = version;
         }

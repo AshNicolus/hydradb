@@ -6,7 +6,7 @@ rust-version = "1.91"
 description = "Rendezvous placement and node liveness for HydraDB cell writers"
 publish = false
 
-# Still no dependency on `slatedb-graph-kernel`: placement must not know about
+# Still no dependency on `hydradb`: placement must not know about
 # graphs, shards or queries, which is what keeps it testable against `InMemory`
 # alone.
 #

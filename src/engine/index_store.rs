@@ -4,8 +4,14 @@ use sha2::{Digest, Sha256};
 use slatedb::bytes::Bytes;
 use slatedb::object_store::{ObjectStoreExt, PutMode, UpdateVersion};
 
-const INDEX_MANIFEST_MAGIC: &str = "hydradb-index-current-v1";
-const INDEX_CSC_MAGIC: &[u8] = b"hydradb-index-csc-v1\0";
+// These v1 magic values are durable storage format identifiers, not product
+// branding. Changing them would make published index generations unreadable
+// during an upgrade, so HydraDB continues to encode and decode the original
+// v1 format.
+// Persisted format identifiers stay stable so existing object-store generations
+// remain readable after the product rename.
+const INDEX_MANIFEST_MAGIC: &str = "turbolay-index-current-v1";
+const INDEX_CSC_MAGIC: &[u8] = b"turbolay-index-csc-v1\0";
 const INDEX_PUBLISH_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -728,8 +734,10 @@ fn decode_index_u64s(key: &str, value: &[u8], cursor: &mut usize, field: &str) -
         })?;
     *cursor = end;
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<u64>())
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("u64 byte width")))
+        .as_chunks::<{ std::mem::size_of::<u64>() }>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
         .collect())
 }
 

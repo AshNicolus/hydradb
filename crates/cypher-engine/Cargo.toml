@@ -1,0 +1,16 @@
+[package]
+name = "hydradb-cypher-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Isolated Cypher preparation and graph physical-plan execution"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+hydradb-cypher-ast = { path = "../cypher-ast" }
+hydradb-cypher-parser-antlr = { path = "../cypher-parser-antlr" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

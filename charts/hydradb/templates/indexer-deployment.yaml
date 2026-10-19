@@ -113,8 +113,17 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: auth
+              mountPath: /var/run/secrets/hydradb
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 1Gi
+        - name: auth
+          secret:
+            secretName: {{ include "hydradb.authSecretName" . }}
+            items:
+              - key: {{ .Values.auth.secretKey }}
+                path: {{ .Values.auth.secretKey }}
 {{- end }}

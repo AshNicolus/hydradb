@@ -113,6 +113,28 @@ fn every_class_is_reached_by_some_error() {
     assert!(reached.into_iter().all(|hit| hit));
 }
 
+#[test]
+fn limit_operations_are_exposed_without_parsing_error_messages() {
+    let admission = GraphError::AdmissionRejected {
+        operation: "candidate_rows",
+        actual: 2,
+        limit: 1,
+    };
+    let timeout = GraphError::QueryTimeout {
+        operation: "query_execute",
+        elapsed_ms: 2,
+        limit_ms: 1,
+    };
+    let query = GraphError::QueryParse {
+        dialect: "cypher",
+        reason: "unexpected token".into(),
+    };
+
+    assert_eq!(admission.limit_operation(), Some("candidate_rows"));
+    assert_eq!(timeout.limit_operation(), Some("query_execute"));
+    assert_eq!(query.limit_operation(), None);
+}
+
 /// `storage` is the one class with two source variants and the sample table
 /// carries only one of them, so the other half of that arm would otherwise go
 /// unexercised. Both must land in the same slot: a dashboard that separated
@@ -153,4 +175,46 @@ fn wrong_node_failures_are_routing_not_fencing() {
 
     assert_eq!(not_writer.class(), "routing");
     assert_eq!(unavailable.class(), "routing");
+}
+
+/// The reason is a refinement of the `query` class and nothing else, so a
+/// failure counter keyed by both can never hold a reason under another class.
+#[test]
+fn only_query_class_failures_carry_a_reason() {
+    for error in GraphError::one_per_class() {
+        assert_eq!(
+            error.failure_reason().is_some(),
+            error.class() == "query",
+            "{error:?}"
+        );
+    }
+    let unsupported = GraphError::UnsupportedQuery {
+        dialect: "OpenCypher",
+        feature: "WHERE currently supports boolean combinations of property comparisons"
+            .to_string(),
+        reason: QueryFailureReason::Where,
+    };
+    assert_eq!(
+        unsupported.failure_reason(),
+        Some(QueryFailureReason::Where)
+    );
+    // A remote failure the owner did not classify keeps the query class and
+    // the exact wording remote failures always had, but carries no reason, so
+    // a remote timeout is not counted as an unsupported query.
+    let remote = GraphError::UnclassifiedQuery {
+        dialect: "QueryTransport",
+        feature: "query/transport/rows: rows exceeded query timeout".to_string(),
+    };
+    assert_eq!(remote.class(), "query");
+    assert_eq!(remote.failure_reason(), None);
+    assert_eq!(
+        remote.to_string(),
+        "QueryTransport query is not supported yet: query/transport/rows: rows exceeded query timeout"
+    );
+    // The reason is a label, never part of the message operators grep for.
+    assert_eq!(
+        unsupported.to_string(),
+        "OpenCypher query is not supported yet: \
+         WHERE currently supports boolean combinations of property comparisons"
+    );
 }

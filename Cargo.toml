@@ -1,13 +1,16 @@
-# The root stays the `slatedb-graph-kernel` package and merely gains a
+# The root stays the `hydradb` package and merely gains a
 # `[workspace]` table, so every bare `cargo test --features …` in CI, the
 # justfile and scripts/ still resolves to the root package. A virtual manifest
 # would have broken all of them.
-#
-# `exclude` covers the vendored Quint/CosmWasm sample manifests under `docs/`,
-# which are gitignored but present in working trees.
 [workspace]
-members = ["crates/placement", "crates/telemetry"]
-exclude = ["docs"]
+members = [
+    "crates/cypher-engine",
+    "crates/cypher-parser-antlr",
+    "crates/cypher-ast",
+    "crates/graph-plan",
+    "crates/placement",
+    "crates/telemetry",
+]
 
 # One place for every third-party version, so a member cannot drift from the
 # root. Members inherit with `{ workspace = true }`. Two rules worth knowing
@@ -15,6 +18,8 @@ exclude = ["docs"]
 # use site, and features listed here are a floor a member can add to but never
 # subtract from — so what is recorded below is the union across all use sites.
 [workspace.dependencies]
+antlr-rust-codegen = "0.34.0"
+antlr-rust-runtime = "0.34.0"
 async-trait = "0.1"
 axum = "0.8.9"
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
@@ -28,6 +33,8 @@ bytes = "1"
 # day that something else stops.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
+foyer = "0.22.3"
+libc = "0.2"
 libcypher-parser-sys = "0.6.1-1"
 # The OpenTelemetry set is used only by `crates/telemetry`, behind its
 # off-by-default `otlp` feature, so nothing here reaches the kernel or a bare
@@ -61,7 +68,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
-slatedb = { git = "https://github.com/usecortex/slatedb.git", rev = "c501471ea070498931f30611bfd1ad2773c3c367", default-features = false, features = ["aws", "foyer"] }
+slatedb = { git = "https://github.com/hydra-db/slatedb.git", rev = "4f2e0060473698bc6a8605a6718f4ff1bc691736", default-features = false, features = ["aws", "foyer"] }
+slatedb-common = { git = "https://github.com/hydra-db/slatedb.git", rev = "4f2e0060473698bc6a8605a6718f4ff1bc691736" }
 subtle = "2"
 tempfile = "3"
 thiserror = "2"
@@ -73,18 +81,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 ulid = "1"
 
 [package]
-name = "slatedb-graph-kernel"
+name = "hydradb"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91"
-description = "A SlateDB-backed object-store graph kernel"
-repository = "https://github.com/usecortex/slatedb-graph-kernel"
+description = "Object-store-native distributed graph database"
+repository = "https://github.com/hydra-db/hydradb"
 readme = "README.md"
 publish = false
 
 [features]
 default = []
 opencypher = ["dep:libcypher-parser-sys"]
+experimental-cypher-engine = ["opencypher", "dep:hydradb-cypher-engine"]
 chaos-harness = []
 json-properties = ["dep:serde_json"]
 query-transport = ["opencypher", "dep:base64", "dep:serde", "dep:subtle", "json-properties", "tokio/io-util", "tokio/net"]
@@ -101,15 +110,20 @@ server-runtime = [
     "dep:tracing-subscriber",
     "dep:hydradb-telemetry",
 ]
-indexer-runtime = ["dep:axum", "dep:tracing-subscriber", "tokio/net", "dep:hydradb-telemetry"]
+indexer-runtime = [
+    "dep:axum",
+    "dep:subtle",
+    "dep:tracing-subscriber",
+    "tokio/net",
+    "dep:hydradb-telemetry",
+]
 
 # OTLP export, off by default and never enabled by another feature. Off, the
 # binaries still initialise telemetry and still emit JSON to stdout — they just
-# install no exporter, so a build without a collector is the normal build. This
-# is the one deviation from `docs/plans/2026-07-26-otel-telemetry-crate.md` §1,
-# which claimed no root `[features]` entry would be needed: true of the library,
-# but the binaries are in this package, so shipping OTLP at all needs a switch
-# here. It is additive — no existing combination changes meaning.
+# install no exporter, so a build without a collector is the normal build. The
+# library needs no root `[features]` entry, but the binaries are in this package,
+# so shipping OTLP at all needs a switch here. It is additive — no existing
+# combination changes meaning.
 otlp = ["hydradb-telemetry/otlp"]
 
 [[bin]]
@@ -133,18 +147,8 @@ path = "examples/opencypher_tck_report.rs"
 required-features = ["opencypher"]
 
 [[example]]
-name = "query_bench"
-path = "examples/query_bench.rs"
-required-features = ["opencypher"]
-
-[[example]]
 name = "query_correctness"
 path = "examples/query_correctness.rs"
-required-features = ["opencypher"]
-
-[[example]]
-name = "multigraph_bench"
-path = "examples/multigraph_bench.rs"
 required-features = ["opencypher"]
 
 [[example]]
@@ -158,27 +162,23 @@ path = "examples/cypher_query.rs"
 required-features = ["opencypher"]
 
 [[example]]
-name = "falkor_query_bench"
-path = "examples/falkor_query_bench.rs"
+name = "match_create_repro"
+path = "examples/match_create_repro.rs"
 required-features = ["opencypher"]
+
+[[example]]
+name = "point_lookup_vs_range_scan"
+path = "examples/point_lookup_vs_range_scan.rs"
 
 [[example]]
 name = "bolt_compat_server"
 path = "examples/bolt_compat_server.rs"
 required-features = ["bolt-server"]
 
-[[example]]
-name = "bolt_benchmark"
-path = "examples/bolt_benchmark.rs"
-required-features = ["public-client-protocols"]
-
-[[example]]
-name = "s3_bolt_benchmark_server"
-path = "examples/s3_bolt_benchmark_server.rs"
-required-features = ["server-runtime"]
 
 [dependencies]
 async-trait = { workspace = true }
+hydradb-cypher-ast = { path = "crates/cypher-ast" }
 axum = { workspace = true, optional = true }
 axum-server = { workspace = true, optional = true }
 boltr = { workspace = true, optional = true }
@@ -192,12 +192,18 @@ base64 = { workspace = true, optional = true }
 # which is the same instant by the same clock but says so nowhere.
 chrono = { workspace = true }
 futures = { workspace = true }
+foyer = { workspace = true }
+# Direct rather than transitive: graph-node reads the glibc allocator snapshot
+# for its Linux-only `/metrics` diagnostics. The metrics are what distinguish
+# live application allocations from bytes retained inside glibc arenas.
+libc = { workspace = true }
 libcypher-parser-sys = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 slatedb = { workspace = true }
+slatedb-common = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true, optional = true }
@@ -206,6 +212,8 @@ subtle = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 hydradb-placement = { path = "crates/placement" }
+hydradb-graph-plan = { path = "crates/graph-plan" }
+hydradb-cypher-engine = { path = "crates/cypher-engine", optional = true }
 ulid = { workspace = true }
 # Optional, because only `src/bin/` uses it: the library half of this package
 # emits through the plain `tracing` facade and must keep compiling — and
@@ -220,7 +228,9 @@ ulid = { workspace = true }
 hydradb-telemetry = { path = "crates/telemetry", optional = true }
 
 [dev-dependencies]
+slatedb-common = { workspace = true, features = ["test-util"] }
 boltr = { workspace = true, features = ["client"] }
+hydradb-cypher-parser-antlr = { path = "crates/cypher-parser-antlr" }
 serde = { workspace = true }
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs, and the fence
 # backoff tests in `src/core/state.rs` are built on it. It does arrive anyway

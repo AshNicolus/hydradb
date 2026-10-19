@@ -1,13 +1,20 @@
+use crate::core::memory_diagnostics::{MemoryDiagnosticGuard, MemoryStage, TrackedMemory};
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock, Weak,
 };
 use std::time::{Duration, Instant};
 
+use hydradb_placement::cell_writer;
 use slatedb::bytes::Bytes;
 use slatedb::config::{ReadOptions, ScanOptions};
+use slatedb::db_cache::DbCache;
 use slatedb::object_store::{memory::InMemory, path::Path, ObjectStore};
+use slatedb_common::metrics::DefaultMetricsRecorder;
+
+use crate::core::config::collect_storage_metrics;
 use slatedb::ErrorKind;
 use slatedb::{Db, DbReader, DbReaderSnapshot, DbSnapshot};
 #[cfg(feature = "opencypher")]
@@ -16,19 +23,114 @@ use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard, RwLock as AsyncRwLock, Semap
 #[cfg(feature = "opencypher")]
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
-use hydradb_placement::cell_writer;
 
 #[cfg(feature = "opencypher")]
 use crate::query::opencypher::ParsedRowQuery;
 use crate::{
     engine, graph_now_millis, open_graph_db, open_graph_reader, sparse_kernel, BoundedGraphCache,
     GraphCacheConfig, GraphCacheMetrics, GraphCachePolicy, GraphDurabilityConfig, GraphError,
-    GraphIndexPolicy, GraphLimits, GraphOperationalMetrics, GraphStorageMemoryConfig,
-    MatrixAdjacency, MatrixCacheKey, Result,
+    GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphOperationalMetrics,
+    GraphStorageMemoryConfig, MatrixAdjacency, MatrixCacheKey, Result, SharedSlateDbCache,
 };
 
 tokio::task_local! {
     static ACTIVE_STORAGE_SNAPSHOT: Arc<GraphStorageSnapshot>;
+    static SNAPSHOT_READABLE_CELLS: std::cell::RefCell<SnapshotReadableCells>;
+}
+
+#[derive(Default)]
+struct SnapshotReadableCells {
+    cells: std::collections::BTreeSet<String>,
+    bytes: usize,
+}
+
+impl SnapshotReadableCells {
+    fn insert(&mut self, cell: &str) {
+        if self.cells.len() >= 128 || self.bytes.saturating_add(cell.len()) > 16 * 1024 {
+            return;
+        }
+        if self.cells.insert(cell.to_owned()) {
+            self.bytes += cell.len();
+        }
+    }
+}
+#[cfg(feature = "opencypher")]
+tokio::task_local! {
+    static SNAPSHOT_QUERY_STATS: std::cell::RefCell<SnapshotQueryStats>;
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+tokio::task_local! {
+    static READ_ACCOUNTING: Arc<ReadAccounting>;
+}
+
+/// SlateDB reads issued on this task while a scope is installed, for
+/// attributing storage work to the query operator that caused it.
+///
+/// Point reads are counted with the bytes of the key and value they returned.
+/// Range scans are counted as requests only: their bytes arrive later, through
+/// iterators the callers drive, and are not measured here.
+#[cfg(feature = "experimental-cypher-engine")]
+#[derive(Debug, Default)]
+pub(crate) struct ReadAccounting {
+    point_reads: AtomicU64,
+    range_scans: AtomicU64,
+    point_read_bytes: AtomicU64,
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+impl ReadAccounting {
+    pub(crate) async fn scope<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
+        READ_ACCOUNTING.scope(Arc::clone(self), future).await
+    }
+
+    /// `(requests, point_read_bytes)` so far.
+    pub(crate) fn totals(&self) -> (u64, u64) {
+        (
+            self.point_reads.load(Ordering::Relaxed) + self.range_scans.load(Ordering::Relaxed),
+            self.point_read_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+fn account_point_read(_key: &[u8], _value: Option<&Bytes>) {
+    #[cfg(feature = "experimental-cypher-engine")]
+    let _ = READ_ACCOUNTING.try_with(|accounting| {
+        accounting.point_reads.fetch_add(1, Ordering::Relaxed);
+        accounting.point_read_bytes.fetch_add(
+            (_key.len() + _value.map_or(0, Bytes::len)) as u64,
+            Ordering::Relaxed,
+        );
+    });
+}
+
+fn account_range_scan() {
+    #[cfg(feature = "experimental-cypher-engine")]
+    let _ = READ_ACCOUNTING.try_with(|accounting| {
+        accounting.range_scans.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Default)]
+struct SnapshotQueryStats {
+    records: BTreeMap<String, Option<crate::QueryStatsRecord>>,
+    bytes: usize,
+}
+
+#[cfg(feature = "opencypher")]
+impl SnapshotQueryStats {
+    fn insert(&mut self, key: &str, value: Option<crate::QueryStatsRecord>) {
+        let bytes = key.len() + std::mem::size_of::<Option<crate::QueryStatsRecord>>();
+        if self.records.contains_key(key)
+            || self.records.len() >= 128
+            || self.bytes.saturating_add(bytes) > 16 * 1024
+        {
+            return;
+        }
+        self.records.insert(key.to_owned(), value);
+        self.bytes += bytes;
+    }
 }
 #[cfg(feature = "opencypher")]
 use crate::{
@@ -67,6 +169,58 @@ impl Default for NativePathPageCursorStore {
     }
 }
 
+/// What one causal-consistency bookmark wait actually did.
+///
+/// The wait is the read-your-writes cost, and until change 4 of
+/// `docs/plans/2026-08-21-cell-affine-read-routing.md` nothing measured it: the
+/// `query.bookmark_wait` span timed it for a trace, and no counter, log or
+/// metric could answer "did this read land on the cell's owner, and did it pay
+/// the epoch wait?" without re-running the week-long investigation in
+/// `docs/2026-08-21-read-path-30s-timeout-findings.md`.
+///
+/// Both facts are known only inside
+/// [`GraphShard::wait_for_storage_sequence_observed`] and both are needed one
+/// layer up, at the client, where the request they belong to is: the counters
+/// live on `ClientQueryMetricsSnapshot` beside the other per-request client
+/// counters, and the span fields go on `query.bookmark_wait`. Carrying them out
+/// as a plain `Copy` struct is what avoids either a second metrics home in the
+/// shard or a guess at the client.
+///
+/// Deliberately **not** the bookmark. The token is an opaque caller-held value
+/// on the never-recorded list (`crates/telemetry/src/semconv.rs`, "What is
+/// never recorded"); only its epoch may be recorded, and that is already a
+/// field of the request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BookmarkWait {
+    /// Whether the shard that served the wait holds the cell's writer.
+    ///
+    /// `true` is the free path — [`GraphStore::durable_sequence_observed`]
+    /// answered from the writer's own commit status. `false` means the answer
+    /// came from a `DbReader`, which is the routing outcome cell-affine reads
+    /// exist to stop producing.
+    pub served_by_cell_writer: bool,
+    /// Manifest refreshes the poll loop performed.
+    ///
+    /// Zero means the fast exit fired and no object-store round trip was made;
+    /// anything else is one `refresh_durable_reader` per unit, at 10ms
+    /// intervals. It is a count rather than a bool because "polled once during
+    /// a handoff" and "polled two hundred times into the deadline" are the two
+    /// outcomes an operator has to tell apart, and the histogram of the wait's
+    /// duration cannot say which of the two a given request was.
+    pub refreshes: u32,
+}
+
+impl BookmarkWait {
+    /// Whether the wait fell through to the poll loop at all.
+    ///
+    /// The alert condition. After cell-affine read routing this is ~0 in steady
+    /// state and non-zero only around handoffs, which is exactly what makes a
+    /// regression visible without re-deriving the analysis.
+    pub fn entered_poll_loop(&self) -> bool {
+        self.refreshes > 0
+    }
+}
+
 pub struct GraphShard {
     pub(crate) db: GraphStore,
     pub(crate) limits: GraphLimits,
@@ -76,6 +230,7 @@ pub struct GraphShard {
     pub(crate) hydration_gate: Arc<Semaphore>,
     pub(crate) matrix_compilation_gate: Arc<Semaphore>,
     pub(crate) graph_write_gate: Arc<Semaphore>,
+    pub(crate) write_pipeline_gate: Arc<Semaphore>,
     pub(crate) artifact_build_gate: Arc<Semaphore>,
     pub(crate) gc_gate: Arc<Semaphore>,
     pub(crate) index_policy: GraphIndexPolicy,
@@ -108,6 +263,14 @@ pub struct GraphShard {
         Mutex<BoundedGraphCache<NativePathResultCacheKey, NativePathResultCacheValue>>,
     #[cfg(feature = "opencypher")]
     pub(crate) native_path_page_cursors: Mutex<NativePathPageCursorStore>,
+    /// Statistics records (and misses) the experimental planner looked up,
+    /// keyed by record key **and** the storage sequence they were read at, so
+    /// requests planning against the same snapshot share one set of point
+    /// reads while a request on a newer snapshot never sees an older answer.
+    /// Any write advances the sequence, which is the invalidation.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(crate) experimental_statistics_memo:
+        Mutex<BoundedGraphCache<(String, crate::StorageSequence), Option<crate::QueryStatsRecord>>>,
     pub(crate) wal_tail_file_cache: Mutex<crate::shard::topology_tail::WalTailFileCache>,
     /// `(cell_id, edge_type)` pairs whose xlog low-water key has been observed
     /// present, so the write path can skip the per-transaction floor check.
@@ -125,22 +288,35 @@ struct GraphStoreInner {
     path: Path,
     object_store: Arc<dyn ObjectStore>,
     cache: GraphCacheConfig,
+    slatedb_cache: Arc<SharedSlateDbCache>,
+    reader_mode: crate::GraphReaderMode,
+    reader_manifest_poll_interval: Duration,
     storage_memory: GraphStorageMemoryConfig,
     durability: GraphDurabilityConfig,
     runtime_handle: tokio::runtime::Handle,
     writer_state: Arc<ProcessWriterState>,
     writer_owner_active: AtomicBool,
-    reader: AsyncRwLock<Option<Arc<DbReader>>>,
+    reader: AsyncRwLock<Option<Arc<TrackedMemory<DbReader>>>>,
     // A writer loss is acknowledged only by a reader refresh from the same or a later generation.
     reader_refresh_generation: AtomicU64,
     reader_refreshed_generation: AtomicU64,
+    // Explicit requests are covered only by a refresh begun after their registration.
+    reader_refresh_requested: AtomicU64,
+    reader_refresh_completed: AtomicU64,
     reader_open_gate: Mutex<()>,
     reader_refresh_gate: Mutex<()>,
     retiring: AtomicBool,
+    // SlateDB metrics recorders for the currently-open writer and reader `Db`s,
+    // captured when each is opened so `storage_metrics` can snapshot L0 counts
+    // and request tallies for `/metrics`. Replaced on every re-open (a fence
+    // recovery opens a fresh writer with a fresh recorder); `None` until first
+    // open. Never held across an `.await`.
+    writer_metrics_recorder: StdMutex<Option<Arc<DefaultMetricsRecorder>>>,
+    reader_metrics_recorder: StdMutex<Option<Arc<DefaultMetricsRecorder>>>,
 }
 
 struct ProcessWriterState {
-    writer: StdRwLock<Option<Db>>,
+    writer: StdRwLock<Option<TrackedMemory<Db>>>,
     open_gate: Mutex<()>,
     owners: StdMutex<usize>,
     closing: AtomicBool,
@@ -329,7 +505,10 @@ fn is_active_reader_snapshot_error(error: &slatedb::Error) -> bool {
             .contains("cannot close database reader while snapshots are active")
 }
 
-async fn close_reader_after_snapshots(reader: Arc<DbReader>) {
+async fn close_reader_after_snapshots(
+    reader: Arc<TrackedMemory<DbReader>>,
+    _diagnostic: MemoryDiagnosticGuard,
+) {
     let mut delay = Duration::from_millis(10);
     loop {
         tokio::time::sleep(delay).await;
@@ -465,6 +644,7 @@ impl ProcessWriterState {
     }
 
     async fn close_final_owner_writer(&self) -> Result<()> {
+        let _diagnostic = MemoryDiagnosticGuard::new(MemoryStage::StorageWriterClose, 0);
         let _open_guard = self.open_gate.lock().await;
         let writer = self
             .writer
@@ -489,6 +669,7 @@ impl ProcessWriterState {
     }
 
     async fn retire_writer(&self) -> Result<bool> {
+        let _diagnostic = MemoryDiagnosticGuard::new(MemoryStage::StorageWriterClose, 0);
         let _open_guard = self.open_gate.lock().await;
         self.closing.store(true, Ordering::Release);
         let _closing_guard = ProcessWriterClosingGuard(&self.closing);
@@ -522,9 +703,9 @@ impl Drop for GraphStoreInner {
 }
 
 pub(crate) enum GraphStorageSnapshot {
-    Writer(Arc<DbSnapshot>),
-    Reader(Arc<DbReaderSnapshot>),
-    Empty(Arc<DbSnapshot>),
+    Writer(TrackedMemory<Arc<DbSnapshot>>),
+    Reader(TrackedMemory<Arc<DbReaderSnapshot>>),
+    Empty(TrackedMemory<Arc<DbSnapshot>>),
 }
 
 impl GraphStorageSnapshot {
@@ -537,9 +718,9 @@ impl GraphStorageSnapshot {
 
     pub(crate) fn last_wal_id(&self) -> Option<u64> {
         match self {
-            Self::Writer(_) => None,
+            Self::Writer(..) => None,
             Self::Reader(snapshot) => Some(snapshot.last_wal_id()),
-            Self::Empty(_) => Some(0),
+            Self::Empty(..) => Some(0),
         }
     }
 
@@ -548,12 +729,16 @@ impl GraphStorageSnapshot {
         key: &[u8],
         options: &ReadOptions,
     ) -> std::result::Result<Option<Bytes>, slatedb::Error> {
-        match self {
+        // Accounted here rather than in `GraphStore`, so the query paths that
+        // hold a snapshot and read it directly are counted too.
+        let value = match self {
             Self::Writer(snapshot) | Self::Empty(snapshot) => {
                 snapshot.get_with_options(key, options).await
             }
             Self::Reader(snapshot) => snapshot.get_with_options(key, options).await,
-        }
+        }?;
+        account_point_read(key, value.as_ref());
+        Ok(value)
     }
 
     pub(crate) async fn scan_prefix_with_options<T>(
@@ -565,6 +750,7 @@ impl GraphStorageSnapshot {
     where
         T: slatedb::ByteRangeBounds + Send,
     {
+        account_range_scan();
         match self {
             Self::Writer(snapshot) | Self::Empty(snapshot) => {
                 snapshot
@@ -581,44 +767,75 @@ impl GraphStorageSnapshot {
 }
 
 impl GraphStore {
+    pub(crate) fn has_block_cache(&self) -> bool {
+        self.inner.cache.slatedb_cache_bytes > 0
+    }
+
     pub(crate) fn lazy(
         path: Path,
         object_store: Arc<dyn ObjectStore>,
-        cache: GraphCacheConfig,
-        storage_memory: GraphStorageMemoryConfig,
-        durability: GraphDurabilityConfig,
-        heartbeat_interval: Duration,
+        options: &GraphOpenOptions,
+        memory: &GraphMemoryConfig,
         process_writer: Option<(&str, Arc<ProcessWriterRegistry>)>,
     ) -> Result<Self> {
         let runtime_handle = tokio::runtime::Handle::current();
         let writer_state = process_writer_state(
             &path,
-            heartbeat_interval,
+            options.fence_backoff_interval,
             process_writer
                 .as_ref()
                 .map(|(node_id, registry)| (*node_id, registry)),
         )?;
+        let slatedb_cache =
+            crate::process_slate_db_cache(&object_store, options.cache.slatedb_cache_bytes)?;
         Ok(Self {
             inner: Arc::new(GraphStoreInner {
                 path,
                 object_store,
-                cache,
-                storage_memory,
-                durability,
+                cache: options.cache.clone(),
+                slatedb_cache,
+                reader_mode: options.reader_mode,
+                reader_manifest_poll_interval: options.reader_manifest_poll_interval,
+                storage_memory: memory.storage.clone(),
+                durability: options.durability.clone(),
                 runtime_handle,
                 writer_state,
                 writer_owner_active: AtomicBool::new(true),
                 reader: AsyncRwLock::new(None),
                 reader_refresh_generation: AtomicU64::new(0),
                 reader_refreshed_generation: AtomicU64::new(0),
+                reader_refresh_requested: AtomicU64::new(0),
+                reader_refresh_completed: AtomicU64::new(0),
                 reader_open_gate: Mutex::new(()),
                 reader_refresh_gate: Mutex::new(()),
                 retiring: AtomicBool::new(false),
+                writer_metrics_recorder: StdMutex::new(None),
+                reader_metrics_recorder: StdMutex::new(None),
             }),
         })
     }
 
-    fn open_writer(&self) -> Option<Db> {
+    /// Snapshot the SlateDB storage-engine metrics for whichever of this store's
+    /// writer/reader handles are open. Cheap: two mutex reads plus in-memory
+    /// counter loads, no object-store I/O. Returns zeroes before either handle
+    /// has been opened.
+    pub(crate) fn storage_metrics(&self) -> GraphStorageMetricsSnapshot {
+        let writer = self
+            .inner
+            .writer_metrics_recorder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let reader = self
+            .inner
+            .reader_metrics_recorder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        collect_storage_metrics(writer.as_deref(), reader.as_deref())
+    }
+
+    fn open_writer(&self) -> Option<TrackedMemory<Db>> {
         if self.inner.retiring.load(Ordering::Acquire) || self.inner.writer_state.is_closing() {
             return None;
         }
@@ -630,7 +847,7 @@ impl GraphStore {
             .clone()
     }
 
-    fn readable_writer(&self) -> Option<Db> {
+    fn readable_writer(&self) -> Option<TrackedMemory<Db>> {
         let writer = self.open_writer()?;
         if writer.status().close_reason.is_none() {
             return Some(writer);
@@ -701,7 +918,7 @@ impl GraphStore {
         Some((Path::from_iter(parts), cell.as_ref().to_string()))
     }
 
-    pub(crate) fn writer(&self) -> Result<Db> {
+    pub(crate) fn writer(&self) -> Result<TrackedMemory<Db>> {
         self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)
     }
 
@@ -980,15 +1197,22 @@ impl GraphStore {
     /// `writer_open_gate`; both the first promotion and a re-promotion after a
     /// fence funnel through here, so the fence path cannot deadlock against
     /// `promote_writer` taking the same gate a second time.
-    async fn install_writer(&self) -> Result<Db> {
-        let writer = open_graph_db(
+    async fn install_writer(&self) -> Result<TrackedMemory<Db>> {
+        let (writer, recorder) = open_graph_db(
             self.inner.path.clone(),
             Arc::clone(&self.inner.object_store),
             &self.inner.cache,
             &self.inner.storage_memory,
             &self.inner.durability,
+            Arc::clone(&self.inner.slatedb_cache) as Arc<dyn DbCache>,
         )
         .await?;
+        let writer = TrackedMemory::new(writer, MemoryStage::StorageWriter);
+        *self
+            .inner
+            .writer_metrics_recorder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(recorder);
         *self
             .inner
             .writer_state
@@ -1013,7 +1237,7 @@ impl GraphStore {
             .cloned()
     }
 
-    pub(crate) async fn open_reader(&self) -> Result<Option<Arc<DbReader>>> {
+    pub(crate) async fn open_reader(&self) -> Result<Option<Arc<TrackedMemory<DbReader>>>> {
         if self.inner.retiring.load(Ordering::Acquire) {
             return Err(GraphError::ReadOnlyShardStorage);
         }
@@ -1031,11 +1255,19 @@ impl GraphStore {
             self.inner.path.clone(),
             Arc::clone(&self.inner.object_store),
             &self.inner.cache,
+            self.inner.reader_mode,
+            self.inner.reader_manifest_poll_interval,
+            Arc::clone(&self.inner.slatedb_cache) as Arc<dyn DbCache>,
         )
         .await
         {
-            Ok(reader) => {
-                let reader = Arc::new(reader);
+            Ok((reader, recorder)) => {
+                *self
+                    .inner
+                    .reader_metrics_recorder
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(recorder);
+                let reader = Arc::new(TrackedMemory::new(reader, MemoryStage::StorageReader));
                 *self.inner.reader.write().await = Some(Arc::clone(&reader));
                 Ok(Some(reader))
             }
@@ -1047,7 +1279,7 @@ impl GraphStore {
         }
     }
 
-    async fn readable_reader(&self) -> Result<Option<Arc<DbReader>>> {
+    async fn readable_reader(&self) -> Result<Option<Arc<TrackedMemory<DbReader>>>> {
         let Some(reader) = self.open_reader().await? else {
             return Ok(None);
         };
@@ -1071,6 +1303,7 @@ impl GraphStore {
             {
                 break;
             }
+            let _diagnostic = MemoryDiagnosticGuard::new(MemoryStage::StorageReaderRefresh, 0);
             reader.refresh().await?;
             self.inner
                 .reader_refreshed_generation
@@ -1109,55 +1342,51 @@ impl GraphStore {
         start_suffix: Option<Vec<u8>>,
         options: &ScanOptions,
     ) -> Result<slatedb::DbIterator> {
+        self.scan_prefix_range_with_options(prefix, start_suffix, None, options)
+            .await
+    }
+
+    /// [`Self::scan_prefix_with_options`] with an exclusive end as well as an
+    /// inclusive start, both relative to `prefix`.
+    ///
+    /// The end is what lets a descending walk resume where its last page
+    /// stopped: SlateDB starts a descending scan at the top of its range, so
+    /// without an end every page would re-read the index from its highest key.
+    pub(crate) async fn scan_prefix_range_with_options(
+        &self,
+        prefix: &[u8],
+        start_suffix: Option<Vec<u8>>,
+        end_suffix_exclusive: Option<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> Result<slatedb::DbIterator> {
+        let range = (
+            start_suffix.map_or(Bound::Unbounded, Bound::Included),
+            end_suffix_exclusive.map_or(Bound::Unbounded, Bound::Excluded),
+        );
         if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
-            return Ok(match start_suffix {
-                Some(start) => {
-                    snapshot
-                        .scan_prefix_with_options(prefix, start.., options)
-                        .await?
-                }
-                None => {
-                    snapshot
-                        .scan_prefix_with_options(prefix, .., options)
-                        .await?
-                }
-            });
+            return Ok(snapshot
+                .scan_prefix_with_options(prefix, range, options)
+                .await?);
         }
         if let Some(writer) = self.readable_writer() {
-            let writer_start_suffix = start_suffix.clone();
-            let result = match writer_start_suffix {
-                Some(start) => {
-                    writer
-                        .scan_prefix_with_options(prefix, start.., options)
-                        .await
-                }
-                None => writer.scan_prefix_with_options(prefix, .., options).await,
-            };
-            match result {
+            match writer
+                .scan_prefix_with_options(prefix, range.clone(), options)
+                .await
+            {
                 Ok(iter) => return Ok(iter),
                 Err(error) if self.recover_closed_writer_error(&error) => {}
                 Err(error) => return Err(error.into()),
             }
         }
         if let Some(reader) = self.readable_reader().await? {
-            return Ok(match start_suffix {
-                Some(start) => {
-                    reader
-                        .scan_prefix_with_options(prefix, start.., options)
-                        .await?
-                }
-                None => reader.scan_prefix_with_options(prefix, .., options).await?,
-            });
+            return Ok(reader
+                .scan_prefix_with_options(prefix, range, options)
+                .await?);
         }
-        let empty = Self::empty_store().await?;
-        Ok(match start_suffix {
-            Some(start) => {
-                empty
-                    .scan_prefix_with_options(prefix, start.., options)
-                    .await?
-            }
-            None => empty.scan_prefix_with_options(prefix, .., options).await?,
-        })
+        Ok(Self::empty_store()
+            .await?
+            .scan_prefix_with_options(prefix, range, options)
+            .await?)
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
@@ -1166,36 +1395,48 @@ impl GraphStore {
 
         let reader = self.inner.reader.write().await.take();
 
-        let writer_result = if self.inner.writer_owner_active.swap(false, Ordering::AcqRel) {
-            if self.inner.writer_state.begin_release() {
-                schedule_process_writer_owner_release(
-                    &self.inner.runtime_handle,
-                    Arc::clone(&self.inner.writer_state),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(GraphError::CorruptValue {
-                        key: format!("process-writer/{}", self.inner.path),
-                        reason: "writer cleanup supervisor stopped unexpectedly".to_string(),
+        let close_writer = async {
+            if self.inner.writer_owner_active.swap(false, Ordering::AcqRel) {
+                if self.inner.writer_state.begin_release() {
+                    schedule_process_writer_owner_release(
+                        &self.inner.runtime_handle,
+                        Arc::clone(&self.inner.writer_state),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(GraphError::CorruptValue {
+                            key: format!("process-writer/{}", self.inner.path),
+                            reason: "writer cleanup supervisor stopped unexpectedly".to_string(),
+                        })
                     })
-                })
+                } else {
+                    Ok(())
+                }
             } else {
                 Ok(())
             }
-        } else {
-            Ok(())
         };
 
-        if let Some(reader) = reader {
-            match reader.close().await {
-                Ok(()) => {}
-                Err(error) if is_active_reader_snapshot_error(&error) => {
-                    tokio::spawn(close_reader_after_snapshots(reader));
+        let close_reader = async {
+            if let Some(reader) = reader {
+                let diagnostic = MemoryDiagnosticGuard::new(MemoryStage::StorageReaderClose, 0);
+                match reader.close().await {
+                    Ok(()) => {}
+                    Err(error) if is_active_reader_snapshot_error(&error) => {
+                        tokio::spawn(close_reader_after_snapshots(reader, diagnostic));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
             }
-        }
-        writer_result
+            Ok(())
+        };
+        // Checkpoint cleanup and the final writer drain are independent. Wait
+        // for both (including on error) before releasing replacement capacity.
+        let (writer_result, reader_result) = tokio::join!(
+            close_writer.instrument(tracing::info_span!("storage.writer_close")),
+            close_reader.instrument(tracing::info_span!("storage.reader_close")),
+        );
+        reader_result.and(writer_result)
     }
 
     pub(crate) async fn snapshot(&self) -> Result<Arc<GraphStorageSnapshot>> {
@@ -1203,8 +1444,17 @@ impl GraphStore {
             return Ok(snapshot);
         }
         if let Some(writer) = self.readable_writer() {
-            match writer.durable_snapshot().await {
-                Ok(snapshot) => return Ok(Arc::new(GraphStorageSnapshot::Writer(snapshot))),
+            match writer
+                .durable_snapshot()
+                .instrument(tracing::info_span!("storage.writer_snapshot"))
+                .await
+            {
+                Ok(snapshot) => {
+                    return Ok(Arc::new(GraphStorageSnapshot::Writer(TrackedMemory::new(
+                        snapshot,
+                        MemoryStage::StorageSnapshot,
+                    ))))
+                }
                 Err(error) if self.recover_closed_writer_error(&error) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -1212,15 +1462,26 @@ impl GraphStore {
         if let Some(reader) = self.readable_reader().await? {
             return reader
                 .snapshot()
+                .instrument(tracing::info_span!("storage.reader_snapshot"))
                 .await
-                .map(|snapshot| Arc::new(GraphStorageSnapshot::Reader(snapshot)))
+                .map(|snapshot| {
+                    Arc::new(GraphStorageSnapshot::Reader(TrackedMemory::new(
+                        snapshot,
+                        MemoryStage::StorageSnapshot,
+                    )))
+                })
                 .map_err(Into::into);
         }
         Self::empty_store()
             .await?
             .snapshot()
             .await
-            .map(|snapshot| Arc::new(GraphStorageSnapshot::Empty(snapshot)))
+            .map(|snapshot| {
+                Arc::new(GraphStorageSnapshot::Empty(TrackedMemory::new(
+                    snapshot,
+                    MemoryStage::StorageSnapshot,
+                )))
+            })
             .map_err(Into::into)
     }
 
@@ -1228,40 +1489,94 @@ impl GraphStore {
         if let Some(reader) = self.readable_reader().await? {
             return reader
                 .snapshot()
+                .instrument(tracing::info_span!("storage.reader_snapshot"))
                 .await
-                .map(|snapshot| Arc::new(GraphStorageSnapshot::Reader(snapshot)))
+                .map(|snapshot| {
+                    Arc::new(GraphStorageSnapshot::Reader(TrackedMemory::new(
+                        snapshot,
+                        MemoryStage::StorageSnapshot,
+                    )))
+                })
                 .map_err(Into::into);
         }
         Self::empty_store()
             .await?
             .snapshot()
             .await
-            .map(|snapshot| Arc::new(GraphStorageSnapshot::Empty(snapshot)))
+            .map(|snapshot| {
+                Arc::new(GraphStorageSnapshot::Empty(TrackedMemory::new(
+                    snapshot,
+                    MemoryStage::StorageSnapshot,
+                )))
+            })
             .map_err(Into::into)
     }
 
     pub(crate) async fn durable_sequence(&self) -> Result<u64> {
+        Ok(self.durable_sequence_observed().await?.0)
+    }
+
+    /// [`Self::durable_sequence`], plus **which branch answered it**.
+    ///
+    /// The branch is the single most diagnostic fact on the causal-read path
+    /// and nothing recorded it before
+    /// `docs/plans/2026-08-21-cell-affine-read-routing.md`. On the cell's
+    /// writer the answer is the writer's own commit status — no I/O, and at or
+    /// past any bookmark minted from a commit here by construction, so
+    /// `wait_for_storage_sequence`'s fast exit always fires. Anywhere else it
+    /// comes from a `DbReader` that only advances when its manifest is
+    /// refreshed from the object store, so the fast exit *cannot* fire for a
+    /// bookmark newer than the last refresh and the 10ms poll loop is the only
+    /// way out. That is the whole of the 17-38s `graph_client_prepare_duration`
+    /// in `docs/2026-08-21-read-path-30s-timeout-findings.md`.
+    ///
+    /// Returning the flag rather than counting it here keeps the fact where it
+    /// can be joined to a request: the shard has no idea which client asked, and
+    /// the client had no way to find out. Nothing is allocated and nothing is
+    /// locked — the bool falls out of the branch that was taken anyway.
+    pub(crate) async fn durable_sequence_observed(&self) -> Result<(u64, bool)> {
         if let Some(writer) = self.readable_writer() {
-            return Ok(writer.status().durable_seq);
+            return Ok((writer.status().durable_seq, true));
         }
-        Ok(self
-            .readable_reader()
-            .await?
-            .map(|reader| reader.status().durable_seq)
-            .unwrap_or(0))
+        Ok((
+            self.readable_reader()
+                .await?
+                .map(|reader| reader.status().durable_seq)
+                .unwrap_or(0),
+            false,
+        ))
     }
 
     pub(crate) async fn refresh_durable_reader(&self) -> Result<u64> {
         let Some(reader) = self.open_reader().await? else {
             return Ok(0);
         };
+        let request = self
+            .inner
+            .reader_refresh_requested
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
         let _refresh_guard = self.inner.reader_refresh_gate.lock().await;
+        if self.inner.reader_refresh_completed.load(Ordering::Acquire) >= request
+            && self
+                .inner
+                .reader_refreshed_generation
+                .load(Ordering::Acquire)
+                == self.inner.reader_refresh_generation.load(Ordering::Acquire)
+        {
+            return Ok(reader.status().durable_seq);
+        }
         loop {
+            let covered = self.inner.reader_refresh_requested.load(Ordering::Acquire);
             let required_generation = self.inner.reader_refresh_generation.load(Ordering::Acquire);
+            let _diagnostic = MemoryDiagnosticGuard::new(MemoryStage::StorageReaderRefresh, 0);
             reader.refresh().await?;
             self.inner
                 .reader_refreshed_generation
                 .store(required_generation, Ordering::Release);
+            self.inner
+                .reader_refresh_completed
+                .store(covered, Ordering::Release);
             if self.inner.reader_refresh_generation.load(Ordering::Acquire) == required_generation {
                 break;
             }
@@ -1291,7 +1606,39 @@ impl GraphStore {
     where
         F: std::future::Future,
     {
+        #[cfg(feature = "opencypher")]
+        let future = SNAPSHOT_QUERY_STATS.scope(
+            std::cell::RefCell::new(SnapshotQueryStats::default()),
+            future,
+        );
+        let future = SNAPSHOT_READABLE_CELLS.scope(
+            std::cell::RefCell::new(SnapshotReadableCells::default()),
+            future,
+        );
         ACTIVE_STORAGE_SNAPSHOT.scope(snapshot, future).await
+    }
+
+    pub(crate) fn snapshot_cell_is_readable(cell: &str) -> bool {
+        SNAPSHOT_READABLE_CELLS
+            .try_with(|state| state.borrow().cells.contains(cell))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn remember_snapshot_readable_cell(cell: &str) {
+        let _ = SNAPSHOT_READABLE_CELLS.try_with(|state| state.borrow_mut().insert(cell));
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn snapshot_query_stats(key: &str) -> Option<Option<crate::QueryStatsRecord>> {
+        SNAPSHOT_QUERY_STATS
+            .try_with(|stats| stats.borrow().records.get(key).cloned())
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn remember_snapshot_query_stats(key: &str, value: Option<crate::QueryStatsRecord>) {
+        let _ = SNAPSHOT_QUERY_STATS.try_with(|stats| stats.borrow_mut().insert(key, value));
     }
 }
 
@@ -1346,6 +1693,87 @@ pub struct GraphCacheEntryCounts {
     pub relationship_row_sets: usize,
     #[cfg(feature = "opencypher")]
     pub relationship_property_row_sets: usize,
+}
+
+/// SlateDB storage-engine counters and gauges, snapshotted from the recorder
+/// each `Db`/`DbReader` was opened with. These describe the LSM the write and
+/// read paths sit on top of — most importantly `l0_sst_count`, the number of
+/// L0 SSTs a prefix scan has to consult. Legacy SSTs and prefixes outside the
+/// configured incident-prefix extractor cannot use Bloom filters to skip
+/// files. Newly built incident-prefix filters expose their pruning through
+/// `sst_filter_prefix_negatives`. Values are
+/// best-effort: a scope with no open writer or reader reports zeroes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphStorageMetricsSnapshot {
+    /// Live count of L0 SSTs across the store. Gauge, updated on manifest poll.
+    pub l0_sst_count: u64,
+    /// Largest L0 SST count in any single segment tree. Gauge.
+    pub segment_max_l0_sst_count: u64,
+    /// Immutable memtables flushed to L0 over the store's life. Counter.
+    pub immutable_memtable_flushes: u64,
+    /// SlateDB `get` requests served (point lookups). Counter.
+    pub get_requests: u64,
+    /// SlateDB `scan` requests served (range scans). Counter.
+    pub scan_requests: u64,
+    /// Total in-memory size (memtables + immutable memtables), bytes. Gauge.
+    pub total_mem_size_bytes: u64,
+    /// Point lookups where an SST's bloom said "might be present" (the SST had
+    /// to be opened). Counter.
+    pub sst_filter_point_positives: u64,
+    /// Point lookups where an SST's bloom proved absence — the SST was skipped
+    /// with zero I/O. Counter. The whole benefit of a point-lookup index over a
+    /// prefix scan lives in this counter.
+    pub sst_filter_point_negatives: u64,
+    /// Point-lookup filter positives that found nothing after opening the SST
+    /// (bloom false-positive rate, numerator). Counter.
+    pub sst_filter_point_false_positives: u64,
+    /// Prefix scans where an SST's filter allowed the read. With no prefix
+    /// extractor applicable this counts every SST every scan consults, making
+    /// `sst_filter_prefix_positives / scan_requests` the average number of
+    /// SSTs a single prefix scan opens. Counter.
+    pub sst_filter_prefix_positives: u64,
+    /// Prefix scans where an SST was skipped by a filter. Legacy SSTs and
+    /// unsupported prefixes receive no prefix-filter help. Counter.
+    pub sst_filter_prefix_negatives: u64,
+    /// Prefix-scan filter positives that yielded no matching key — SSTs opened
+    /// purely to prove emptiness (wasted I/O, measured directly). Counter.
+    pub sst_filter_prefix_false_positives: u64,
+    /// Writes throttled because unflushed bytes exceeded `max_unflushed_bytes`.
+    /// Counter.
+    pub backpressure_writes: u64,
+    /// Writes stalled waiting on L0 (too many L0 SSTs, either globally or per
+    /// key range). Counter, both stall types summed.
+    pub l0_write_stalls: u64,
+    /// Bytes written into output SSTs by compaction, all workers summed.
+    /// Counter.
+    pub compaction_bytes: u64,
+    /// Compaction jobs currently executing, all workers summed. Gauge.
+    pub running_compactions: u64,
+    /// Unix timestamp (seconds) of the last completed compaction. Gauge; the
+    /// distance from `now` is the compaction lag.
+    pub last_compaction_timestamp_sec: u64,
+    /// Bytes of collapsed key-value data written into memtables — the
+    /// write-amplification denominator. Counter.
+    pub memtable_write_bytes: u64,
+    /// Bytes flushed to the WAL. Counter (write-amp numerator term).
+    pub wal_flush_bytes: u64,
+    /// Bytes flushed from immutable memtables into L0 SSTs. Counter
+    /// (write-amp numerator term).
+    pub l0_flush_bytes: u64,
+    /// Block-cache hits on data blocks. Counter.
+    pub block_cache_data_hits: u64,
+    /// Block-cache misses on data blocks. Counter.
+    pub block_cache_data_misses: u64,
+    /// Block-cache hits on filter blocks (a bloom probe that cost no I/O).
+    /// Counter.
+    pub block_cache_filter_hits: u64,
+    /// Block-cache misses on filter blocks. Counter.
+    pub block_cache_filter_misses: u64,
+    /// Object-store GET-family requests (get, get_range, head, …) across every
+    /// component of the store. Counter — the actual I/O bill.
+    pub object_store_get_requests: u64,
+    /// Object-store PUT-family requests. Counter.
+    pub object_store_put_requests: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1430,6 +1858,344 @@ pub(crate) fn is_retryable_write_conflict(err: &GraphError) -> bool {
 mod tests {
     use super::*;
 
+    /// Every clock sleep, including the immediate first tick, needs a permit.
+    /// The dispatcher requests its next sleep only after handling the last poll.
+    #[derive(Debug)]
+    struct ManualReaderClock {
+        clock: slatedb_common::clock::DefaultSystemClock,
+        sleeps: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl slatedb_common::clock::SystemClock for ManualReaderClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.clock.now()
+        }
+
+        fn advance<'a>(
+            &'a self,
+            duration: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            self.clock.advance(duration)
+        }
+
+        fn sleep<'a>(
+            &'a self,
+            _duration: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                let (release, wait) = tokio::sync::oneshot::channel();
+                self.sleeps
+                    .send(release)
+                    .expect("reader clock controller dropped");
+                wait.await.expect("reader tick permit dropped");
+            })
+        }
+
+        fn ticker(&self, duration: Duration) -> slatedb_common::clock::SystemClockTicker<'_> {
+            slatedb_common::clock::SystemClockTicker::new(self, duration)
+        }
+    }
+
+    struct ReaderPolls {
+        sleeps: tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>,
+        parked: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl ReaderPolls {
+        async fn wait_until_parked(&mut self) {
+            assert!(self.parked.is_none());
+            self.parked = Some(
+                tokio::time::timeout(Duration::from_secs(2), self.sleeps.recv())
+                    .await
+                    .expect("reader poll did not finish and park")
+                    .expect("reader clock closed"),
+            );
+        }
+
+        async fn poll_once(&mut self) {
+            self.parked
+                .take()
+                .expect("reader is not parked")
+                .send(())
+                .unwrap();
+            self.wait_until_parked().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_cleanup_does_not_wait_for_writer_shutdown() {
+        let store = GraphStore::lazy(
+            Path::from("graph/overlapping-handle-close"),
+            Arc::new(InMemory::new()),
+            &GraphOpenOptions::default(),
+            &GraphMemoryConfig::default(),
+            None,
+        )
+        .unwrap();
+        store.promote_writer().await.unwrap();
+        store.writer().unwrap().put(b"key", b"value").await.unwrap();
+        let reader = store.open_reader().await.unwrap().unwrap();
+        let reader_live = reader.probe();
+        drop(reader);
+        let gate = store.inner.writer_state.open_gate.lock().await;
+        let mut close = Box::pin(store.close());
+        let overlapped = tokio::select! {
+            result = &mut close => panic!("writer gate must hold shutdown: {result:?}"),
+            result = tokio::time::timeout(Duration::from_millis(200), async {
+                while reader_live() {
+                    tokio::task::yield_now().await;
+                }
+            }) => result.is_ok(),
+        };
+        drop(gate);
+        close.await.unwrap();
+        println!("reader_closed_while_writer_blocked={overlapped}");
+        assert!(
+            overlapped,
+            "independent reader cleanup must not queue behind writer shutdown"
+        );
+    }
+
+    #[test]
+    fn snapshot_readable_cells_have_entry_and_byte_bounds() {
+        let mut state = SnapshotReadableCells::default();
+        for i in 0..1024 {
+            state.insert(&format!("cell-{i}"));
+        }
+        assert_eq!(state.cells.len(), 128);
+        assert!(state.bytes <= 16 * 1024);
+        let mut state = SnapshotReadableCells::default();
+        state.insert(&"x".repeat(16 * 1024 + 1));
+        assert!(state.cells.is_empty());
+        state.insert("a");
+        state.insert("a");
+        assert_eq!(state.bytes, 1);
+    }
+
+    #[cfg(feature = "opencypher")]
+    #[test]
+    fn snapshot_statistics_memo_has_entry_and_byte_bounds() {
+        let mut stats = SnapshotQueryStats::default();
+        for i in 0..1024 {
+            stats.insert(&format!("key-{i}"), None);
+        }
+        assert_eq!(stats.records.len(), 128);
+        assert!(stats.bytes <= 16 * 1024);
+        let mut stats = SnapshotQueryStats::default();
+        stats.insert(&"x".repeat(16 * 1024), None);
+        assert!(stats.records.is_empty());
+        for i in 0..128 {
+            stats.insert(&format!("{i}{}", "x".repeat(1024)), None);
+        }
+        assert!(stats.records.len() < 128);
+        assert!(stats.bytes <= 16 * 1024);
+    }
+
+    async fn reader_with_manual_polls() -> (
+        GraphStore,
+        Arc<crate::tests::ReadCountingObjectStore>,
+        ReaderPolls,
+    ) {
+        let counting = crate::tests::ReadCountingObjectStore::new();
+        let store = GraphStore::lazy(
+            Path::from("graph/queued-reader-refresh"),
+            counting.clone(),
+            &GraphOpenOptions {
+                reader_mode: crate::GraphReaderMode::FollowLatest,
+                reader_manifest_poll_interval: Duration::from_secs(3600),
+                ..GraphOpenOptions::default()
+            },
+            &GraphMemoryConfig::default(),
+            None,
+        )
+        .unwrap();
+        store.promote_writer().await.unwrap();
+        store.writer().unwrap().put(b"key", b"value").await.unwrap();
+        store.retire_writer().await.unwrap();
+        let (sleeps, pending_sleeps) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Arc::new(ManualReaderClock {
+            clock: slatedb_common::clock::DefaultSystemClock::new(),
+            sleeps,
+        });
+        let (builder, recorder) = crate::core::config::graph_reader_builder(
+            store.inner.path.clone(),
+            Arc::clone(&store.inner.object_store),
+            &store.inner.cache,
+            store.inner.reader_mode,
+            store.inner.reader_manifest_poll_interval,
+            Arc::clone(&store.inner.slatedb_cache) as Arc<dyn DbCache>,
+        );
+        let reader = builder.with_system_clock(clock).build().await.unwrap();
+        *store.inner.reader.write().await = Some(Arc::new(TrackedMemory::new(
+            reader,
+            MemoryStage::StorageReader,
+        )));
+        *store.inner.reader_metrics_recorder.lock().unwrap() = Some(recorder);
+        let mut polls = ReaderPolls {
+            sleeps: pending_sleeps,
+            parked: None,
+        };
+        polls.wait_until_parked().await;
+        (store, counting, polls)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reader_polls_require_a_permit_and_report_completion() {
+        let (store, counting, mut polls) = reader_with_manual_polls().await;
+        let reader = store.open_reader().await.unwrap().unwrap();
+        // Opening replays existing data even while the first tick is held.
+        assert_eq!(
+            reader.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+
+        let before = counting.reads();
+        let (begun, release) = counting.pause_next_get();
+        let mut poll = Box::pin(polls.poll_once());
+        assert!(futures::poll!(poll.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(2), begun)
+            .await
+            .unwrap()
+            .unwrap();
+        // A read has started but cannot finish: completion must remain pending.
+        assert!(counting.reads() > before);
+        let stalled_reads = counting.reads();
+        // Cross two of the old 20 ms quiet windows without completing the GET.
+        // Virtual time keeps this deterministic and adds no wall-clock delay.
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_millis(25)).await;
+            assert_eq!(counting.reads(), stalled_reads);
+            assert!(futures::poll!(poll.as_mut()).is_pending());
+        }
+        release.send(()).unwrap();
+        poll.await;
+
+        let after_first_poll = counting.reads();
+        polls.poll_once().await;
+        assert!(counting.reads() > after_first_poll);
+        drop(reader);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_reader_refreshes_share_one_discovery_pass() {
+        let (store, counting, _polls) = reader_with_manual_polls().await;
+        // Hold all automatic ticks, including the immediate one. Only the
+        // explicit refresh calls below can perform discovery in counted windows.
+        let before = counting.reads();
+        let expected = store.refresh_durable_reader().await.unwrap();
+        let one_refresh_reads = counting.reads() - before;
+        assert!(one_refresh_reads > 0);
+
+        let gate = store.inner.reader_refresh_gate.lock().await;
+        let mut requests: Vec<_> = (0..16)
+            .map(|_| Box::pin(store.refresh_durable_reader()))
+            .collect();
+        for request in &mut requests {
+            assert!(futures::poll!(request.as_mut()).is_pending());
+        }
+        let before = counting.reads();
+        let started = Instant::now();
+        drop(gate);
+        for result in futures::future::join_all(requests).await {
+            assert!(result.unwrap() >= expected);
+        }
+        let reads = counting.reads() - before;
+        println!("queued_refreshes=16,one_refresh_reads={one_refresh_reads},cohort_reads={reads},elapsed_us={}", started.elapsed().as_micros());
+        assert_eq!(reads, one_refresh_reads);
+
+        // A request registered after I/O starts must not reuse that older pass.
+        let (begun, release) = counting.pause_next_get();
+        let before = counting.reads();
+        let mut first = Box::pin(store.refresh_durable_reader());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(2), begun)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut later = Box::pin(store.refresh_durable_reader());
+        assert!(futures::poll!(later.as_mut()).is_pending());
+        release.send(()).unwrap();
+        let (first, later) = tokio::join!(first, later);
+        assert!(first.unwrap() >= expected);
+        assert!(later.unwrap() >= expected);
+        assert_eq!(counting.reads() - before, one_refresh_reads * 2);
+
+        // Cancelled callers cannot mark an unfinished refresh as covered.
+        let completed = store.inner.reader_refresh_completed.load(Ordering::Acquire);
+        let (begun, release) = counting.pause_next_get();
+        let mut cancelled = Box::pin(store.refresh_durable_reader());
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(2), begun)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(cancelled);
+        assert_eq!(
+            store.inner.reader_refresh_completed.load(Ordering::Acquire),
+            completed
+        );
+        // SlateDB may cancel the underlying I/O along with its caller.
+        let _ = release.send(());
+        assert!(store.refresh_durable_reader().await.unwrap() >= expected);
+
+        // A new completed write still requires a fresh discovery and is visible.
+        store.promote_writer().await.unwrap();
+        let handle = store
+            .writer()
+            .unwrap()
+            .put(b"later", b"committed")
+            .await
+            .unwrap();
+        let committed = handle.seqnum();
+        handle.await_durable().await.unwrap();
+        store.retire_writer().await.unwrap();
+        assert!(store.refresh_durable_reader().await.unwrap() >= committed);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_diagnostics_follow_handle_snapshot_and_pending_close_lifetimes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = GraphStore::lazy(
+            Path::from("graph/memory-diagnostic-lifetimes"),
+            object_store,
+            &GraphOpenOptions::default(),
+            &GraphMemoryConfig::default(),
+            None,
+        )
+        .unwrap();
+        store.promote_writer().await.unwrap();
+        let writer = store.writer().unwrap();
+        let writer_live = writer.probe();
+        let reader = store.open_reader().await.unwrap().unwrap();
+        let reader_live = reader.probe();
+        let snapshot = store.reader_snapshot().await.unwrap();
+        let GraphStorageSnapshot::Reader(tracked) = snapshot.as_ref() else {
+            panic!("reader snapshot")
+        };
+        let snapshot_live = tracked.probe();
+        let shared_snapshot = Arc::clone(&snapshot);
+        drop(snapshot);
+        drop(reader);
+        assert!(snapshot_live());
+        store.close().await.unwrap();
+        // The reader closer still owns its handle while a snapshot pins it.
+        assert!(reader_live());
+        assert!(writer_live()); // our outstanding wrapper still exists after close
+        drop(writer);
+        assert!(!writer_live());
+        drop(shared_snapshot);
+        assert!(!snapshot_live());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reader_live() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader close token and handle drain after snapshot release");
+    }
+
     fn live_registry_states(registry: &ProcessWriterRegistry) -> usize {
         registry
             .states
@@ -1508,10 +2274,8 @@ mod tests {
         let store = GraphStore::lazy(
             Path::from("graph/cancelled-writer-promotion"),
             object_store,
-            GraphCacheConfig::default(),
-            GraphStorageMemoryConfig::default(),
-            GraphDurabilityConfig::default(),
-            Duration::from_secs(5),
+            &GraphOpenOptions::default(),
+            &GraphMemoryConfig::default(),
             Some(("node-0", registry)),
         )
         .expect("the routed graph store opens");
@@ -1560,10 +2324,8 @@ mod tests {
         let store = GraphStore::lazy(
             Path::from("graph/runtime-free-final-drop"),
             object_store,
-            GraphCacheConfig::default(),
-            GraphStorageMemoryConfig::default(),
-            GraphDurabilityConfig::default(),
-            Duration::from_secs(5),
+            &GraphOpenOptions::default(),
+            &GraphMemoryConfig::default(),
             Some(("node-0", Arc::clone(&registry))),
         )
         .expect("the routed graph store opens inside Tokio");
@@ -1599,10 +2361,8 @@ mod tests {
                 let store = GraphStore::lazy(
                     Path::from("graph/shutdown-runtime-final-drop"),
                     object_store,
-                    GraphCacheConfig::default(),
-                    GraphStorageMemoryConfig::default(),
-                    GraphDurabilityConfig::default(),
-                    Duration::from_secs(5),
+                    &GraphOpenOptions::default(),
+                    &GraphMemoryConfig::default(),
                     Some(("node-0", Arc::clone(&registry))),
                 )
                 .expect("the routed graph store opens");

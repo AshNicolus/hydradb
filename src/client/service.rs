@@ -1,8 +1,13 @@
+mod memory_estimates;
+use crate::core::memory_diagnostics::{
+    request_estimated_bytes, MemoryDiagnosticGuard, MemoryStage, REQUEST_ESTIMATED_BYTES,
+};
+use crate::{QueryFailureReason, QueryFailureStage};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,16 +22,20 @@ use crate::query::coordination::{
     QueryTransportConnectionIdentity, QueryTransportNamespaceQuotas, QueryTransportPrincipal,
     QueryTransportScopeAuthorizer, QueryTransportSecret, QueryTransportServerConfig,
 };
+#[cfg(feature = "experimental-cypher-engine")]
+use crate::query::experimental_cypher::{experimental_query_columns, prepare_experimental_cypher};
 use crate::query::opencypher::{
     classify_opencypher_query_access, opencypher_query_fingerprint,
-    parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query_with_parameters,
-    parse_opencypher_unwind_batch, OpenCypherQueryAccess, ParsedUnwindBatchKind,
+    parse_opencypher_mutation_query_with_list_parameters,
+    parse_opencypher_row_query_with_list_parameters, parse_opencypher_unwind_batch,
+    OpenCypherQueryAccess, ParsedUnwindBatchKind, ParsedUnwindConstraintValue,
+    ParsedUnwindVertexConstraints,
 };
 use crate::query::path_procedure::parse_native_path_procedure_columns;
 use crate::{
-    validate_component, AtomicDurationHistogram, DurationHistogramSnapshot, EdgeMetadata,
-    GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryBatchEdge,
-    QueryBatchMergePolicy, QueryBatchOperation, QueryBatchRelationship,
+    validate_component, AtomicDurationHistogram, CypherEngineMode, DurationHistogramSnapshot,
+    EdgeMetadata, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryBatchEdge,
+    QueryBatchIsolatedVertex, QueryBatchMergePolicy, QueryBatchOperation, QueryBatchRelationship,
     QueryBatchRelationshipMerge, QueryBatchVertex, QueryCancellationToken, QueryColumn,
     QueryContext, QueryCursorToken, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow,
     Result, StorageSequence, VertexMetadata, VertexPropertyValue,
@@ -162,6 +171,7 @@ fn canonical_database_component(database: &str, encoded: &str) -> Result<String>
 
 fn unknown_graph_database(database: &str) -> GraphError {
     GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::InvalidRequest,
         dialect: "ClientProtocol",
         feature: format!("unknown graph database {database}"),
     }
@@ -330,6 +340,7 @@ impl ClientDatabaseResolver for StaticClientDatabaseResolver {
                 .default_database
                 .clone()
                 .ok_or_else(|| GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::InvalidRequest,
                     dialect: "ClientProtocol",
                     feature: "no default graph database is configured".to_string(),
                 })?,
@@ -414,6 +425,7 @@ impl FromStr for ClientBookmark {
 
 fn invalid_bookmark(reason: &str) -> GraphError {
     GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::InvalidRequest,
         dialect: "ClientProtocol",
         feature: format!("invalid bookmark: {reason}"),
     }
@@ -435,7 +447,9 @@ fn hex_decode(value: &str) -> Result<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = hex_nibble(pair[0])?;
             let low = hex_nibble(pair[1])?;
@@ -679,13 +693,59 @@ pub struct ClientQueryPage {
     pub bookmark: Option<ClientBookmark>,
 }
 
-#[derive(Clone, Debug)]
+/// The scalar map every engine has always taken, paired with the list sidecar
+/// that `IN` reads. Bound parameters travel as this pair from the transport
+/// door to the query context.
+type BoundQueryParameters = (
+    BTreeMap<String, VertexPropertyValue>,
+    BTreeMap<String, Vec<VertexPropertyValue>>,
+);
+
+#[derive(Debug)]
 pub(crate) struct PreparedClientQuery {
+    memory_diagnostic: MemoryDiagnosticGuard,
     pub(crate) request: ClientQueryRequest,
     pub(crate) action: QueryTransportAction,
     pub(crate) columns: Vec<QueryColumn>,
     pub(crate) scalar_parameters: BTreeMap<String, VertexPropertyValue>,
+    /// Carried across pages for the same reason the scalars are: a Bolt cursor
+    /// is resumed from this struct, and a resumed page has to bind exactly what
+    /// the first page bound.
+    pub(crate) list_parameters: BTreeMap<String, Vec<VertexPropertyValue>>,
     pub(crate) batch_operation: Option<QueryBatchOperation>,
+    /// The engine resolved when this statement was prepared. A Bolt RUN
+    /// prepares and each PULL executes, so resolving again at PULL would let a
+    /// runtime override flip the engine between a statement's parse and its
+    /// execution. Every later stage reads this field, never the service.
+    pub(crate) cypher_engine: CypherEngineMode,
+}
+
+impl Clone for PreparedClientQuery {
+    fn clone(&self) -> Self {
+        let request = self.request.clone();
+        let scalar_parameters = self.scalar_parameters.clone();
+        let list_parameters = self.list_parameters.clone();
+        let batch_operation = self.batch_operation.clone();
+        let estimated_bytes = memory_estimates::request(&request)
+            .saturating_add(memory_estimates::bound(
+                &scalar_parameters,
+                &list_parameters,
+            ))
+            .saturating_add(memory_estimates::batch(&batch_operation));
+        Self {
+            memory_diagnostic: MemoryDiagnosticGuard::new(
+                MemoryStage::ClientPrepared,
+                estimated_bytes,
+            ),
+            request,
+            action: self.action,
+            columns: self.columns.clone(),
+            scalar_parameters,
+            list_parameters,
+            batch_operation,
+            cypher_engine: self.cypher_engine,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -701,6 +761,7 @@ pub struct ClientQueryServiceConfig {
     pub max_server_cursors: usize,
     pub max_cursor_buffer_bytes: u64,
     pub cursor_ttl_ms: u64,
+    pub cypher_engine: CypherEngineMode,
 }
 
 impl Default for ClientQueryServiceConfig {
@@ -723,6 +784,7 @@ impl ClientQueryServiceConfig {
             max_server_cursors: DEFAULT_MAX_SERVER_CURSORS,
             max_cursor_buffer_bytes: DEFAULT_MAX_CURSOR_BUFFER_BYTES,
             cursor_ttl_ms: DEFAULT_CURSOR_TTL_MS,
+            cypher_engine: CypherEngineMode::Legacy,
         }
     }
 
@@ -789,6 +851,11 @@ impl ClientQueryServiceConfig {
         self
     }
 
+    pub fn with_cypher_engine(mut self, cypher_engine: CypherEngineMode) -> Self {
+        self.cypher_engine = cypher_engine;
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         self.namespace_quotas.validate()?;
         if self.max_concurrent_queries == 0
@@ -801,6 +868,7 @@ impl ClientQueryServiceConfig {
             || self.cursor_ttl_ms == 0
         {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: "client query limits must be greater than zero".to_string(),
             });
@@ -820,6 +888,30 @@ pub struct ClientQueryMetricsSnapshot {
     /// Total by construction: one call increments both, so the array sums to the
     /// scalar. Enumerate it with [`Self::class_counter_fields`].
     pub queries_failed_by_class: [u64; GraphError::CLASS_COUNT],
+    /// Query failures -- the `query` error class -- by stage and
+    /// [`crate::QueryFailureReason`]. Enumerate it with
+    /// [`Self::failure_counter_fields`].
+    ///
+    /// Only failures with a reason: timeouts, admission, routing, storage and
+    /// the rest are [`Self::queries_failed_by_class`]'s, and so is a remote
+    /// failure its owner did not classify. Recorded at every exit of a request
+    /// the service accepts, including the prepare step that parses and plans
+    /// -- where an unsupported query fails, and which `queries_failed` never
+    /// saw -- plus HTTP's `read_epoch` rejection, which happens before the
+    /// service sees the request.
+    ///
+    /// One field per engine, for the reason
+    /// [`Self::read_latency_legacy`] gives: the comparison this family exists
+    /// for is legacy against experimental, and a single population labelled at
+    /// export time would hand its whole history to whichever engine a scrape
+    /// happens to find effective. A statement that was admitted carries its
+    /// own engine here; one rejected before admission — HTTP's `read_epoch`
+    /// check, a malformed request — is counted against the engine effective
+    /// at that moment, which is the only true answer for a statement no
+    /// engine ever ran.
+    pub queries_failed_by_reason_legacy: crate::QueryFailureCountsSnapshot,
+    /// [`Self::queries_failed_by_reason_legacy`] for the experimental engine.
+    pub queries_failed_by_reason_experimental: crate::QueryFailureCountsSnapshot,
     pub rows_returned: u64,
     pub auth_failures: u64,
     pub scope_denials: u64,
@@ -827,18 +919,111 @@ pub struct ClientQueryMetricsSnapshot {
     pub backpressure_waits: u64,
     pub prepare_requests: u64,
     pub prepare_duration_us: u64,
-    /// Total microseconds across both latency histograms below.
+    /// Causal-consistency bookmark waits served, of any outcome.
+    ///
+    /// The **denominator**. Every counter below is a fraction of it, and none
+    /// of them is alertable without it: "forty waits polled" is a fleet at rest
+    /// or a fleet on fire depending on whether forty-one waits happened or four
+    /// hundred thousand did. Change 4 of
+    /// `docs/plans/2026-08-21-cell-affine-read-routing.md` asks for the pair
+    /// for exactly this reason.
+    ///
+    /// It restates [`Self::bookmark_wait_latency`]'s `count()`, and does so
+    /// deliberately rather than through
+    /// `PrometheusCounterExport::Derived`: a histogram's `_count` is a
+    /// *suffix* of a histogram family, so an alert dividing a counter series by
+    /// one is a shape a reviewer has to check by hand. One call increments both,
+    /// so they cannot drift.
+    pub bookmark_waits: u64,
+    /// Waits that fell through to the 10ms poll loop — i.e. `durable_sequence()`
+    /// did not satisfy the bookmark on its first check.
+    ///
+    /// **This is the alert.** After cell-affine read routing
+    /// (`GRAPH_READ_ROUTING=owner`) a read lands on the node that holds the
+    /// cell's writer, whose `durable_seq` is at or past any bookmark minted
+    /// from a commit there, so the loop is unreachable and this reads ~0 in
+    /// steady state. It goes non-zero around a writer handoff, which is the one
+    /// window where it should, and it goes and stays non-zero if reads drift
+    /// back onto non-owners — which is the regression this exists to make
+    /// visible without re-deriving
+    /// `docs/2026-08-21-read-path-30s-timeout-findings.md`.
+    pub bookmark_waits_polled: u64,
+    /// Waits that ran out of `max_bookmark_wait_ms` and returned
+    /// `SnapshotAhead`.
+    ///
+    /// Not a duplicate of `queries_failed_by_class{error_class="freshness"}`,
+    /// which is the obvious objection. On the Bolt path the wait runs inside
+    /// `prepare_page_request`, and a prepare that fails never reaches
+    /// `record_result_metrics` -- it is traced and logged and counted nowhere
+    /// (`src/client/bolt.rs`, the `Bolt RUN preparation failed` arm;
+    /// `queries_failed_by_reason` counts only query failures). So before this
+    /// counter the error that step 3 of the plan made *reachable* was still
+    /// not *countable* on the path that produces it. It is also the only
+    /// series that attributes a freshness failure to the bookmark wait rather
+    /// than to any of the other `SnapshotAhead` sites in the kernel — artifact
+    /// builds, maintenance, path procedures and row execution all raise the
+    /// same variant.
+    pub bookmark_waits_declined: u64,
+    /// Waits answered from the cell writer's own commit status — the free path.
+    pub bookmark_waits_on_cell_writer: u64,
+    /// Waits answered from a `DbReader` — the node does not hold this cell's
+    /// writer.
+    ///
+    /// The single most diagnostic fact on the read path, and nothing recorded
+    /// it before this. `rate(off_cell_writer) / rate(bookmark_waits)` is
+    /// "reads are landing on non-owners" as a query rather than an inference;
+    /// with `GRAPH_READ_ROUTING=owner` it should be ~0 outside handoffs.
+    ///
+    /// The two do **not** have to sum to [`Self::bookmark_waits`]: a client
+    /// that cannot observe the branch — anything reaching the shard over the
+    /// query transport rather than in-process — increments neither, so the gap
+    /// is the count of waits nobody could attribute. Guessing would have been
+    /// the alternative, and a guess in a metric is worse than a gap.
+    pub bookmark_waits_off_cell_writer: u64,
+    /// Time statements spent acquiring namespace and node query permits, microseconds.
+    pub admission_wait_us: u64,
+    /// Time converting result rows to the wire protocol and handing them to the socket, microseconds.
+    pub serialize_duration_us: u64,
+    /// Rows serialized onto a client protocol.
+    pub serialized_rows: u64,
+    /// Total microseconds across the four latency histograms below.
     ///
     /// Retained so nothing that read the old sum has to change. It is derived
     /// rather than stored: every execution is recorded into exactly one of the
-    /// two histograms, so their sums add up to the previous value exactly.
+    /// four histograms, so their sums add up to the previous value exactly.
     pub execution_duration_us: u64,
     /// End-to-end execution of a read, from the authorization check to the
     /// assembled first page — including the server-cursor start.
-    pub read_latency: DurationHistogramSnapshot,
+    ///
+    /// One histogram per engine rather than one labelled at export time. The
+    /// kill switch means a process can serve both engines in its lifetime, and
+    /// a single population relabelled on a flip would hand the whole history
+    /// to whichever engine happens to be effective at the next scrape — with
+    /// the engine comparison these families exist for as the first casualty.
+    /// Each statement lands in the histogram for the engine it was admitted
+    /// with, so an export reads the label off the data instead of off the node.
+    pub read_latency_legacy: DurationHistogramSnapshot,
+    /// [`Self::read_latency_legacy`] for statements the experimental engine ran.
+    pub read_latency_experimental: DurationHistogramSnapshot,
     /// End-to-end execution of a mutation, which is a different distribution
     /// entirely: it carries a commit, and it can never be served from a cursor.
-    pub write_latency: DurationHistogramSnapshot,
+    pub write_latency_legacy: DurationHistogramSnapshot,
+    /// [`Self::write_latency_legacy`] for statements the experimental engine ran.
+    pub write_latency_experimental: DurationHistogramSnapshot,
+    /// How long the causal-consistency bookmark wait took, per wait.
+    ///
+    /// Read-your-writes latency, and the plan's headline ask. It hid inside
+    /// `graph_client_prepare_duration` — an average over every prepare — for as
+    /// long as it did precisely because that number is a mean over a
+    /// bimodal population: a free exit on the owner and a 17-38s manifest
+    /// spin everywhere else average to a "prepare" figure that names neither.
+    /// A distribution separates them, and the mass above the 2s bucket is
+    /// then the same event `bookmark_waits_polled` counts.
+    ///
+    /// Recorded around the whole wait, including the first `durable_sequence()`
+    /// check, so its `count()` and `bookmark_waits` measure the same
+    /// population.
+    pub bookmark_wait_latency: DurationHistogramSnapshot,
 }
 
 crate::core::metrics::snapshot_fields!(ClientQueryMetricsSnapshot {
@@ -853,14 +1038,29 @@ crate::core::metrics::snapshot_fields!(ClientQueryMetricsSnapshot {
         backpressure_waits,
         prepare_requests,
         prepare_duration_us,
+        bookmark_waits,
+        bookmark_waits_polled,
+        bookmark_waits_declined,
+        bookmark_waits_on_cell_writer,
+        bookmark_waits_off_cell_writer,
+        admission_wait_us,
+        serialize_duration_us,
+        serialized_rows,
         execution_duration_us,
     }
     histograms {
-        read_latency,
-        write_latency,
+        read_latency_legacy,
+        read_latency_experimental,
+        write_latency_legacy,
+        write_latency_experimental,
+        bookmark_wait_latency,
     }
     class_counters {
         queries_failed_by_class,
+    }
+    failure_counters {
+        queries_failed_by_reason_legacy,
+        queries_failed_by_reason_experimental,
     }
 });
 
@@ -870,6 +1070,8 @@ struct ClientQueryMetrics {
     queries_completed: AtomicU64,
     queries_failed: AtomicU64,
     queries_failed_by_class: crate::core::metrics::ErrorClassCounters,
+    queries_failed_by_reason_legacy: crate::core::metrics::QueryFailureCounters,
+    queries_failed_by_reason_experimental: crate::core::metrics::QueryFailureCounters,
     rows_returned: AtomicU64,
     auth_failures: AtomicU64,
     scope_denials: AtomicU64,
@@ -877,20 +1079,41 @@ struct ClientQueryMetrics {
     backpressure_waits: AtomicU64,
     prepare_requests: AtomicU64,
     prepare_duration_us: AtomicU64,
+    // The bookmark-wait family. Five relaxed counters and one histogram beside
+    // the neighbours they are read with, recorded once per `ensure_bookmark`
+    // and never on a path that has no bookmark — a request without one does no
+    // wait, and counting a zero there would put the fleet's read volume in the
+    // denominator of a ratio about read-your-writes.
+    bookmark_waits: AtomicU64,
+    bookmark_waits_polled: AtomicU64,
+    bookmark_waits_declined: AtomicU64,
+    bookmark_waits_on_cell_writer: AtomicU64,
+    bookmark_waits_off_cell_writer: AtomicU64,
+    admission_wait_us: AtomicU64,
+    serialize_duration_us: AtomicU64,
+    serialized_rows: AtomicU64,
+    bookmark_wait_latency: AtomicDurationHistogram,
     // One sum fed two structurally different populations before this. Every
     // execution funnels through `execute_prepared_page_inner`, which already
     // knows the `QueryTransportAction` and threw it away, so a mutation's
     // commit path and a page served out of a warm server cursor landed in one
     // distribution. Splitting on the action costs nothing and is the whole
     // reason a percentile out of these is worth reading.
-    read_latency: AtomicDurationHistogram,
-    write_latency: AtomicDurationHistogram,
+    // ...and split again by engine, because the kill switch made "the node's
+    // engine" and "the engine this statement ran on" two different facts. See
+    // `ClientQueryMetricsSnapshot::read_latency_legacy`.
+    read_latency_legacy: AtomicDurationHistogram,
+    read_latency_experimental: AtomicDurationHistogram,
+    write_latency_legacy: AtomicDurationHistogram,
+    write_latency_experimental: AtomicDurationHistogram,
 }
 
 impl ClientQueryMetrics {
     fn snapshot(&self) -> ClientQueryMetricsSnapshot {
-        let read_latency = self.read_latency.snapshot();
-        let write_latency = self.write_latency.snapshot();
+        let read_latency_legacy = self.read_latency_legacy.snapshot();
+        let read_latency_experimental = self.read_latency_experimental.snapshot();
+        let write_latency_legacy = self.write_latency_legacy.snapshot();
+        let write_latency_experimental = self.write_latency_experimental.snapshot();
         ClientQueryMetricsSnapshot {
             queries_started: self.queries_started.load(Ordering::Relaxed),
             queries_completed: self.queries_completed.load(Ordering::Relaxed),
@@ -898,6 +1121,10 @@ impl ClientQueryMetrics {
             queries_failed_by_class: crate::core::metrics::load_class_counters(
                 &self.queries_failed_by_class,
             ),
+            queries_failed_by_reason_legacy: self.queries_failed_by_reason_legacy.snapshot(),
+            queries_failed_by_reason_experimental: self
+                .queries_failed_by_reason_experimental
+                .snapshot(),
             rows_returned: self.rows_returned.load(Ordering::Relaxed),
             auth_failures: self.auth_failures.load(Ordering::Relaxed),
             scope_denials: self.scope_denials.load(Ordering::Relaxed),
@@ -905,10 +1132,85 @@ impl ClientQueryMetrics {
             backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
             prepare_requests: self.prepare_requests.load(Ordering::Relaxed),
             prepare_duration_us: self.prepare_duration_us.load(Ordering::Relaxed),
-            execution_duration_us: read_latency.sum_us.saturating_add(write_latency.sum_us),
-            read_latency,
-            write_latency,
+            bookmark_waits: self.bookmark_waits.load(Ordering::Relaxed),
+            bookmark_waits_polled: self.bookmark_waits_polled.load(Ordering::Relaxed),
+            bookmark_waits_declined: self.bookmark_waits_declined.load(Ordering::Relaxed),
+            bookmark_waits_on_cell_writer: self
+                .bookmark_waits_on_cell_writer
+                .load(Ordering::Relaxed),
+            bookmark_waits_off_cell_writer: self
+                .bookmark_waits_off_cell_writer
+                .load(Ordering::Relaxed),
+            admission_wait_us: self.admission_wait_us.load(Ordering::Relaxed),
+            serialize_duration_us: self.serialize_duration_us.load(Ordering::Relaxed),
+            serialized_rows: self.serialized_rows.load(Ordering::Relaxed),
+            execution_duration_us: [
+                &read_latency_legacy,
+                &read_latency_experimental,
+                &write_latency_legacy,
+                &write_latency_experimental,
+            ]
+            .into_iter()
+            .fold(0, |total, histogram| total.saturating_add(histogram.sum_us)),
+            read_latency_legacy,
+            read_latency_experimental,
+            write_latency_legacy,
+            write_latency_experimental,
+            bookmark_wait_latency: self.bookmark_wait_latency.snapshot(),
         }
+    }
+
+    /// Count one finished bookmark wait.
+    ///
+    /// One call site, in [`ClientQueryService::ensure_bookmark`], so the
+    /// denominator and every numerator move together by construction rather
+    /// than by two `fetch_add`s staying in step across a future edit — the same
+    /// reason [`Self::record_result`] takes the error instead of a bool.
+    ///
+    /// `wait` is `None` when the client that served the request cannot see
+    /// which branch the shard took; that case increments the denominator and
+    /// the latency and nothing else, which is the honest shape.
+    fn record_bookmark_wait(
+        &self,
+        elapsed: Duration,
+        wait: Option<crate::BookmarkWait>,
+        declined: bool,
+    ) {
+        self.bookmark_waits.fetch_add(1, Ordering::Relaxed);
+        self.bookmark_wait_latency.record(elapsed);
+        if declined {
+            self.bookmark_waits_declined.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some(wait) = wait else {
+            // A wait that *declined* carries no observation — the shard returns
+            // `Err(SnapshotAhead)` and the observation does not survive the `?`
+            // — but it is still a poll, and by construction rather than by
+            // assumption: `wait_for_storage_sequence`'s fast exit returns `Ok`,
+            // so the only way to reach `SnapshotAhead` is from inside the loop,
+            // after at least one `refresh_durable_reader`. Leaving it out would
+            // subtract the worst waits from the numerator of the very ratio
+            // they are the point of.
+            //
+            // The owner/non-owner split is *not* inferred the same way, because
+            // there is no theorem to lean on: a caller can present an epoch
+            // ahead of every node, and then even the cell's writer polls and
+            // declines. So a declined wait counts in neither, and the gap
+            // between `on + off` and the total is exactly the waits nobody
+            // could attribute.
+            if declined {
+                self.bookmark_waits_polled.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        };
+        if wait.entered_poll_loop() {
+            self.bookmark_waits_polled.fetch_add(1, Ordering::Relaxed);
+        }
+        let counter = if wait.served_by_cell_writer {
+            &self.bookmark_waits_on_cell_writer
+        } else {
+            &self.bookmark_waits_off_cell_writer
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one finished request: its rows, and either its completion or its
@@ -938,12 +1240,36 @@ impl ClientQueryMetrics {
     /// They are spelled out rather than matched with `_` so that adding a
     /// variant is a compile error here instead of a silent misfiling, and they
     /// fold into reads so that the two sums stay total over every observation.
-    fn record_execution(&self, action: QueryTransportAction, elapsed: Duration) {
-        match action {
-            QueryTransportAction::Write => self.write_latency.record(elapsed),
-            QueryTransportAction::Read
-            | QueryTransportAction::Cancel
-            | QueryTransportAction::Admin => self.read_latency.record(elapsed),
+    /// `engine` is the one the statement was **admitted** with, carried on
+    /// [`PreparedClientQuery::cypher_engine`], not the node's current engine:
+    /// a statement that outlives a kill-switch flip is an observation of the
+    /// engine that ran it, and filing it under the new one would corrupt the
+    /// comparison in the direction that matters.
+    fn record_execution(
+        &self,
+        action: QueryTransportAction,
+        elapsed: Duration,
+        engine: CypherEngineMode,
+    ) {
+        match (action, engine) {
+            (QueryTransportAction::Write, CypherEngineMode::Legacy) => {
+                self.write_latency_legacy.record(elapsed)
+            }
+            (QueryTransportAction::Write, CypherEngineMode::Experimental) => {
+                self.write_latency_experimental.record(elapsed)
+            }
+            (
+                QueryTransportAction::Read
+                | QueryTransportAction::Cancel
+                | QueryTransportAction::Admin,
+                CypherEngineMode::Legacy,
+            ) => self.read_latency_legacy.record(elapsed),
+            (
+                QueryTransportAction::Read
+                | QueryTransportAction::Cancel
+                | QueryTransportAction::Admin,
+                CypherEngineMode::Experimental,
+            ) => self.read_latency_experimental.record(elapsed),
         }
     }
 }
@@ -1023,9 +1349,50 @@ struct ClientQueryServiceInner {
     cursors: Mutex<BTreeMap<u64, ServerQueryCursor>>,
     next_cursor_id: AtomicU64,
     cursor_buffer_bytes: AtomicU64,
+    /// Runtime override of `config.cypher_engine`, encoded by
+    /// [`encode_engine_override`]. Read once per statement.
+    cypher_engine_override: AtomicU8,
+}
+
+/// Which Cypher engine a node runs and why, as one consistent reading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CypherEngineSelection {
+    /// `GRAPH_CYPHER_ENGINE` at startup.
+    pub configured: CypherEngineMode,
+    /// The kill-switch override, if one is set.
+    pub override_mode: Option<CypherEngineMode>,
+}
+
+impl CypherEngineSelection {
+    /// The engine new statements are admitted to.
+    pub fn effective(&self) -> CypherEngineMode {
+        self.override_mode.unwrap_or(self.configured)
+    }
+}
+
+const ENGINE_OVERRIDE_NONE: u8 = 0;
+const ENGINE_OVERRIDE_LEGACY: u8 = 1;
+const ENGINE_OVERRIDE_EXPERIMENTAL: u8 = 2;
+
+fn encode_engine_override(mode: Option<CypherEngineMode>) -> u8 {
+    match mode {
+        None => ENGINE_OVERRIDE_NONE,
+        Some(CypherEngineMode::Legacy) => ENGINE_OVERRIDE_LEGACY,
+        Some(CypherEngineMode::Experimental) => ENGINE_OVERRIDE_EXPERIMENTAL,
+    }
+}
+
+fn decode_engine_override(value: u8) -> Option<CypherEngineMode> {
+    match value {
+        ENGINE_OVERRIDE_LEGACY => Some(CypherEngineMode::Legacy),
+        ENGINE_OVERRIDE_EXPERIMENTAL => Some(CypherEngineMode::Experimental),
+        _ => None,
+    }
 }
 
 struct ServerQueryCursor {
+    memory_diagnostic: MemoryDiagnosticGuard,
+    diagnostic_request_bytes: u64,
     owner: ClientQueryKey,
     target: ClientQueryTarget,
     query: String,
@@ -1060,12 +1427,105 @@ impl ClientQueryService {
                 cursors: Mutex::new(BTreeMap::new()),
                 next_cursor_id: AtomicU64::new(1),
                 cursor_buffer_bytes: AtomicU64::new(0),
+                cypher_engine_override: AtomicU8::new(ENGINE_OVERRIDE_NONE),
             }),
         })
     }
 
     pub fn metrics(&self) -> ClientQueryMetricsSnapshot {
         self.inner.metrics.snapshot()
+    }
+
+    /// The Cypher engine a statement admitted now would run through: the
+    /// runtime override when one is set, otherwise the configured engine.
+    ///
+    /// Process-wide, so the metric exporters stamp it on the client latency
+    /// histograms as a label rather than recording two populations: a legacy
+    /// node and an experimental node then sit on one panel without a join on
+    /// the instance name. After an override the label moves with it; the
+    /// cumulative histogram carries over, so `rate()` over the new label value
+    /// counts only statements finished after the flip.
+    pub fn cypher_engine(&self) -> CypherEngineMode {
+        decode_engine_override(self.inner.cypher_engine_override.load(Ordering::SeqCst))
+            .unwrap_or(self.inner.config.cypher_engine)
+    }
+
+    /// The engine `GRAPH_CYPHER_ENGINE` configured at startup.
+    pub fn configured_cypher_engine(&self) -> CypherEngineMode {
+        self.inner.config.cypher_engine
+    }
+
+    /// The configured engine and the runtime override, from one load of the
+    /// override. Reporting them through separate loads could pair one flip's
+    /// override with another's effective engine.
+    pub fn cypher_engine_selection(&self) -> CypherEngineSelection {
+        CypherEngineSelection {
+            configured: self.inner.config.cypher_engine,
+            override_mode: decode_engine_override(
+                self.inner.cypher_engine_override.load(Ordering::SeqCst),
+            ),
+        }
+    }
+
+    /// Kill switch: route statements admitted from now on through `mode`, or
+    /// back to the configured engine when `mode` is `None`. Needs no restart
+    /// and does not persist across one.
+    ///
+    /// Statements already prepared or executing keep the engine they resolved
+    /// at admission; see [`PreparedClientQuery::cypher_engine`]. A binary built
+    /// without `experimental-cypher-engine` refuses `Experimental` here rather
+    /// than accepting it and failing every query afterwards.
+    ///
+    /// Returns the override this call replaced and the selection it installed.
+    /// The selection is built from `mode`, not re-read, so it describes this
+    /// call's update even when another flip lands straight after it.
+    pub fn set_cypher_engine_override(
+        &self,
+        mode: Option<CypherEngineMode>,
+    ) -> Result<(Option<CypherEngineMode>, CypherEngineSelection)> {
+        if mode == Some(CypherEngineMode::Experimental)
+            && !cfg!(feature = "experimental-cypher-engine")
+        {
+            return Err(experimental_engine_not_compiled());
+        }
+        let previous = decode_engine_override(
+            self.inner
+                .cypher_engine_override
+                .swap(encode_engine_override(mode), Ordering::SeqCst),
+        );
+        Ok((
+            previous,
+            CypherEngineSelection {
+                configured: self.inner.config.cypher_engine,
+                override_mode: mode,
+            },
+        ))
+    }
+
+    /// Account result rows converted to a wire protocol and handed to its
+    /// writer. Called by the Bolt and HTTP layers, which own the encoding; the
+    /// `query.serialize` span beside each call carries the same numbers for one
+    /// request.
+    #[cfg_attr(
+        not(any(feature = "bolt-server", feature = "http-api")),
+        allow(dead_code)
+    )]
+    pub(crate) fn record_serialization(&self, elapsed: std::time::Duration, rows: usize) {
+        let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.inner
+            .metrics
+            .serialize_duration_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .serialized_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+        tracing::info_span!(
+            "query.serialize",
+            hydradb.query.rows_serialized = rows as u64,
+            elapsed_us,
+        )
+        .in_scope(|| {});
     }
 
     pub fn max_page_size(&self) -> usize {
@@ -1077,6 +1537,7 @@ impl ClientQueryService {
         let requested = requested.unwrap_or(limit);
         if requested == 0 {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: "query timeout must be greater than zero".to_string(),
             });
@@ -1137,14 +1598,33 @@ impl ClientQueryService {
     /// Block until this cell has durably reached the bookmarked epoch.
     ///
     /// The span exists only when a bookmark does, and its duration *is*
-    /// read-your-writes latency, which no counter measures today. It is the
-    /// first thing to look at for the BFG-007 class of complaint — "the write
-    /// succeeded but the read did not see it" — because it separates "we waited
-    /// for the epoch" from "we never waited and read stale".
+    /// read-your-writes latency. It is the first thing to look at for the
+    /// BFG-007 class of complaint — "the write succeeded but the read did not
+    /// see it" — because it separates "we waited for the epoch" from "we never
+    /// waited and read stale".
+    ///
+    /// # What is measured here, and why it is measured here
+    ///
+    /// Until change 4 of `docs/plans/2026-08-21-cell-affine-read-routing.md`
+    /// this span was the *only* record of the wait, and a span is a sample: the
+    /// 17-38s waits in `docs/2026-08-21-read-path-30s-timeout-findings.md` were
+    /// found by inferring them out of `graph_client_prepare_duration`, an
+    /// average over every prepare. The three instruments below turn that
+    /// inference into a measurement — a duration histogram, a count of the
+    /// waits that fell through to the poll loop, and a count of the waits that
+    /// were served by the cell's own writer — and the point of them is that the
+    /// *next* such investigation is a dashboard query rather than a week.
+    ///
+    /// This is the right layer for all three. The shard knows the two facts and
+    /// has no idea which request they belong to; the client knows the request
+    /// and could not see the facts. [`crate::BookmarkWait`] is what crosses the
+    /// gap.
     ///
     /// The bookmark value itself is never recorded: it is an opaque
     /// caller-held token, and §2 puts it on the never-recorded list. Its
-    /// *epoch* is recorded, which is the part that explains anything.
+    /// *epoch* is recorded, which is the part that explains anything — and that
+    /// rule extends to the log line below, which carries epochs and a cell and
+    /// nothing else.
     pub async fn ensure_bookmark(&self, bookmark: &ClientBookmark) -> Result<()> {
         let span = tracing::info_span!(
             "query.bookmark_wait",
@@ -1152,35 +1632,121 @@ impl ClientQueryService {
             hydradb.cell_id = %bookmark.target.cell_id,
             hydradb.read_epoch = bookmark.epoch,
             observed_epoch = tracing::field::Empty,
+            // Unprefixed, like `observed_epoch` beside them, and deliberately:
+            // `crates/telemetry`'s `semconv` registry is the vocabulary for keys
+            // that *correlate across paths*, and these three describe one wait
+            // on one span. Promote them if a second producer ever records them.
+            polled = tracing::field::Empty,
+            refreshes = tracing::field::Empty,
+            on_cell_writer = tracing::field::Empty,
             error.class = tracing::field::Empty,
             hydradb.sampling.tail_keep = tracing::field::Empty,
         );
-        let outcome = async {
-            let current_sequence = self
+        let started = std::time::Instant::now();
+        // The async block yields the observation alongside the result rather
+        // than writing it to a captured slot, so the borrow checker does not
+        // have to be argued with about a `&mut` held across an await.
+        let (outcome, wait) = async {
+            let (current_sequence, wait) = match self
                 .inner
                 .client
-                .wait_for_storage_sequence(
+                .wait_for_storage_sequence_observed(
                     &bookmark.target.scope,
                     &bookmark.target.cell_id,
                     bookmark.epoch,
                 )
-                .await?
-                .ok_or_else(|| GraphError::UnsupportedQuery {
-                    dialect: "ClientProtocol",
-                    feature: "backend cannot prove bookmark durability".to_string(),
-                })?;
+                .await
+            {
+                Ok(observed) => observed,
+                Err(error) => return (Err(error), None),
+            };
+            if let Some(wait) = wait {
+                let span = tracing::Span::current();
+                span.record("polled", wait.entered_poll_loop());
+                span.record("refreshes", wait.refreshes);
+                span.record("on_cell_writer", wait.served_by_cell_writer);
+            }
+            let Some(current_sequence) = current_sequence else {
+                return (
+                    Err(GraphError::UnsupportedQuery {
+                        reason: QueryFailureReason::InvalidRequest,
+                        dialect: "ClientProtocol",
+                        feature: "backend cannot prove bookmark durability".to_string(),
+                    }),
+                    wait,
+                );
+            };
             tracing::Span::current().record("observed_epoch", current_sequence);
             if current_sequence < bookmark.epoch {
-                return Err(GraphError::SnapshotAhead {
-                    cell_id: bookmark.target.cell_id.clone(),
-                    read_epoch: bookmark.epoch,
-                    current_epoch: current_sequence,
-                });
+                return (
+                    Err(GraphError::SnapshotAhead {
+                        cell_id: bookmark.target.cell_id.clone(),
+                        read_epoch: bookmark.epoch,
+                        current_epoch: current_sequence,
+                    }),
+                    wait,
+                );
             }
-            Ok(())
+            (Ok(()), wait)
         }
         .instrument(span.clone())
         .await;
+        let elapsed = started.elapsed();
+        // `SnapshotAhead` and nothing else: a store failure mid-wait is a
+        // storage-class error, and folding it in here would make the one series
+        // that says "this cell could not catch up in time" also say "the object
+        // store was unavailable".
+        let declined = matches!(&outcome, Err(GraphError::SnapshotAhead { .. }));
+        if declined && wait.is_none() {
+            // Same theorem as in `record_bookmark_wait`: a decline is a poll.
+            // Recorded here rather than inside the block because the shard's
+            // `SnapshotAhead` leaves nothing behind to record it from.
+            span.record("polled", true);
+        }
+        self.inner
+            .metrics
+            .record_bookmark_wait(elapsed, wait, declined);
+        if let Some(wait) = wait.filter(|wait| wait.entered_poll_loop()) {
+            // INFO, and the level is a judgement rather than a default.
+            //
+            // Not WARN: with `GRAPH_READ_ROUTING=fleet` — today's default — a
+            // read that follows a write is load-balanced across the fleet and
+            // two times in three lands off the owner, so WARN would fire on the
+            // majority of bookmark-carrying reads and train every operator to
+            // filter the exact channel that carries the signal *after* the
+            // switch flips. Not DEBUG either: no production deployment collects
+            // it, and a handoff window that cannot be explained from the logs a
+            // node actually ships is how the last investigation took a week.
+            //
+            // INFO is affordable because the population is bounded twice over —
+            // only reads that carry a bookmark, and of those only the ones whose
+            // local reader was genuinely behind — and because change 1 of the
+            // plan is expected to drive it to ~0, at which point every line here
+            // is a writer handoff worth reading. The always-on signal is
+            // `bookmark_waits_polled`; this line is the per-event detail beside
+            // it.
+            //
+            // The string is built inside this branch and nowhere else: the free
+            // path — every read once the switch flips — allocates nothing.
+            //
+            // No `target:` and no `%` sigils, both for the same mechanical
+            // reason rather than by preference: `tracing`'s event macros cannot
+            // parse a dotted field name after an explicit target, nor a dotted
+            // name with a sigil. The default target is the module path, which
+            // an `EnvFilter` directive of `hydradb=…` still matches, so nothing
+            // is lost.
+            let scope = bookmark.target.scope.to_string();
+            tracing::info!(
+                hydradb.scope = scope.as_str(),
+                hydradb.cell_id = bookmark.target.cell_id.as_str(),
+                hydradb.read_epoch = bookmark.epoch,
+                refreshes = wait.refreshes,
+                on_cell_writer = wait.served_by_cell_writer,
+                elapsed_ms = elapsed.as_millis() as u64,
+                declined,
+                "read paid the causal-consistency bookmark wait"
+            );
+        }
         if let Err(err) = &outcome {
             record_span_error(&span, err);
         }
@@ -1245,33 +1811,53 @@ impl ClientQueryService {
         result
     }
 
+    /// This entry point has no separate prepare step -- it parses inside
+    /// execution -- so every failure it returns counts as `execute`.
     async fn execute_rows_inner(
         &self,
         session: &ClientQuerySession,
+        request: ClientQueryRequest,
+    ) -> Result<ClientQueryResult> {
+        // Resolved here rather than inside the body, so the failure and the
+        // execution it belongs to agree on one engine even across a flip.
+        let cypher_engine = self.cypher_engine();
+        let result = self
+            .execute_rows_body(session, request, cypher_engine)
+            .await;
+        self.record_failure(QueryFailureStage::Execute, &result, cypher_engine);
+        result
+    }
+
+    async fn execute_rows_body(
+        &self,
+        session: &ClientQuerySession,
         mut request: ClientQueryRequest,
+        cypher_engine: CypherEngineMode,
     ) -> Result<ClientQueryResult> {
         if request.read_epoch.is_some() {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: "historical graph epochs are not client query snapshots; use a bookmark for causal reads"
                     .to_string(),
             });
         }
+        let preparing = MemoryDiagnosticGuard::new(
+            MemoryStage::ClientPrepare,
+            memory_estimates::request(&request),
+        );
         self.validate_request(&request, None)?;
+        // `cypher_engine` was resolved once by the caller, before anything
+        // read it: a kill-switch flip while this statement is in flight must
+        // not change the engine under it, nor under the failure it may leave.
         let runtime_limit_ms = self.normalize_runtime_limit(&mut request)?;
         // The limit belongs on the root, not on admission: the staging report
         // of "29999 ms; limit is 29999 ms" is only legible next to the budget
         // it was measured against.
         tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
-        let action = self.authorize_query(session, &request)?;
-        let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
-        let (batch_operation, scalar_parameters) = match parsed_unwind {
-            Some(parsed) => (
-                Some(resolve_unwind_batch(parsed, &request.parameters)?),
-                BTreeMap::new(),
-            ),
-            None => (None, scalar_query_parameters(&request.parameters)?),
-        };
+        let action = self.authorize_query(session, &request, cypher_engine)?;
+        let (batch_operation, (scalar_parameters, list_parameters)) =
+            self.prepare_transport_parameters(&request)?;
         if batch_operation.as_ref().is_some_and(|operation| {
             operation.is_write() != (action == QueryTransportAction::Write)
         }) {
@@ -1288,24 +1874,38 @@ impl ClientQueryService {
                 self.inner.config.max_parameters,
             )?;
         }
+        let estimated_bytes = memory_estimates::request(&request)
+            .saturating_add(memory_estimates::bound(
+                &scalar_parameters,
+                &list_parameters,
+            ))
+            .saturating_add(memory_estimates::batch(&batch_operation));
         let key = client_query_key(session, &request);
         let (generation, cancellation_token) = self.begin_query(key.clone()).await?;
+        drop(preparing);
         let result = self
             .run_query_with_timeout(
                 &key,
                 generation,
                 &cancellation_token,
                 runtime_limit_ms,
+                estimated_bytes,
                 async {
                     self.validate_bookmark(&request).await?;
                     self.refresh_strong_read(&request, action, &cancellation_token)
                         .await?;
+                    let _context_memory = MemoryDiagnosticGuard::new(
+                        MemoryStage::ClientContextParameters,
+                        memory_estimates::bound(&scalar_parameters, &list_parameters),
+                    );
                     let mut context = query_context(
                         session,
                         &request,
                         scalar_parameters.clone(),
+                        list_parameters.clone(),
                         cancellation_token.clone(),
-                    );
+                    )
+                    .with_cypher_engine(cypher_engine);
                     if action == QueryTransportAction::Read {
                         context.read_epoch = None;
                         context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
@@ -1321,6 +1921,10 @@ impl ClientQueryService {
                                 .await?
                         }
                     };
+                    let _result_memory = MemoryDiagnosticGuard::new(
+                        MemoryStage::ClientResultBuffer,
+                        result.estimated_resident_bytes(),
+                    );
                     let read_epoch = result_read_epoch(&result, action)?;
                     let storage_sequence = result_storage_sequence(&result, action)?;
                     let bookmark = self
@@ -1381,11 +1985,17 @@ impl ClientQueryService {
         page_size: usize,
     ) -> Result<ClientQueryPage> {
         if cursor.is_none() && request.read_epoch.is_some() {
-            return Err(GraphError::UnsupportedQuery {
+            let error = GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: "historical graph epochs are not client query snapshots; use a bookmark for causal reads"
                     .to_string(),
-            });
+            };
+            // Rejected ahead of `prepare_page_request`, so neither of its
+            // wrappers sees it; count it where it is raised, against the
+            // engine that would have taken it.
+            self.record_request_failure(QueryFailureStage::Prepare, &error, self.cypher_engine());
+            return Err(error);
         }
         let prepared = self
             .prepare_page_request(session, request, page_size)
@@ -1432,19 +2042,40 @@ impl ClientQueryService {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<ClientQueryPage> {
+        // The statement's own engine, from its admission, not the node's
+        // current one: a flip between RUN and PULL must not move its failure.
+        let cypher_engine = prepared.cypher_engine;
+        let result = self
+            .execute_prepared_page_body(session, prepared, cursor, page_size)
+            .await;
+        self.record_failure(QueryFailureStage::Execute, &result, cypher_engine);
+        result
+    }
+
+    async fn execute_prepared_page_body(
+        &self,
+        session: &ClientQuerySession,
+        prepared: PreparedClientQuery,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<ClientQueryPage> {
         let execution_started = std::time::Instant::now();
         let PreparedClientQuery {
+            memory_diagnostic,
             request,
             action,
             columns: _,
             scalar_parameters,
+            list_parameters,
             batch_operation,
+            cypher_engine,
         } = prepared;
         // Grants can change while a Bolt cursor is open. The parsed query and
         // access classification are reusable, but authorization is not.
         self.authorize_scope(session, &request.target.scope, action)?;
         if action == QueryTransportAction::Write && cursor.is_some() {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: "mutation queries cannot continue from a result cursor".to_string(),
             });
@@ -1452,26 +2083,40 @@ impl ClientQueryService {
         let runtime_limit_ms = request
             .max_runtime_ms
             .expect("prepared client queries have a normalized runtime limit");
+        let estimated_bytes = memory_estimates::request(&request)
+            .saturating_add(memory_estimates::bound(
+                &scalar_parameters,
+                &list_parameters,
+            ))
+            .saturating_add(memory_estimates::batch(&batch_operation));
         let key = client_query_key(session, &request);
         let (generation, cancellation_token) = self.begin_query(key.clone()).await?;
+        drop(memory_diagnostic);
         let result = self
             .run_query_with_timeout(
                 &key,
                 generation,
                 &cancellation_token,
                 runtime_limit_ms,
+                estimated_bytes,
                 async {
                     if let Some(cursor) = cursor {
                         return self
                             .continue_server_cursor(session, &request, cursor, page_size)
                             .await;
                     }
+                    let _context_memory = MemoryDiagnosticGuard::new(
+                        MemoryStage::ClientContextParameters,
+                        memory_estimates::bound(&scalar_parameters, &list_parameters),
+                    );
                     let mut context = query_context(
                         session,
                         &request,
                         scalar_parameters.clone(),
+                        list_parameters.clone(),
                         cancellation_token.clone(),
-                    );
+                    )
+                    .with_cypher_engine(cypher_engine);
                     context.max_runtime_ms = request.max_runtime_ms;
                     context.cancellation_token = Some(cancellation_token.clone());
                     if action == QueryTransportAction::Read {
@@ -1493,6 +2138,10 @@ impl ClientQueryService {
                                     .await?
                             }
                         };
+                        let _result_memory = MemoryDiagnosticGuard::new(
+                            MemoryStage::ClientResultBuffer,
+                            result.estimated_resident_bytes(),
+                        );
                         let read_epoch = result_read_epoch(&result, action)?;
                         let storage_sequence = result_storage_sequence(&result, action)?;
                         let bookmark = self
@@ -1538,66 +2187,143 @@ impl ClientQueryService {
         );
         self.inner
             .metrics
-            .record_execution(action, execution_started.elapsed());
+            .record_execution(action, execution_started.elapsed(), cypher_engine);
         result
     }
 
+    /// Both client protocols prepare here, so this is the one place a query
+    /// that cannot be parsed, lowered or planned is counted -- on Bolt the
+    /// failure goes straight back to the client and never reaches
+    /// [`Self::record_result_metrics`].
     pub(crate) async fn prepare_page_request(
+        &self,
+        session: &ClientQuerySession,
+        request: ClientQueryRequest,
+        page_size: usize,
+    ) -> Result<PreparedClientQuery> {
+        // One load, for the statement and for the failure it may leave: the
+        // body admits on this engine and a failure inside it is counted
+        // against the same one, so a flip between the two cannot file a
+        // prepare failure against an engine that never saw the statement.
+        let cypher_engine = self.cypher_engine();
+        let result = self
+            .prepare_page_request_body(session, request, page_size, cypher_engine)
+            .await;
+        self.record_failure(QueryFailureStage::Prepare, &result, cypher_engine);
+        result
+    }
+
+    async fn prepare_page_request_body(
         &self,
         session: &ClientQuerySession,
         mut request: ClientQueryRequest,
         page_size: usize,
+        cypher_engine: CypherEngineMode,
     ) -> Result<PreparedClientQuery> {
+        let _preparing = MemoryDiagnosticGuard::new(
+            MemoryStage::ClientPrepare,
+            memory_estimates::request(&request),
+        );
         let prepare_started = std::time::Instant::now();
         self.inner
             .metrics
             .prepare_requests
             .fetch_add(1, Ordering::Relaxed);
         self.validate_request(&request, Some(page_size))?;
+        // `cypher_engine` was resolved once by the caller at RUN and is
+        // carried on the prepared statement from here, so every PULL of this
+        // statement uses it whatever the kill switch says later.
         let runtime_limit_ms = self.normalize_runtime_limit(&mut request)?;
         tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
-        let action = self.authorize_query(session, &request)?;
+        let action = self.authorize_query(session, &request, cypher_engine)?;
         self.validate_bookmark(&request).await?;
 
-        let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
-        let (batch_operation, scalar_parameters) = match parsed_unwind {
-            Some(parsed) => (
-                Some(resolve_unwind_batch(parsed, &request.parameters)?),
-                BTreeMap::new(),
-            ),
-            None => (None, scalar_query_parameters(&request.parameters)?),
-        };
+        let (batch_operation, (scalar_parameters, list_parameters)) =
+            self.prepare_transport_parameters(&request)?;
 
         let columns = if let Some(operation) = &batch_operation {
             batch_operation_columns(operation)
+        } else if cypher_engine == CypherEngineMode::Experimental {
+            #[cfg(feature = "experimental-cypher-engine")]
+            {
+                match action {
+                    QueryTransportAction::Read => {
+                        match parse_native_path_procedure_columns(&request.query)? {
+                            Some(columns) => columns,
+                            None => experimental_query_columns(
+                                &request.query,
+                                &scalar_parameters,
+                                &list_parameters,
+                            )?,
+                        }
+                    }
+                    QueryTransportAction::Write => {
+                        let Some(mutation) = parse_opencypher_mutation_query_with_list_parameters(
+                            &request.query,
+                            &scalar_parameters,
+                            &list_parameters,
+                        )?
+                        else {
+                            return Err(GraphError::UnsupportedQuery {
+                                reason: QueryFailureReason::Mutation,
+                                dialect: "ClientProtocol",
+                                feature: "write query is not executable by the mutation engine"
+                                    .to_string(),
+                            });
+                        };
+                        // A mutation with a trailing RETURN has to declare its column
+                        // before execution: Bolt sends the field names in the RUN
+                        // response, ahead of any record.
+                        mutation
+                            .returning
+                            .map(|returning| vec![returning.column])
+                            .unwrap_or_default()
+                    }
+                    QueryTransportAction::Cancel | QueryTransportAction::Admin => {
+                        unreachable!("query access classification only returns read or write")
+                    }
+                }
+            }
+            #[cfg(not(feature = "experimental-cypher-engine"))]
+            {
+                return Err(experimental_engine_not_compiled());
+            }
         } else {
             match action {
                 QueryTransportAction::Read => {
                     match parse_native_path_procedure_columns(&request.query)? {
                         Some(columns) => columns,
                         None => {
-                            parse_opencypher_row_query_with_parameters(
+                            parse_opencypher_row_query_with_list_parameters(
                                 &request.query,
                                 &scalar_parameters,
+                                &list_parameters,
                             )?
                             .columns
                         }
                     }
                 }
                 QueryTransportAction::Write => {
-                    let mutation = parse_opencypher_mutation_query_with_parameters(
+                    let Some(mutation) = parse_opencypher_mutation_query_with_list_parameters(
                         &request.query,
                         &scalar_parameters,
+                        &list_parameters,
                     )?
-                    .is_some();
-                    if !mutation {
+                    else {
                         return Err(GraphError::UnsupportedQuery {
+                            reason: QueryFailureReason::Mutation,
                             dialect: "ClientProtocol",
                             feature: "write query is not executable by the mutation engine"
                                 .to_string(),
                         });
-                    }
-                    Vec::new()
+                    };
+                    // A mutation with a trailing RETURN has to declare its column
+                    // before execution: Bolt sends the field names in the RUN
+                    // response, ahead of any record.
+                    mutation
+                        .returning
+                        .map(|returning| vec![returning.column])
+                        .unwrap_or_default()
                 }
                 QueryTransportAction::Cancel | QueryTransportAction::Admin => {
                     unreachable!("query access classification only returns read or write")
@@ -1621,11 +2347,22 @@ impl ClientQueryService {
             )?;
         }
         let prepared = PreparedClientQuery {
+            memory_diagnostic: MemoryDiagnosticGuard::new(
+                MemoryStage::ClientPrepared,
+                memory_estimates::request(&request)
+                    .saturating_add(memory_estimates::bound(
+                        &scalar_parameters,
+                        &list_parameters,
+                    ))
+                    .saturating_add(memory_estimates::batch(&batch_operation)),
+            ),
             request,
             action,
             columns,
             scalar_parameters,
+            list_parameters,
             batch_operation,
+            cypher_engine,
         };
         self.inner.metrics.prepare_duration_us.fetch_add(
             prepare_started
@@ -1687,6 +2424,11 @@ impl ClientQueryService {
         let next_bytes = current_bytes.saturating_add(resident_bytes);
         let cursor_id = next_cursor_id(&self.inner.next_cursor_id, &cursors)?;
         let cursor = ServerQueryCursor {
+            memory_diagnostic: MemoryDiagnosticGuard::new(
+                MemoryStage::CursorBuffer,
+                resident_bytes.saturating_add(memory_estimates::request(request)),
+            ),
+            diagnostic_request_bytes: memory_estimates::request(request),
             owner: client_query_key(session, request),
             target: request.target.clone(),
             query: request.query.clone(),
@@ -1722,6 +2464,7 @@ impl ClientQueryService {
         let expected_owner = client_query_key(session, request);
         let Some(cursor) = cursors.get(&token.offset) else {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: "result cursor is unknown or expired".to_string(),
             });
@@ -1732,6 +2475,7 @@ impl ClientQueryService {
             || cursor.parameters != request.parameters
         {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: "result cursor does not belong to this query request".to_string(),
             });
@@ -1743,6 +2487,11 @@ impl ClientQueryService {
         let previous_bytes = cursor.resident_bytes;
         let page_rows = take_cursor_rows(&mut cursor.rows, page_size);
         cursor.resident_bytes = query_rows_resident_bytes(&cursor.rows);
+        cursor.memory_diagnostic.set_bytes(
+            cursor
+                .resident_bytes
+                .saturating_add(cursor.diagnostic_request_bytes),
+        );
         let released_bytes = previous_bytes.saturating_sub(cursor.resident_bytes);
         self.inner
             .cursor_buffer_bytes
@@ -1827,6 +2576,7 @@ impl ClientQueryService {
         let active_queries = self.inner.active_queries.lock().await;
         let Some(active) = active_queries.get(&key) else {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: format!("no active query with id {query_id} was cancelled"),
             });
@@ -1868,6 +2618,7 @@ impl ClientQueryService {
         if let Some(page_size) = page_size {
             if page_size == 0 {
                 return Err(GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::InvalidRequest,
                     dialect: "ClientProtocol",
                     feature: "page size must be greater than zero".to_string(),
                 });
@@ -1885,13 +2636,77 @@ impl ClientQueryService {
         &self,
         session: &ClientQuerySession,
         request: &ClientQueryRequest,
+        cypher_engine: CypherEngineMode,
     ) -> Result<QueryTransportAction> {
-        let action = match classify_opencypher_query_access(&request.query)? {
-            OpenCypherQueryAccess::Read => QueryTransportAction::Read,
-            OpenCypherQueryAccess::Write => QueryTransportAction::Write,
+        let action = if cypher_engine == CypherEngineMode::Experimental {
+            #[cfg(feature = "experimental-cypher-engine")]
+            {
+                match classify_opencypher_query_access(&request.query)? {
+                    OpenCypherQueryAccess::Read => {
+                        // A read UNWIND batch is not this engine's to plan:
+                        // `prepare_transport_parameters` hands it to the batch
+                        // path a step later, as it does on the legacy engine.
+                        // It is refused here in two ways -- rows the sidecar
+                        // split will not take, and an empty list that splits
+                        // cleanly but leaves the planner an UNWIND it cannot
+                        // parse -- so both refusals ask the same question.
+                        // Asking only on a refusal keeps the batch parse off
+                        // every other read, which pays for it in prepare.
+                        let refusal_stands = |error: GraphError| -> Result<()> {
+                            match parse_opencypher_unwind_batch(&request.query)? {
+                                Some(_) => Ok(()),
+                                None => Err(error),
+                            }
+                        };
+                        match split_query_parameters(&request.parameters) {
+                            Ok((parameters, lists)) => {
+                                if parse_native_path_procedure_columns(&request.query)?.is_none() {
+                                    if let Err(error) = prepare_experimental_cypher(
+                                        &request.query,
+                                        &parameters,
+                                        &lists,
+                                    ) {
+                                        refusal_stands(error)?;
+                                    }
+                                }
+                            }
+                            Err(error) => refusal_stands(error)?,
+                        }
+                        QueryTransportAction::Read
+                    }
+                    OpenCypherQueryAccess::Write => QueryTransportAction::Write,
+                }
+            }
+            #[cfg(not(feature = "experimental-cypher-engine"))]
+            {
+                return Err(experimental_engine_not_compiled());
+            }
+        } else {
+            match classify_opencypher_query_access(&request.query)? {
+                OpenCypherQueryAccess::Read => QueryTransportAction::Read,
+                OpenCypherQueryAccess::Write => QueryTransportAction::Write,
+            }
         };
         self.authorize_scope(session, &request.target.scope, action)?;
         Ok(action)
+    }
+
+    fn prepare_transport_parameters(
+        &self,
+        request: &ClientQueryRequest,
+    ) -> Result<(Option<QueryBatchOperation>, BoundQueryParameters)> {
+        match parse_opencypher_unwind_batch(&request.query)? {
+            // An UNWIND batch consumes its list itself, so nothing reaches the
+            // sidecar on that path.
+            Some(parsed) => Ok((
+                Some(resolve_unwind_batch(parsed, &request.parameters)?),
+                (BTreeMap::new(), BTreeMap::new()),
+            )),
+            None => {
+                let (scalars, lists) = split_query_parameters(&request.parameters)?;
+                Ok((None, (scalars, lists)))
+            }
+        }
     }
 
     fn normalize_runtime_limit(&self, request: &mut ClientQueryRequest) -> Result<u64> {
@@ -1933,6 +2748,7 @@ impl ClientQueryService {
         }
         if action != QueryTransportAction::Read {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: "strong consistency applies only to read queries".to_string(),
             });
@@ -1954,6 +2770,7 @@ impl ClientQueryService {
             _ = cancellation_token.cancelled() => return Err(client_query_cancelled()),
         };
         sequence.ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::InvalidRequest,
             dialect: "ClientProtocol",
             feature: "backend cannot refresh the latest durable SlateDB frontier".to_string(),
         })?;
@@ -2009,6 +2826,7 @@ impl ClientQueryService {
         let mut active_queries = self.inner.active_queries.lock().await;
         if active_queries.contains_key(&key) {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
                 feature: format!("query id {} is already active", key.query_id),
             });
@@ -2054,7 +2872,9 @@ impl ClientQueryService {
                 "query.admission",
                 hydradb.scope = %key.scope,
                 error.class = tracing::field::Empty,
+                error.operation = tracing::field::Empty,
             );
+            let admission_started = std::time::Instant::now();
             let permits = async {
                 let namespace_permits = self
                     .acquire_namespace_permits(&key.scope.namespace, cancellation_token)
@@ -2064,6 +2884,10 @@ impl ClientQueryService {
             }
             .instrument(admission.clone())
             .await;
+            self.inner.metrics.admission_wait_us.fetch_add(
+                u64::try_from(admission_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             let (_namespace_permits, _query_permit) = match permits {
                 Ok(permits) => permits,
                 Err(err) => {
@@ -2071,6 +2895,8 @@ impl ClientQueryService {
                     return Err(err);
                 }
             };
+            let _execution =
+                MemoryDiagnosticGuard::new(MemoryStage::ClientExecute, request_estimated_bytes());
             execute.await
         })
         .catch_unwind()
@@ -2107,12 +2933,16 @@ impl ClientQueryService {
         generation: u64,
         cancellation_token: &QueryCancellationToken,
         runtime_limit_ms: u64,
+        estimated_bytes: u64,
         execute: F,
     ) -> Result<T>
     where
         F: Future<Output = Result<T>>,
     {
-        let query = self.run_query(key, generation, cancellation_token, execute);
+        let query = cancellation_token.scope(REQUEST_ESTIMATED_BYTES.scope(
+            estimated_bytes,
+            self.run_query(key, generation, cancellation_token, execute),
+        ));
         tokio::pin!(query);
         tokio::select! {
             result = &mut query => result,
@@ -2138,6 +2968,10 @@ impl ClientQueryService {
                     .metrics
                     .backpressure_waits
                     .fetch_add(1, Ordering::Relaxed);
+                let _waiting = MemoryDiagnosticGuard::new(
+                    MemoryStage::ClientQueryWait,
+                    request_estimated_bytes(),
+                );
                 tokio::select! {
                     permit = Arc::clone(&self.inner.query_gate).acquire_owned() => {
                         permit.map_err(|err| GraphError::CorruptValue {
@@ -2168,6 +3002,10 @@ impl ClientQueryService {
                         .metrics
                         .backpressure_waits
                         .fetch_add(1, Ordering::Relaxed);
+                    let _waiting = MemoryDiagnosticGuard::new(
+                        MemoryStage::ClientNamespaceWait,
+                        request_estimated_bytes(),
+                    );
                     tokio::select! {
                         permit = Arc::clone(gate).acquire_owned() => {
                             permit.map_err(|err| GraphError::CorruptValue {
@@ -2191,6 +3029,41 @@ impl ClientQueryService {
     /// the whole reason to distinguish one failure from another: a rate of
     /// `queries_failed` says a client is unhappy, and the same rate split by
     /// class says which subsystem to look at first.
+    fn record_failure<T>(
+        &self,
+        stage: QueryFailureStage,
+        result: &Result<T>,
+        engine: CypherEngineMode,
+    ) {
+        if let Err(error) = result {
+            self.record_request_failure(stage, error, engine);
+        }
+    }
+
+    /// Count a request a protocol adapter rejected before handing it to this
+    /// service, for the checks that are a property of the query request
+    /// rather than of the wire format. Framing, decoding and authentication
+    /// failures are not query failures and stay out of this family;
+    /// authentication has `auth_failures`.
+    /// `engine` is the statement's admitted engine where there is one, and
+    /// otherwise the engine effective at the moment of the rejection. Either
+    /// way it is fixed here, at the point of recording, so a later kill-switch
+    /// flip cannot move a failure between engines.
+    pub(crate) fn record_request_failure(
+        &self,
+        stage: QueryFailureStage,
+        error: &GraphError,
+        engine: CypherEngineMode,
+    ) {
+        match engine {
+            CypherEngineMode::Legacy => &self.inner.metrics.queries_failed_by_reason_legacy,
+            CypherEngineMode::Experimental => {
+                &self.inner.metrics.queries_failed_by_reason_experimental
+            }
+        }
+        .record(stage, error);
+    }
+
     fn record_result_metrics(
         &self,
         _action: QueryTransportAction,
@@ -2208,6 +3081,9 @@ impl ClientQueryService {
 /// question and the one an operator asks first.
 fn record_span_error(span: &tracing::Span, err: &GraphError) {
     span.record("error.class", err.class());
+    if let Some(operation) = err.limit_operation() {
+        span.record("error.operation", operation);
+    }
     // The head sampler decided this trace's fate when the root span started,
     // which was before this request could possibly be known to fail, so nothing
     // recorded here can change it. The marker is for the collector's tail
@@ -2266,6 +3142,7 @@ pub(crate) fn client_root_span(
                 hydradb.query.rows_returned = tracing::field::Empty,
                 runtime_limit_ms = tracing::field::Empty,
                 error.class = tracing::field::Empty,
+                error.operation = tracing::field::Empty,
                 hydradb.sampling.tail_keep = tracing::field::Empty,
             )
         };
@@ -2360,10 +3237,19 @@ fn result_storage_sequence(
         })
 }
 
+fn experimental_engine_not_compiled() -> GraphError {
+    GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Other,
+        dialect: "Cypher25",
+        feature: "the experimental-cypher-engine Cargo feature is not enabled".to_string(),
+    }
+}
+
 fn query_context(
     session: &ClientQuerySession,
     request: &ClientQueryRequest,
     parameters: BTreeMap<String, VertexPropertyValue>,
+    list_parameters: BTreeMap<String, Vec<VertexPropertyValue>>,
     cancellation_token: QueryCancellationToken,
 ) -> QueryContext {
     let mutation_idempotency_key = match request.mutation_idempotency_key.as_ref() {
@@ -2376,6 +3262,7 @@ fn query_context(
     let mut context = QueryContext::new(&request.target.cell_id, mutation_idempotency_key)
         .in_scope(request.target.scope.clone())
         .with_parameters(parameters)
+        .with_list_parameters(list_parameters)
         .with_cancellation_token(cancellation_token);
     if let Some(read_epoch) = request.read_epoch {
         context = context.at_epoch(read_epoch);
@@ -2404,23 +3291,44 @@ fn principal_scoped_mutation_idempotency_key(
     )
 }
 
-fn scalar_query_parameters(
+/// Split bound parameters into the scalar map every engine has always taken and
+/// the list sidecar that `IN` reads.
+///
+/// A list of scalars is no longer refused. Refusing it was what made
+/// `WHERE x IN $ids` unusable from a client, whichever engine was selected: the
+/// rejection happened here, before the query text was looked at. A list holding
+/// anything but scalars, and a map, are still refused with the message they
+/// always had, because those remain UNWIND-only inputs.
+fn split_query_parameters(
     parameters: &BTreeMap<String, QueryParameterValue>,
-) -> Result<BTreeMap<String, VertexPropertyValue>> {
-    parameters
-        .iter()
-        .map(|(name, value)| match value {
-            QueryParameterValue::Scalar(value) => Ok((name.clone(), value.clone())),
-            QueryParameterValue::List(_) | QueryParameterValue::Map(_) => {
-                Err(GraphError::UnsupportedQuery {
-                    dialect: "ClientProtocol",
-                    feature: format!(
-                        "composite parameter ${name} is only supported as an UNWIND input"
-                    ),
-                })
+) -> Result<BoundQueryParameters> {
+    let composite = |name: &str| GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Parameter,
+        dialect: "ClientProtocol",
+        feature: format!("composite parameter ${name} is only supported as an UNWIND input"),
+    };
+    let mut scalars = BTreeMap::new();
+    let mut lists = BTreeMap::new();
+    for (name, value) in parameters {
+        match value {
+            QueryParameterValue::Scalar(value) => {
+                scalars.insert(name.clone(), value.clone());
             }
-        })
-        .collect()
+            QueryParameterValue::List(values) => {
+                let mut scalar_values = Vec::with_capacity(values.len());
+                for value in values {
+                    let QueryParameterValue::Scalar(value) = value else {
+                        // A list of rows is an UNWIND input, not an `IN` list.
+                        return Err(composite(name));
+                    };
+                    scalar_values.push(value.clone());
+                }
+                lists.insert(name.clone(), scalar_values);
+            }
+            QueryParameterValue::Map(_) => return Err(composite(name)),
+        }
+    }
+    Ok((scalars, lists))
 }
 
 fn resolve_unwind_batch(
@@ -2436,6 +3344,7 @@ fn resolve_unwind_batch(
         })?;
     let QueryParameterValue::List(rows) = value else {
         return Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Unwind,
             dialect: "OpenCypher",
             feature: format!("UNWIND parameter ${} must be a list", parsed.parameter),
         });
@@ -2498,6 +3407,67 @@ fn resolve_unwind_batch(
             vertices.sort_unstable();
             vertices.dedup();
             Ok(QueryBatchOperation::DeleteVertices { vertices, detach })
+        }
+        ParsedUnwindBatchKind::DeleteIsolatedVertices {
+            vertex_field,
+            path_node_constraints,
+            deleted_column,
+        } => {
+            let candidates = unwind_isolated_candidates(
+                rows,
+                &vertex_field,
+                &path_node_constraints,
+                parameters,
+            )?;
+            Ok(QueryBatchOperation::DeleteIsolatedVertices {
+                candidates,
+                deleted_column,
+            })
+        }
+        ParsedUnwindBatchKind::DeleteVerticesAndIsolatedCandidates {
+            detach_vertex_field,
+            isolated_parameter,
+            isolated_vertex_field,
+            isolated_path_node_constraints,
+            deleted_column,
+        } => {
+            let mut detach_vertices = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| unwind_row_vertex_id(row, index, &detach_vertex_field))
+                .collect::<Result<Vec<_>>>()?;
+            let isolated_value = parameters
+                .get(&isolated_parameter)
+                .or_else(|| parameters.get(&format!("${isolated_parameter}")))
+                .ok_or_else(|| GraphError::MissingQueryParameter {
+                    dialect: "OpenCypher",
+                    name: isolated_parameter.clone(),
+                })?;
+            let QueryParameterValue::List(isolated_rows) = isolated_value else {
+                return Err(GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::Unwind,
+                    dialect: "OpenCypher",
+                    feature: format!("UNWIND parameter ${isolated_parameter} must be a list"),
+                });
+            };
+            let mut isolated_candidates = unwind_isolated_candidates(
+                isolated_rows,
+                &isolated_vertex_field,
+                &isolated_path_node_constraints,
+                parameters,
+            )?;
+            detach_vertices.sort_unstable();
+            detach_vertices.dedup();
+            let detach_set = detach_vertices
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            isolated_candidates.retain(|candidate| !detach_set.contains(&candidate.vertex));
+            Ok(QueryBatchOperation::DeleteVerticesAndIsolatedCandidates {
+                detach_vertices,
+                isolated_candidates,
+                deleted_column,
+            })
         }
         ParsedUnwindBatchKind::DeleteRelationshipsByProperty {
             edge_type,
@@ -2665,11 +3635,13 @@ fn unwind_row_vertex_id(
 ) -> Result<crate::VertexId> {
     let QueryParameterValue::Map(row) = row else {
         return Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Unwind,
             dialect: "OpenCypher",
             feature: format!("UNWIND row {index} must be a map"),
         });
     };
     let value = row.get(field).ok_or_else(|| GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Unwind,
         dialect: "OpenCypher",
         feature: format!("UNWIND row {index} is missing field {field}"),
     })?;
@@ -2681,6 +3653,7 @@ fn unwind_row_vertex_id(
         QueryParameterValue::Scalar(_)
         | QueryParameterValue::List(_)
         | QueryParameterValue::Map(_) => Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Unwind,
             dialect: "OpenCypher",
             feature: format!("UNWIND row {index} field {field} must be a non-negative integer"),
         }),
@@ -2694,6 +3667,7 @@ fn unwind_row_scalar(
 ) -> Result<VertexPropertyValue> {
     let QueryParameterValue::Map(row) = row else {
         return Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Unwind,
             dialect: "OpenCypher",
             feature: format!("UNWIND row {index} must be a map"),
         });
@@ -2702,15 +3676,83 @@ fn unwind_row_scalar(
         Some(QueryParameterValue::Scalar(value)) => Ok(value.clone()),
         Some(QueryParameterValue::List(_) | QueryParameterValue::Map(_)) => {
             Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Unwind,
                 dialect: "OpenCypher",
                 feature: format!("UNWIND row {index} field {field} must be scalar"),
             })
         }
         None => Err(GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Unwind,
             dialect: "OpenCypher",
             feature: format!("UNWIND row {index} is missing field {field}"),
         }),
     }
+}
+
+fn unwind_isolated_candidates(
+    rows: &[QueryParameterValue],
+    vertex_field: &str,
+    constraints: &ParsedUnwindVertexConstraints,
+    parameters: &BTreeMap<String, QueryParameterValue>,
+) -> Result<Vec<QueryBatchIsolatedVertex>> {
+    let mut candidates = BTreeMap::<crate::VertexId, VertexMetadata>::new();
+    for (index, row) in rows.iter().enumerate() {
+        let vertex = unwind_row_vertex_id(row, index, vertex_field)?;
+        let mut metadata = VertexMetadata {
+            labels: constraints.labels.clone(),
+            properties: BTreeMap::new(),
+        };
+        for (property, value) in &constraints.properties {
+            let value = match value {
+                ParsedUnwindConstraintValue::Literal(value) => value.clone(),
+                ParsedUnwindConstraintValue::Parameter(name) => {
+                    match parameters
+                        .get(name)
+                        .or_else(|| parameters.get(&format!("${name}")))
+                    {
+                        Some(QueryParameterValue::Scalar(value)) => value.clone(),
+                        Some(QueryParameterValue::List(_) | QueryParameterValue::Map(_)) => {
+                            return Err(GraphError::UnsupportedQuery {
+                                reason: QueryFailureReason::Unwind,
+                                dialect: "OpenCypher",
+                                feature: format!(
+                                    "isolated vertex constraint parameter ${name} must be scalar"
+                                ),
+                            });
+                        }
+                        None => {
+                            return Err(GraphError::MissingQueryParameter {
+                                dialect: "OpenCypher",
+                                name: name.clone(),
+                            });
+                        }
+                    }
+                }
+                ParsedUnwindConstraintValue::RowField(field) => {
+                    unwind_row_scalar(row, index, field)?
+                }
+            };
+            metadata.properties.insert(property.clone(), value);
+        }
+        if let Some(previous) = candidates.insert(vertex, metadata.clone()) {
+            if previous != metadata {
+                return Err(GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::Unwind,
+                    dialect: "OpenCypher",
+                    feature: format!(
+                        "UNWIND rows for vertex {vertex} use conflicting isolation constraints"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .map(|(vertex, path_node_constraints)| QueryBatchIsolatedVertex {
+            vertex,
+            path_node_constraints,
+        })
+        .collect())
 }
 
 fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> {
@@ -2730,6 +3772,12 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
         | QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices { .. }
         | QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices { .. }
         | QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
+        QueryBatchOperation::DeleteIsolatedVertices { deleted_column, .. } => {
+            vec![deleted_column.clone()]
+        }
+        QueryBatchOperation::DeleteVerticesAndIsolatedCandidates { deleted_column, .. } => {
+            vec![deleted_column.clone()]
+        }
     }
 }
 
@@ -2746,6 +3794,7 @@ fn enforce_limit(operation: &'static str, actual: usize, limit: usize) -> Result
 
 fn authentication_error() -> GraphError {
     GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::InvalidRequest,
         dialect: "ClientProtocol",
         feature: "unauthorized client request".to_string(),
     }

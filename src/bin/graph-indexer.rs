@@ -3,38 +3,65 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use futures::StreamExt;
+use hydradb::{
+    object_store_from_env, GraphCluster, GraphError, GraphId, GraphIndexBuildPath,
+    GraphIndexGeneration, GraphLimits, GraphOpenOptions, GraphReaderMode, GraphScope,
+    GraphScopeChange, NamespaceId, NamespacePath, ObjectStoreGraphScopeDirectory,
+};
+use hydradb_telemetry::{semconv, ErrorClass, Outcome, ServiceIdentity, TelemetryConfig};
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{ObjectStoreExt, PutMode, UpdateVersion};
-use slatedb_graph_kernel::{
-    object_store_from_env, GraphCluster, GraphError, GraphId, GraphIndexBuildPath,
-    GraphIndexGeneration, GraphLimits, GraphOpenOptions, GraphScope, NamespaceId, NamespacePath,
-    ObjectStoreGraphScopeDirectory,
-};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::field::Empty;
 use tracing::Instrument;
-use hydradb_telemetry::{semconv, ErrorClass, Outcome, ServiceIdentity, TelemetryConfig};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const DEFAULT_SCOPE_CONCURRENCY: usize = 8;
 const MAX_SCOPE_CONCURRENCY: usize = 64;
+const SCOPE_PROBE_CONCURRENCY_MULTIPLIER: usize = 2;
+const MAX_SCOPE_PROBE_CONCURRENCY: usize = 128;
 const DEFAULT_SCOPES_PER_CYCLE: usize = 256;
 const MAX_SCOPES_PER_CYCLE: usize = 16_384;
+const MIN_SCOPE_CURSOR_CHECKPOINT_SCOPES: usize = 64;
 const DEFAULT_MAX_OPEN_SCOPES: usize = 128;
-const MAX_OPEN_SCOPES: usize = 4_096;
+const MAX_OPEN_SCOPES: usize = 16_384;
+const DEFAULT_DIRTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MIN_DIRTY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const CHANGE_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const INDEXER_READER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn indexer_open_options(max_wal_tail_files: u64, slatedb_cache_bytes: usize) -> GraphOpenOptions {
+    let mut options = GraphOpenOptions::default();
+    options.limits = GraphLimits {
+        max_wal_tail_files,
+        ..GraphLimits::default()
+    };
+    // Cached indexer readers explicitly refresh before every build. Keeping a
+    // managed checkpoint per cached scope creates thousands of periodic S3
+    // writes, while frequent background polls duplicate the explicit refresh.
+    // FollowLatest makes these readers read-only at the object-store level;
+    // failed reads invalidate the scope and reopen it on the next pass.
+    options.reader_mode = GraphReaderMode::FollowLatest;
+    options.reader_manifest_poll_interval = INDEXER_READER_MANIFEST_POLL_INTERVAL;
+    options.cache.slatedb_cache_bytes = slatedb_cache_bytes;
+    options
+}
 const DEFAULT_READINESS_FAILURE_THRESHOLD: u64 = 3;
 const MAX_READINESS_FAILURE_THRESHOLD: u64 = 100;
 const HOT_SCOPE_BUDGET_DIVISOR: usize = 4;
@@ -68,6 +95,14 @@ struct CachedScopeCluster {
     last_used: u64,
     hot: bool,
     idle_rechecks: u8,
+    covered_sequences: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeCacheDisposition {
+    Hit,
+    Admitted,
+    Bypassed,
 }
 
 /// Long-lived read-only scope handles for the indexer.
@@ -85,6 +120,8 @@ struct IndexerScopeCache {
     max_open_scopes: usize,
     access_clock: AtomicU64,
     clusters: AsyncMutex<BTreeMap<GraphScope, CachedScopeCluster>>,
+    scope_run_gates: AsyncMutex<BTreeMap<GraphScope, Weak<AsyncMutex<()>>>>,
+    scope_permits: Semaphore,
     metrics: Arc<IndexerMetrics>,
 }
 
@@ -95,8 +132,12 @@ impl IndexerScopeCache {
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         open_options: GraphOpenOptions,
         max_open_scopes: usize,
+        scope_concurrency: usize,
         metrics: Arc<IndexerMetrics>,
     ) -> Self {
+        metrics
+            .scope_cache_capacity
+            .store(max_open_scopes as u64, Ordering::Release);
         Self {
             data_path,
             cells,
@@ -105,26 +146,74 @@ impl IndexerScopeCache {
             max_open_scopes,
             access_clock: AtomicU64::new(0),
             clusters: AsyncMutex::new(BTreeMap::new()),
+            scope_run_gates: AsyncMutex::new(BTreeMap::new()),
+            scope_permits: Semaphore::new(scope_concurrency),
             metrics,
+        }
+    }
+
+    async fn scope_run_gate(&self, scope: &GraphScope) -> Arc<AsyncMutex<()>> {
+        let mut gates = self.scope_run_gates.lock().await;
+        if let Some(gate) = gates.get(scope).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(AsyncMutex::new(()));
+        gates.insert(scope.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn resident_cluster_for_scope(&self, scope: &GraphScope) -> Option<Arc<GraphCluster>> {
+        let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut clusters = self.clusters.lock().await;
+        let entry = clusters.get_mut(scope)?;
+        entry.last_used = access;
+        self.metrics
+            .scope_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+        Some(Arc::clone(&entry.cluster))
+    }
+
+    async fn covered_sequences_for_scope(
+        &self,
+        scope: &GraphScope,
+        expected: &Arc<GraphCluster>,
+    ) -> BTreeMap<String, u64> {
+        let clusters = self.clusters.lock().await;
+        clusters
+            .get(scope)
+            .filter(|entry| Arc::ptr_eq(&entry.cluster, expected))
+            .map(|entry| entry.covered_sequences.clone())
+            .unwrap_or_default()
+    }
+
+    async fn update_covered_sequences(
+        &self,
+        scope: &GraphScope,
+        expected: &Arc<GraphCluster>,
+        covered_sequences: &BTreeMap<String, u64>,
+    ) {
+        let mut clusters = self.clusters.lock().await;
+        let Some(entry) = clusters
+            .get_mut(scope)
+            .filter(|entry| Arc::ptr_eq(&entry.cluster, expected))
+        else {
+            return;
+        };
+        for (cell_id, sequence) in covered_sequences {
+            entry.covered_sequences.insert(cell_id.clone(), *sequence);
         }
     }
 
     async fn cluster_for_scope(
         &self,
         scope: &GraphScope,
-    ) -> slatedb_graph_kernel::Result<(Arc<GraphCluster>, bool)> {
-        let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
-        {
-            let mut clusters = self.clusters.lock().await;
-            if let Some(entry) = clusters.get_mut(scope) {
-                entry.last_used = access;
-                self.metrics
-                    .scope_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok((Arc::clone(&entry.cluster), true));
-            }
+    ) -> hydradb::Result<(Arc<GraphCluster>, ScopeCacheDisposition)> {
+        if let Some(cluster) = self.resident_cluster_for_scope(scope).await {
+            return Ok((cluster, ScopeCacheDisposition::Hit));
         }
 
+        let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
         self.metrics
             .scope_cache_misses
             .fetch_add(1, Ordering::Relaxed);
@@ -139,58 +228,32 @@ impl IndexerScopeCache {
             .await?,
         );
 
-        let mut evicted = None;
-        let mut admission_error = None;
-        let selected = {
+        let (selected, disposition) = {
             let mut clusters = self.clusters.lock().await;
             if let Some(entry) = clusters.get_mut(scope) {
                 entry.last_used = access;
-                Some(Arc::clone(&entry.cluster))
+                (Arc::clone(&entry.cluster), ScopeCacheDisposition::Hit)
+            } else if clusters.len() >= self.max_open_scopes {
+                self.metrics
+                    .scope_cache_admission_bypasses
+                    .fetch_add(1, Ordering::Relaxed);
+                (Arc::clone(&opened), ScopeCacheDisposition::Bypassed)
             } else {
-                if clusters.len() >= self.max_open_scopes {
-                    let candidate = clusters
-                        .iter()
-                        .filter(|(_, entry)| Arc::strong_count(&entry.cluster) == 1)
-                        .min_by_key(|(_, entry)| entry.last_used)
-                        .map(|(scope, _)| scope.clone());
-                    if let Some(candidate) = candidate {
-                        evicted = clusters.remove(&candidate).map(|entry| entry.cluster);
-                        self.metrics
-                            .scope_cache_evictions
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        admission_error = Some(GraphError::AdmissionRejected {
-                            operation: "indexer_open_scopes",
-                            actual: clusters.len().saturating_add(1) as u64,
-                            limit: self.max_open_scopes as u64,
-                        });
-                    }
-                }
-                if admission_error.is_some() {
-                    None
-                } else {
-                    clusters.insert(
-                        scope.clone(),
-                        CachedScopeCluster {
-                            cluster: Arc::clone(&opened),
-                            last_used: access,
-                            hot: false,
-                            idle_rechecks: 0,
-                        },
-                    );
-                    self.metrics
-                        .scope_cache_entries
-                        .store(clusters.len() as u64, Ordering::Release);
-                    Some(Arc::clone(&opened))
-                }
+                clusters.insert(
+                    scope.clone(),
+                    CachedScopeCluster {
+                        cluster: Arc::clone(&opened),
+                        last_used: access,
+                        hot: false,
+                        idle_rechecks: 0,
+                        covered_sequences: BTreeMap::new(),
+                    },
+                );
+                self.metrics
+                    .scope_cache_entries
+                    .store(clusters.len() as u64, Ordering::Release);
+                (Arc::clone(&opened), ScopeCacheDisposition::Admitted)
             }
-        };
-
-        let Some(selected) = selected else {
-            if let Err(error) = opened.close().await {
-                self.record_close_failure(scope, "admission_rejected", &error);
-            }
-            return Err(admission_error.expect("admission error must accompany a rejected open"));
         };
 
         if !Arc::ptr_eq(&selected, &opened) {
@@ -198,12 +261,7 @@ impl IndexerScopeCache {
                 self.record_close_failure(scope, "duplicate_open", &error);
             }
         }
-        if let Some(cluster) = evicted {
-            if let Err(error) = cluster.close().await {
-                self.record_close_failure(scope, "eviction", &error);
-            }
-        }
-        Ok((selected, false))
+        Ok((selected, disposition))
     }
 
     async fn hot_scopes(&self, limit: usize) -> Vec<GraphScope> {
@@ -224,33 +282,117 @@ impl IndexerScopeCache {
         &self,
         scope: &GraphScope,
         expected: &Arc<GraphCluster>,
-        cache_hit: bool,
+        disposition: ScopeCacheDisposition,
         built: bool,
     ) {
-        let removed = {
+        if disposition == ScopeCacheDisposition::Bypassed {
+            if built {
+                self.admit_built_scope(scope, expected).await;
+            } else if let Err(error) = expected.close().await {
+                self.record_close_failure(scope, "admission_bypassed", &error);
+            }
+            return;
+        }
+
+        let mut demoted = false;
+        {
             let mut clusters = self.clusters.lock().await;
-            let remove = match clusters.get_mut(scope) {
+            match clusters.get_mut(scope) {
                 Some(entry) if Arc::ptr_eq(&entry.cluster, expected) && built => {
                     entry.hot = true;
                     entry.idle_rechecks = 0;
-                    false
                 }
-                Some(entry) if Arc::ptr_eq(&entry.cluster, expected) && cache_hit && entry.hot => {
+                Some(entry)
+                    if Arc::ptr_eq(&entry.cluster, expected)
+                        && disposition == ScopeCacheDisposition::Hit
+                        && entry.hot =>
+                {
                     entry.idle_rechecks = entry.idle_rechecks.saturating_add(1);
-                    entry.idle_rechecks >= HOT_SCOPE_IDLE_RECHECKS
+                    if entry.idle_rechecks >= HOT_SCOPE_IDLE_RECHECKS {
+                        entry.hot = false;
+                        entry.idle_rechecks = 0;
+                        demoted = true;
+                    }
                 }
-                Some(entry) if Arc::ptr_eq(&entry.cluster, expected) => true,
-                _ => false,
-            };
-            let removed = remove.then(|| clusters.remove(scope)).flatten();
+                _ => {}
+            }
+        }
+        if demoted {
             self.metrics
-                .scope_cache_entries
-                .store(clusters.len() as u64, Ordering::Release);
-            removed.map(|entry| entry.cluster)
+                .scope_cache_idle_demotions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn finish_failed_scope(
+        &self,
+        scope: &GraphScope,
+        expected: &Arc<GraphCluster>,
+        disposition: ScopeCacheDisposition,
+    ) -> hydradb::Result<()> {
+        if disposition == ScopeCacheDisposition::Bypassed {
+            expected.close().await
+        } else {
+            self.invalidate(scope, expected).await
+        }
+    }
+
+    async fn admit_built_scope(&self, scope: &GraphScope, expected: &Arc<GraphCluster>) {
+        let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut evicted = None;
+        let admitted = {
+            let mut clusters = self.clusters.lock().await;
+            if let Some(entry) = clusters.get_mut(scope) {
+                entry.last_used = access;
+                entry.hot = true;
+                entry.idle_rechecks = 0;
+                false
+            } else {
+                if clusters.len() >= self.max_open_scopes {
+                    let candidate = clusters
+                        .iter()
+                        .filter(|(_, entry)| Arc::strong_count(&entry.cluster) == 1)
+                        .min_by_key(|(_, entry)| (entry.hot, entry.last_used))
+                        .map(|(scope, _)| scope.clone());
+                    if let Some(candidate) = candidate {
+                        evicted = clusters.remove(&candidate).map(|entry| entry.cluster);
+                        self.metrics
+                            .scope_cache_evictions
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if clusters.len() >= self.max_open_scopes {
+                    false
+                } else {
+                    clusters.insert(
+                        scope.clone(),
+                        CachedScopeCluster {
+                            cluster: Arc::clone(expected),
+                            last_used: access,
+                            hot: true,
+                            idle_rechecks: 0,
+                            covered_sequences: BTreeMap::new(),
+                        },
+                    );
+                    self.metrics
+                        .scope_cache_entries
+                        .store(clusters.len() as u64, Ordering::Release);
+                    self.metrics
+                        .scope_cache_promotions
+                        .fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            }
         };
-        if let Some(cluster) = removed {
+
+        if !admitted {
+            if let Err(error) = expected.close().await {
+                self.record_close_failure(scope, "promotion_bypassed", &error);
+            }
+        }
+        if let Some(cluster) = evicted {
             if let Err(error) = cluster.close().await {
-                self.record_close_failure(scope, "idle_scope", &error);
+                self.record_close_failure(scope, "promotion_eviction", &error);
             }
         }
     }
@@ -259,7 +401,7 @@ impl IndexerScopeCache {
         &self,
         scope: &GraphScope,
         expected: &Arc<GraphCluster>,
-    ) -> slatedb_graph_kernel::Result<()> {
+    ) -> hydradb::Result<()> {
         let removed = {
             let mut clusters = self.clusters.lock().await;
             let matches = clusters
@@ -277,7 +419,7 @@ impl IndexerScopeCache {
         Ok(())
     }
 
-    async fn invalidate_scope(&self, scope: &GraphScope) -> slatedb_graph_kernel::Result<()> {
+    async fn invalidate_scope(&self, scope: &GraphScope) -> hydradb::Result<()> {
         let removed = {
             let mut clusters = self.clusters.lock().await;
             let removed = clusters.remove(scope).map(|entry| entry.cluster);
@@ -318,7 +460,7 @@ impl IndexerScopeCache {
         }
     }
 
-    async fn close(&self) -> slatedb_graph_kernel::Result<()> {
+    async fn close(&self) -> hydradb::Result<()> {
         let clusters = std::mem::take(&mut *self.clusters.lock().await);
         self.metrics.scope_cache_entries.store(0, Ordering::Release);
         let mut failures = Vec::new();
@@ -446,6 +588,34 @@ impl fmt::Display for IndexFailure {
 #[derive(Debug, Default)]
 struct CycleFailures {
     failures: Vec<IndexFailure>,
+}
+
+#[derive(Debug, Default)]
+struct IndexCycleOutcome {
+    built: bool,
+    covered_sequences: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Default)]
+struct RegisteredScopeOutcome {
+    failures: CycleFailures,
+    covered_sequences: BTreeMap<String, u64>,
+    empty: bool,
+}
+
+struct FairScopeRun {
+    failures: CycleFailures,
+    cursor: Option<ScopeCursor>,
+    ending_cursor: Option<String>,
+    cursor_progressed: bool,
+}
+
+struct ScopeChangeRun {
+    scope: GraphScope,
+    already_covered: Vec<GraphScopeChange>,
+    pending: Vec<GraphScopeChange>,
+    outcome: Option<RegisteredScopeOutcome>,
+    coverage_error: Option<GraphError>,
 }
 
 impl CycleFailures {
@@ -638,12 +808,29 @@ struct IndexerMetrics {
     scope_cache_hits: AtomicU64,
     scope_cache_misses: AtomicU64,
     scope_cache_evictions: AtomicU64,
+    scope_cache_admission_bypasses: AtomicU64,
+    scope_cache_promotions: AtomicU64,
+    scope_cache_idle_demotions: AtomicU64,
     scope_cache_close_failures: AtomicU64,
     scope_cache_entries: AtomicU64,
+    scope_cache_capacity: AtomicU64,
+    registered_scopes: AtomicU64,
+    scope_cache_last_warned_shortfall: AtomicU64,
+    change_notifications_observed: AtomicU64,
+    change_notifications_cleared: AtomicU64,
+    changed_scopes_processed: AtomicU64,
+    change_notification_failures: AtomicU64,
+    change_push_wakes: AtomicU64,
+    change_push_rejections: AtomicU64,
+    change_push_throttles: AtomicU64,
+    pending_change_notifications: AtomicU64,
+    last_change_success_ms: AtomicU64,
+    last_change_lag_ms: AtomicU64,
+    stage_timings: Mutex<BTreeMap<(IndexWorkKind, IndexStage), StageTiming>>,
     /// `generations_published`, `generation_failures` and `generations_deleted`,
     /// keyed by `{cell_id, edge_type}`.
     ///
-    /// The four counters above stay process-global because they describe the
+    /// The counters above stay process-global because they describe the
     /// process: a cycle is not a property of a cell. These three describe work
     /// done *to* a cell, and every site that increments them already holds both
     /// identifiers — the same fields [`IndexFailure`] keeps structured so they
@@ -663,7 +850,122 @@ struct IndexerMetrics {
     last_full_sweep_ms: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum IndexWorkKind {
+    Change,
+    Sweep,
+}
+
+impl IndexWorkKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::Sweep => "sweep",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum IndexStage {
+    Pass,
+    ListChanges,
+    ScopeTotal,
+    ScopeQueue,
+    ScopeHasData,
+    ClusterOpen,
+    RefreshSequence,
+    DiscoverDirty,
+    ReadCurrent,
+    ArtifactBuild,
+    ArtifactGc,
+    XlogGc,
+    ClearChanges,
+}
+
+impl IndexStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::ListChanges => "list_changes",
+            Self::ScopeTotal => "scope_total",
+            Self::ScopeQueue => "scope_queue",
+            Self::ScopeHasData => "scope_has_data",
+            Self::ClusterOpen => "cluster_open",
+            Self::RefreshSequence => "refresh_sequence",
+            Self::DiscoverDirty => "discover_dirty",
+            Self::ReadCurrent => "read_current",
+            Self::ArtifactBuild => "artifact_build",
+            Self::ArtifactGc => "artifact_gc",
+            Self::XlogGc => "xlog_gc",
+            Self::ClearChanges => "clear_changes",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StageTiming {
+    count: u64,
+    elapsed_micros: u64,
+    max_micros: u64,
+}
+
+struct StageTimer<'a> {
+    metrics: &'a IndexerMetrics,
+    work: IndexWorkKind,
+    stage: IndexStage,
+    started: Instant,
+}
+
+impl Drop for StageTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .record_stage(self.work, self.stage, self.started.elapsed());
+    }
+}
+
 impl IndexerMetrics {
+    fn time_stage(&self, work: IndexWorkKind, stage: IndexStage) -> StageTimer<'_> {
+        StageTimer {
+            metrics: self,
+            work,
+            stage,
+            started: Instant::now(),
+        }
+    }
+
+    fn record_stage(&self, work: IndexWorkKind, stage: IndexStage, elapsed: Duration) {
+        let elapsed_micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        let mut timings = self
+            .stage_timings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let timing = timings.entry((work, stage)).or_default();
+        timing.count = timing.count.saturating_add(1);
+        timing.elapsed_micros = timing.elapsed_micros.saturating_add(elapsed_micros);
+        timing.max_micros = timing.max_micros.max(elapsed_micros);
+    }
+
+    fn stage_timings_snapshot(&self) -> BTreeMap<(IndexWorkKind, IndexStage), StageTiming> {
+        self.stage_timings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record_scope_cache_population(
+        &self,
+        registered_scopes: usize,
+        capacity: usize,
+    ) -> Option<usize> {
+        self.registered_scopes
+            .store(registered_scopes as u64, Ordering::Release);
+        let shortfall = registered_scopes.saturating_sub(capacity);
+        let previous = self
+            .scope_cache_last_warned_shortfall
+            .swap(shortfall as u64, Ordering::AcqRel);
+        (shortfall > 0 && previous != shortfall as u64).then_some(shortfall)
+    }
+
     /// Apply `record` to the counters for one `{cell_id, edge_type}` pair,
     /// folding into [`OVERFLOW_LABEL`] once the map is full.
     fn dimension<F: FnOnce(&mut DimensionedCounters)>(
@@ -759,8 +1061,56 @@ struct IndexerAdminServer {
     task: JoinHandle<std::io::Result<()>>,
 }
 
+#[derive(Clone)]
+struct IndexerAdminState {
+    metrics: Arc<IndexerMetrics>,
+    change_wake: Arc<Notify>,
+    wake_token: Arc<str>,
+    wake_limiter: Arc<WakeRateLimiter>,
+}
+
+struct WakeRateLimiter {
+    min_interval: Duration,
+    last_accepted: Mutex<Option<Instant>>,
+}
+
+impl WakeRateLimiter {
+    fn new(min_interval: Duration) -> Self {
+        Self {
+            min_interval,
+            last_accepted: Mutex::new(None),
+        }
+    }
+
+    fn try_accept(&self) -> bool {
+        let now = Instant::now();
+        let mut last_accepted = self
+            .last_accepted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last_accepted
+            .as_ref()
+            .is_some_and(|last| now.duration_since(*last) < self.min_interval)
+        {
+            return false;
+        }
+        *last_accepted = Some(now);
+        true
+    }
+}
+
 #[tokio::main]
 async fn main() -> RuntimeResult<()> {
+    // Before the subscriber: see `build_info::version_flag_requested`.
+    if hydradb_telemetry::build_info::version_flag_requested() {
+        println!(
+            "{} {}",
+            ServiceIdentity::GraphIndexer.binary(),
+            hydradb_telemetry::BUILD_INFO.long_version()
+        );
+        return Ok(());
+    }
+
     // One subscriber for both binaries, so a shared log sink separates a node
     // line from an indexer line by field rather than by message text. `init` is
     // total: with `OTEL_EXPORTER_OTLP_ENDPOINT` unset it installs the fmt layer
@@ -770,6 +1120,7 @@ async fn main() -> RuntimeResult<()> {
     // before a pod restart are lost, which is exactly the window that matters.
     let telemetry =
         hydradb_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphIndexer))?;
+    hydradb_telemetry::build_info::log();
 
     let data_path = env_value("GRAPH_DATA_PATH", "graph/data");
     let root_scope = graph_scope()?;
@@ -786,6 +1137,21 @@ async fn main() -> RuntimeResult<()> {
         Duration::from_millis(env_value("GRAPH_INDEXER_INTERVAL_MS", "5000").parse::<u64>()?);
     if interval.is_zero() {
         return Err("GRAPH_INDEXER_INTERVAL_MS must be greater than zero".into());
+    }
+    let dirty_poll_interval = Duration::from_millis(
+        env_value(
+            "GRAPH_INDEXER_DIRTY_POLL_INTERVAL_MS",
+            &DEFAULT_DIRTY_POLL_INTERVAL.as_millis().to_string(),
+        )
+        .parse::<u64>()?,
+    );
+    if !(MIN_DIRTY_POLL_INTERVAL..=MAX_DIRTY_POLL_INTERVAL).contains(&dirty_poll_interval) {
+        return Err(format!(
+            "GRAPH_INDEXER_DIRTY_POLL_INTERVAL_MS must be between {} and {}",
+            MIN_DIRTY_POLL_INTERVAL.as_millis(),
+            MAX_DIRTY_POLL_INTERVAL.as_millis()
+        )
+        .into());
     }
     let retain_previous = env_value("GRAPH_INDEXER_RETAIN_PREVIOUS", "1").parse::<usize>()?;
     let build_mode = IndexBuildMode::from_env()?;
@@ -853,17 +1219,25 @@ async fn main() -> RuntimeResult<()> {
         &GraphLimits::default().max_wal_tail_files.to_string(),
     )
     .parse::<u64>()?;
-    // `GraphOpenOptions` is `#[non_exhaustive]`: constructed from `default()`
-    // with fields assigned, per its own docs.
-    let mut open_options = GraphOpenOptions::default();
-    open_options.limits = GraphLimits {
-        max_wal_tail_files,
-        ..GraphLimits::default()
-    };
+    let slatedb_cache_bytes = env_value(
+        "GRAPH_SLATE_DB_CACHE_BYTES",
+        &(640usize * 1024 * 1024).to_string(),
+    )
+    .parse::<usize>()?;
+    let open_options = indexer_open_options(max_wal_tail_files, slatedb_cache_bytes);
     let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
+    let wake_token = read_indexer_wake_token()?;
 
     let metrics = Arc::new(IndexerMetrics::default());
-    let admin = IndexerAdminServer::bind(admin_addr, Arc::clone(&metrics)).await?;
+    let change_wake = Arc::new(Notify::new());
+    let admin = IndexerAdminServer::bind(
+        admin_addr,
+        Arc::clone(&metrics),
+        Arc::clone(&change_wake),
+        wake_token,
+        dirty_poll_interval,
+    )
+    .await?;
     // An empty graph has no SlateDB manifest yet. The indexer is healthy and
     // ready to observe that namespace even though there is nothing to build.
     metrics.ready.store(true, Ordering::Release);
@@ -880,8 +1254,20 @@ async fn main() -> RuntimeResult<()> {
         Arc::clone(&object_store),
         open_options.clone(),
         max_open_scopes,
+        scope_concurrency,
         Arc::clone(&metrics),
     ));
+    let (scope_change_stop, scope_change_task) = start_scope_change_worker(
+        scope_directory.clone(),
+        retain_previous,
+        build_mode,
+        incremental_min_edges,
+        scope_concurrency,
+        dirty_poll_interval,
+        Arc::clone(&scope_cache),
+        Arc::clone(&metrics),
+        change_wake,
+    );
     let mut shutdown = Box::pin(shutdown_signal());
     tracing::info!(
         scope = %root_scope,
@@ -892,6 +1278,11 @@ async fn main() -> RuntimeResult<()> {
         scope_concurrency,
         scopes_per_cycle,
         max_open_scopes,
+        dirty_poll_interval_ms = dirty_poll_interval.as_millis() as u64,
+        reader_mode = open_options.reader_mode.as_str(),
+        reader_manifest_poll_interval_ms = open_options
+            .reader_manifest_poll_interval
+            .as_millis() as u64,
         readiness_failure_threshold,
         "graph indexer started"
     );
@@ -932,6 +1323,7 @@ async fn main() -> RuntimeResult<()> {
         .instrument(cycle_span.clone())
         .await;
 
+        let mut continue_sweep_immediately = false;
         match outcome {
             Ok(cycle) => {
                 metrics.successful_cycles.fetch_add(1, Ordering::Relaxed);
@@ -944,6 +1336,8 @@ async fn main() -> RuntimeResult<()> {
                     metrics
                         .last_full_sweep_ms
                         .store(completed_at, Ordering::Relaxed);
+                } else {
+                    continue_sweep_immediately = true;
                 }
                 metrics
                     .consecutive_failed_cycles
@@ -1018,15 +1412,335 @@ async fn main() -> RuntimeResult<()> {
                 result?;
                 break;
             }
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(if continue_sweep_immediately {
+                Duration::ZERO
+            } else {
+                interval
+            }) => {}
         }
     }
     metrics.ready.store(false, Ordering::Release);
+    let _ = scope_change_stop.send(true);
+    scope_change_task.await??;
     scope_cache.close().await?;
     admin.stop().await?;
     tracing::info!(scope = %root_scope, "graph indexer stopped");
     telemetry.shutdown();
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_scope_change_worker(
+    scope_directory: ObjectStoreGraphScopeDirectory,
+    retain_previous: usize,
+    build_mode: IndexBuildMode,
+    incremental_min_edges: u64,
+    scope_concurrency: usize,
+    poll_interval: Duration,
+    scope_cache: Arc<IndexerScopeCache>,
+    metrics: Arc<IndexerMetrics>,
+    change_wake: Arc<Notify>,
+) -> (watch::Sender<bool>, JoinHandle<RuntimeResult<()>>) {
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            let failures = run_scope_change_pass(
+                &scope_directory,
+                retain_previous,
+                build_mode,
+                incremental_min_edges,
+                scope_concurrency,
+                &scope_cache,
+                &metrics,
+            )
+            .await;
+            let retry_delay = if failures.is_empty() {
+                poll_interval
+            } else {
+                metrics
+                    .change_notification_failures
+                    .fetch_add(failures.len() as u64, Ordering::Relaxed);
+                tracing::warn!(
+                    failure_count = failures.len(),
+                    error = %failures,
+                    "graph index change fast lane failed; fair sweep will retry"
+                );
+                poll_interval.max(CHANGE_FAILURE_RETRY_INTERVAL)
+            };
+
+            if failures.is_empty() {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    _ = change_wake.notified() => {}
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+            } else {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+            }
+        }
+    });
+    (stop_tx, task)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_scope_change_pass(
+    scope_directory: &ObjectStoreGraphScopeDirectory,
+    retain_previous: usize,
+    build_mode: IndexBuildMode,
+    incremental_min_edges: u64,
+    scope_concurrency: usize,
+    scope_cache: &IndexerScopeCache,
+    metrics: &IndexerMetrics,
+) -> CycleFailures {
+    let _pass_timer = metrics.time_stage(IndexWorkKind::Change, IndexStage::Pass);
+    let list_timer = metrics.time_stage(IndexWorkKind::Change, IndexStage::ListChanges);
+    let changes_result = scope_directory.list_changes().await;
+    drop(list_timer);
+    let changes = match changes_result {
+        Ok(changes) => changes,
+        Err(error) => {
+            let mut failures = CycleFailures::default();
+            failures.push(IndexFailure::kernel(
+                "scope_change_discovery",
+                "list changed graph scopes".to_string(),
+                &error,
+            ));
+            return failures;
+        }
+    };
+    metrics
+        .pending_change_notifications
+        .store(changes.len() as u64, Ordering::Release);
+    if changes.is_empty() {
+        return CycleFailures::default();
+    }
+    metrics
+        .change_notifications_observed
+        .fetch_add(changes.len() as u64, Ordering::Relaxed);
+
+    let mut grouped = BTreeMap::<GraphScope, Vec<GraphScopeChange>>::new();
+    for change in changes {
+        grouped
+            .entry(change.scope.clone())
+            .or_default()
+            .push(change);
+    }
+
+    let runs = futures::stream::iter(grouped)
+        .map(|(scope, changes)| async move {
+            let (already_covered, pending) =
+                match partition_scope_changes(scope_directory, &changes).await {
+                    Ok(partition) => partition,
+                    Err(error) => {
+                        return ScopeChangeRun {
+                            scope,
+                            already_covered: Vec::new(),
+                            pending: changes,
+                            outcome: None,
+                            coverage_error: Some(error),
+                        };
+                    }
+                };
+            let outcome = if pending.is_empty() {
+                None
+            } else {
+                Some(
+                    run_registered_scope(
+                        scope.clone(),
+                        retain_previous,
+                        build_mode,
+                        incremental_min_edges,
+                        scope_cache,
+                        metrics,
+                        IndexWorkKind::Change,
+                    )
+                    .await,
+                )
+            };
+            ScopeChangeRun {
+                scope,
+                already_covered,
+                pending,
+                outcome,
+                coverage_error: None,
+            }
+        })
+        .buffer_unordered(scope_concurrency);
+    let mut runs = std::pin::pin!(runs);
+    let mut failures = CycleFailures::default();
+    let mut cleared = 0u64;
+    while let Some(run) = runs.next().await {
+        let ScopeChangeRun {
+            scope,
+            mut already_covered,
+            pending,
+            outcome,
+            coverage_error,
+        } = run;
+        if let Some(error) = coverage_error {
+            failures.push(
+                IndexFailure::kernel(
+                    "scope_change_coverage_read",
+                    format!("read graph index change coverage for {scope}"),
+                    &error,
+                )
+                .with_scope(&scope.to_string()),
+            );
+            continue;
+        }
+
+        let mut processed = false;
+        if let Some(outcome) = outcome {
+            if !outcome.failures.is_empty() {
+                failures.absorb(outcome.failures);
+            } else {
+                processed = true;
+                let coverage = if outcome.empty {
+                    maximum_hint_sequences(&pending)
+                } else {
+                    outcome.covered_sequences
+                };
+                let mut acknowledged = BTreeMap::new();
+                for (cell_id, sequence) in coverage {
+                    match scope_directory
+                        .acknowledge_sequence(&scope, &cell_id, sequence)
+                        .await
+                    {
+                        Ok(()) => {
+                            acknowledged.insert(cell_id, sequence);
+                        }
+                        Err(error) => failures.push(
+                            IndexFailure::kernel(
+                                "scope_change_coverage_write",
+                                format!(
+                                    "persist graph index change coverage for {scope}/{cell_id}"
+                                ),
+                                &error,
+                            )
+                            .with_scope(&scope.to_string())
+                            .with_cell(&cell_id),
+                        ),
+                    }
+                }
+                already_covered.extend(pending.into_iter().filter(|change| {
+                    match (&change.cell_id, change.sequence) {
+                        (Some(cell_id), Some(sequence)) => acknowledged
+                            .get(cell_id)
+                            .is_some_and(|covered| *covered >= sequence),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                }));
+            }
+        }
+
+        if !already_covered.is_empty() {
+            let clear_timer = metrics.time_stage(IndexWorkKind::Change, IndexStage::ClearChanges);
+            let clear_result = scope_directory.clear_changes(&already_covered).await;
+            drop(clear_timer);
+            if let Err(error) = clear_result {
+                failures.push(
+                    IndexFailure::kernel(
+                        "scope_change_clear",
+                        format!("clear graph index change notifications for {scope}"),
+                        &error,
+                    )
+                    .with_scope(&scope.to_string()),
+                );
+                continue;
+            }
+            cleared = cleared.saturating_add(already_covered.len() as u64);
+        }
+
+        if processed {
+            let completed_at = unix_time_ms();
+            let oldest = already_covered
+                .iter()
+                .map(|change| change.created_at.timestamp_millis().max(0) as u64)
+                .min()
+                .unwrap_or(completed_at);
+            metrics
+                .last_change_success_ms
+                .store(completed_at, Ordering::Relaxed);
+            metrics
+                .last_change_lag_ms
+                .store(completed_at.saturating_sub(oldest), Ordering::Relaxed);
+            metrics
+                .changed_scopes_processed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    metrics
+        .change_notifications_cleared
+        .fetch_add(cleared, Ordering::Relaxed);
+    metrics
+        .pending_change_notifications
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            Some(pending.saturating_sub(cleared))
+        })
+        .ok();
+    failures
+}
+
+async fn partition_scope_changes(
+    scope_directory: &ObjectStoreGraphScopeDirectory,
+    changes: &[GraphScopeChange],
+) -> hydradb::Result<(Vec<GraphScopeChange>, Vec<GraphScopeChange>)> {
+    let mut watermarks = BTreeMap::<String, Option<u64>>::new();
+    for change in changes {
+        if let Some(cell_id) = change.cell_id.as_ref() {
+            if !watermarks.contains_key(cell_id) {
+                watermarks.insert(
+                    cell_id.clone(),
+                    scope_directory
+                        .covered_sequence(&change.scope, cell_id)
+                        .await?,
+                );
+            }
+        }
+    }
+    let mut covered = Vec::new();
+    let mut pending = Vec::new();
+    for change in changes.iter().cloned() {
+        let is_covered = match (&change.cell_id, change.sequence) {
+            (Some(cell_id), Some(sequence)) => watermarks
+                .get(cell_id)
+                .copied()
+                .flatten()
+                .is_some_and(|covered| covered >= sequence),
+            _ => false,
+        };
+        if is_covered {
+            covered.push(change);
+        } else {
+            pending.push(change);
+        }
+    }
+    Ok((covered, pending))
+}
+
+fn maximum_hint_sequences(changes: &[GraphScopeChange]) -> BTreeMap<String, u64> {
+    let mut maximum = BTreeMap::new();
+    for change in changes {
+        if let (Some(cell_id), Some(sequence)) = (&change.cell_id, change.sequence) {
+            maximum
+                .entry(cell_id.clone())
+                .and_modify(|current: &mut u64| *current = (*current).max(sequence))
+                .or_insert(sequence);
+        }
+    }
+    maximum
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1091,6 +1805,16 @@ async fn run_registered_scopes_cycle(
             }
         };
         schedule.scope_names = schedule.scopes.iter().map(ToString::to_string).collect();
+        if let Some(capacity_shortfall) = metrics
+            .record_scope_cache_population(schedule.scopes.len(), scope_cache.max_open_scopes)
+        {
+            tracing::warn!(
+                registered_scopes = schedule.scopes.len(),
+                scope_cache_capacity = scope_cache.max_open_scopes,
+                capacity_shortfall,
+                "indexer scope cache cannot retain every registered scope"
+            );
+        }
 
         let registered = schedule.scopes.iter().cloned().collect::<BTreeSet<_>>();
         scope_cache.retain_registered(&registered).await;
@@ -1127,9 +1851,7 @@ async fn run_registered_scopes_cycle(
     });
     let starting_cursor_registered = starting_position.is_some();
     let final_registered_scope = schedule.scope_names.last().map(String::as_str);
-    let mut cursor_progressed = false;
-    let mut ending_cursor = cursor.last_scope.clone();
-    let mut cursor = Some(cursor);
+    let cursor = Some(cursor);
 
     let hot_budget = if scopes_per_cycle == 1 {
         0
@@ -1181,57 +1903,25 @@ async fn run_registered_scopes_cycle(
         );
     }
 
-    for batch in scopes.chunks(scope_concurrency) {
-        let batch_last_scope = batch.last().map(ToString::to_string).unwrap_or_default();
-        failures.absorb(
-            run_scope_batch(
-                batch,
-                retain_previous,
-                build_mode,
-                incremental_min_edges,
-                scope_cache,
-                metrics,
-                scope_concurrency,
-            )
-            .await,
-        );
-
-        match advance_scope_cursor(
-            &object_store,
-            &cursor_path,
-            cursor
-                .take()
-                .expect("a valid cursor must precede every fair-scan batch"),
-            &batch_last_scope,
-        )
-        .await
-        {
-            Ok(ScopeCursorAdvance::Advanced(next)) => {
-                ending_cursor.clone_from(&next.last_scope);
-                cursor = Some(next);
-                cursor_progressed = true;
-            }
-            Ok(ScopeCursorAdvance::LostRace) => {
-                tracing::info!(
-                    cursor = %cursor_path,
-                    last_scope = %batch_last_scope,
-                    "another indexer advanced the scope cursor"
-                );
-                // Do not overwrite the winner with a cursor based on stale
-                // progress. Rediscovery on the next cycle resumes from the
-                // winner's durable boundary.
-                break;
-            }
-            Err(error) => {
-                failures.push(IndexFailure::kernel(
-                    "scope_cursor_advance",
-                    format!("advance indexer scope cursor {cursor_path}"),
-                    &error,
-                ));
-                break;
-            }
-        }
-    }
+    let FairScopeRun {
+        failures: fair_failures,
+        cursor,
+        ending_cursor,
+        cursor_progressed,
+    } = run_fair_scope_stream(
+        &scopes,
+        retain_previous,
+        build_mode,
+        incremental_min_edges,
+        scope_cache,
+        metrics,
+        scope_concurrency,
+        &object_store,
+        &cursor_path,
+        cursor,
+    )
+    .await;
+    failures.absorb(fair_failures);
 
     let full_sweep_completed = completed_scope_sweep(
         cursor_progressed,
@@ -1272,14 +1962,129 @@ async fn run_scope_batch(
                 incremental_min_edges,
                 scope_cache,
                 metrics,
+                IndexWorkKind::Sweep,
             )
         })
         .buffer_unordered(scope_concurrency);
     let mut runs = std::pin::pin!(runs);
-    while let Some(scope_failures) = runs.next().await {
-        failures.absorb(scope_failures);
+    while let Some(scope_outcome) = runs.next().await {
+        failures.absorb(scope_outcome.failures);
     }
     failures
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_fair_scope_stream(
+    scopes: &[GraphScope],
+    retain_previous: usize,
+    build_mode: IndexBuildMode,
+    incremental_min_edges: u64,
+    scope_cache: &IndexerScopeCache,
+    metrics: &IndexerMetrics,
+    scope_concurrency: usize,
+    object_store: &Arc<dyn slatedb::object_store::ObjectStore>,
+    cursor_path: &Path,
+    mut cursor: Option<ScopeCursor>,
+) -> FairScopeRun {
+    let mut failures = CycleFailures::default();
+    let mut ending_cursor = cursor
+        .as_ref()
+        .and_then(|current| current.last_scope.clone());
+    let mut cursor_progressed = false;
+    if scopes.is_empty() {
+        return FairScopeRun {
+            failures,
+            cursor,
+            ending_cursor,
+            cursor_progressed,
+        };
+    }
+
+    // Most retained scopes only need one read-only reader refresh to prove that
+    // their previously covered storage sequence is still current. Keep that
+    // high-latency object-store probe wider than the build gate; dirty scopes
+    // still acquire `scope_permits` before discovery or GraphBLAS work.
+    let probe_concurrency = scope_probe_concurrency(scope_concurrency);
+    let runs = futures::stream::iter(scopes.iter().cloned().enumerate())
+        .map(|(index, scope)| async move {
+            (
+                index,
+                run_registered_scope(
+                    scope,
+                    retain_previous,
+                    build_mode,
+                    incremental_min_edges,
+                    scope_cache,
+                    metrics,
+                    IndexWorkKind::Sweep,
+                )
+                .await,
+            )
+        })
+        .buffer_unordered(probe_concurrency);
+    let mut runs = std::pin::pin!(runs);
+    let mut completed = vec![false; scopes.len()];
+    let mut contiguous_completed = 0usize;
+    let checkpoint_stride = scope_concurrency.max(MIN_SCOPE_CURSOR_CHECKPOINT_SCOPES);
+    let mut next_checkpoint = Some(checkpoint_stride.min(scopes.len()));
+
+    'results: while let Some((index, scope_outcome)) = runs.next().await {
+        failures.absorb(scope_outcome.failures);
+        completed[index] = true;
+        while contiguous_completed < completed.len() && completed[contiguous_completed] {
+            contiguous_completed += 1;
+        }
+
+        while let Some(checkpoint) =
+            next_checkpoint.filter(|checkpoint| contiguous_completed >= *checkpoint)
+        {
+            let last_scope = scopes[checkpoint - 1].to_string();
+            match advance_scope_cursor(
+                object_store,
+                cursor_path,
+                cursor
+                    .take()
+                    .expect("a valid cursor must precede every fair-scan checkpoint"),
+                &last_scope,
+            )
+            .await
+            {
+                Ok(ScopeCursorAdvance::Advanced(next)) => {
+                    ending_cursor.clone_from(&next.last_scope);
+                    cursor = Some(next);
+                    cursor_progressed = true;
+                    next_checkpoint = (checkpoint < scopes.len()).then(|| {
+                        checkpoint
+                            .saturating_add(checkpoint_stride)
+                            .min(scopes.len())
+                    });
+                }
+                Ok(ScopeCursorAdvance::LostRace) => {
+                    tracing::info!(
+                        cursor = %cursor_path,
+                        last_scope,
+                        "another indexer advanced the scope cursor"
+                    );
+                    break 'results;
+                }
+                Err(error) => {
+                    failures.push(IndexFailure::kernel(
+                        "scope_cursor_advance",
+                        format!("advance indexer scope cursor {cursor_path}"),
+                        &error,
+                    ));
+                    break 'results;
+                }
+            }
+        }
+    }
+
+    FairScopeRun {
+        failures,
+        cursor,
+        ending_cursor,
+        cursor_progressed,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1290,8 +2095,20 @@ async fn run_registered_scope(
     incremental_min_edges: u64,
     scope_cache: &IndexerScopeCache,
     metrics: &IndexerMetrics,
-) -> CycleFailures {
+    work: IndexWorkKind,
+) -> RegisteredScopeOutcome {
+    let _scope_timer = metrics.time_stage(work, IndexStage::ScopeTotal);
+    // A changed-scope hint can overlap the fair recovery sweep. Serialize the
+    // same scope first. The global build permit is acquired only after a fair
+    // sweep proves that the scope changed, so remote refresh latency does not
+    // occupy scarce GraphBLAS/build capacity.
+    let queue_timer = metrics.time_stage(work, IndexStage::ScopeQueue);
+    let run_gate = scope_cache.scope_run_gate(&scope).await;
+    let _run_guard = run_gate.lock().await;
+    drop(queue_timer);
     let mut failures = CycleFailures::default();
+    let mut covered_sequences = BTreeMap::new();
+    let mut refreshed_sequences = BTreeMap::new();
     {
         let scope_name = scope.to_string();
         let scope_span = tracing::info_span!(
@@ -1301,56 +2118,68 @@ async fn run_registered_scope(
             error.class = Empty,
         );
 
-        let has_data_span = tracing::info_span!(
-            parent: &scope_span,
-            "index.scope_has_data",
-            hydradb.scope = %scope_name,
-            has_data = Empty,
-            hydradb.outcome = Empty,
-            error.class = Empty,
-        );
-        match scope_has_data(
-            &scope_cache.data_path,
-            &scope,
-            &scope_cache.cells,
-            &scope_cache.object_store,
-        )
-        .instrument(has_data_span.clone())
-        .await
-        {
-            Ok(true) => {
-                has_data_span.record("has_data", true);
-                record_success(&has_data_span);
-            }
-            Ok(false) => {
-                // An empty namespace is the healthy steady state, not an
-                // absence of work to report.
-                has_data_span.record("has_data", false);
-                has_data_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
-                scope_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
-                if let Err(error) = scope_cache.invalidate_scope(&scope).await {
+        let cached_cluster = scope_cache.resident_cluster_for_scope(&scope).await;
+        if cached_cluster.is_none() {
+            let has_data_span = tracing::info_span!(
+                parent: &scope_span,
+                "index.scope_has_data",
+                hydradb.scope = %scope_name,
+                has_data = Empty,
+                hydradb.outcome = Empty,
+                error.class = Empty,
+            );
+            let has_data_timer = metrics.time_stage(work, IndexStage::ScopeHasData);
+            let has_data_result = scope_has_data(
+                &scope_cache.data_path,
+                &scope,
+                &scope_cache.cells,
+                &scope_cache.object_store,
+            )
+            .instrument(has_data_span.clone())
+            .await;
+            drop(has_data_timer);
+            match has_data_result {
+                Ok(true) => {
+                    has_data_span.record("has_data", true);
+                    record_success(&has_data_span);
+                }
+                Ok(false) => {
+                    // An empty namespace is the healthy steady state, not an
+                    // absence of work to report.
+                    has_data_span.record("has_data", false);
+                    has_data_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
+                    scope_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
+                    if let Err(error) = scope_cache.invalidate_scope(&scope).await {
+                        let failure = IndexFailure::kernel(
+                            "cluster_close",
+                            format!("close empty scope {scope_name}"),
+                            &error,
+                        )
+                        .with_scope(&scope_name);
+                        record_failure(&scope_span, &failure);
+                        failures.push(failure);
+                    }
+                    return RegisteredScopeOutcome {
+                        failures,
+                        empty: true,
+                        ..RegisteredScopeOutcome::default()
+                    };
+                }
+                Err(error) => {
                     let failure = IndexFailure::kernel(
-                        "cluster_close",
-                        format!("close empty scope {scope_name}"),
+                        "scope_has_data",
+                        format!("scan scope {scope_name}"),
                         &error,
                     )
                     .with_scope(&scope_name);
-                    record_failure(&scope_span, &failure);
+                    record_failure(&has_data_span, &failure);
+                    scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
                     failures.push(failure);
+                    return RegisteredScopeOutcome {
+                        failures,
+                        ..RegisteredScopeOutcome::default()
+                    };
                 }
-                return failures;
-            }
-            Err(error) => {
-                let failure = IndexFailure::kernel(
-                    "scope_has_data",
-                    format!("scan scope {scope_name}"),
-                    &error,
-                )
-                .with_scope(&scope_name);
-                record_failure(&has_data_span, &failure);
-                scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
-                failures.push(failure);
-                return failures;
             }
         }
 
@@ -1362,11 +2191,17 @@ async fn run_registered_scope(
             hydradb.outcome = Empty,
             error.class = Empty,
         );
-        let (cluster, cache_hit) = match scope_cache
-            .cluster_for_scope(&scope)
-            .instrument(open_span.clone())
-            .await
-        {
+        let open_timer = metrics.time_stage(work, IndexStage::ClusterOpen);
+        let cluster_result = if let Some(cluster) = cached_cluster {
+            Ok((cluster, ScopeCacheDisposition::Hit))
+        } else {
+            scope_cache
+                .cluster_for_scope(&scope)
+                .instrument(open_span.clone())
+                .await
+        };
+        drop(open_timer);
+        let (cluster, cache_disposition) = match cluster_result {
             Ok(cluster) => {
                 record_success(&open_span);
                 cluster
@@ -1382,12 +2217,77 @@ async fn run_registered_scope(
                 record_failure(&open_span, &failure);
                 scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
                 failures.push(failure);
-                return failures;
+                return RegisteredScopeOutcome {
+                    failures,
+                    ..RegisteredScopeOutcome::default()
+                };
             }
         };
 
         let mut scope_failed = false;
         let mut scope_built = false;
+        let known_covered_sequences = scope_cache
+            .covered_sequences_for_scope(&scope, &cluster)
+            .await;
+
+        if work == IndexWorkKind::Sweep && known_covered_sequences.len() == scope_cache.cells.len()
+        {
+            match refresh_covered_scope(&cluster, &scope_name, &scope_cache.cells, metrics, work)
+                .instrument(scope_span.clone())
+                .await
+            {
+                Ok(sequences)
+                    if sequences.iter().all(|(cell_id, sequence)| {
+                        known_covered_sequences.get(cell_id) == Some(sequence)
+                    }) =>
+                {
+                    covered_sequences = sequences;
+                    scope_cache
+                        .finish_scope(&scope, &cluster, cache_disposition, false)
+                        .await;
+                    scope_cache
+                        .update_covered_sequences(&scope, &cluster, &covered_sequences)
+                        .await;
+                    scope_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
+                    return RegisteredScopeOutcome {
+                        failures,
+                        covered_sequences,
+                        empty: false,
+                    };
+                }
+                Ok(sequences) => refreshed_sequences = sequences,
+                Err(inner) => {
+                    failures.absorb(inner);
+                    if let Err(error) = scope_cache
+                        .finish_failed_scope(&scope, &cluster, cache_disposition)
+                        .await
+                    {
+                        failures.push(
+                            IndexFailure::kernel(
+                                "cluster_close",
+                                format!("close failed scope {scope_name}"),
+                                &error,
+                            )
+                            .with_scope(&scope_name),
+                        );
+                    }
+                    scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
+                    return RegisteredScopeOutcome {
+                        failures,
+                        covered_sequences,
+                        empty: false,
+                    };
+                }
+            }
+        }
+
+        let build_queue_timer = metrics.time_stage(work, IndexStage::ScopeQueue);
+        let _permit = scope_cache
+            .scope_permits
+            .acquire()
+            .await
+            .expect("the indexer scope semaphore remains open for the runtime");
+        drop(build_queue_timer);
         // Instrumenting the call rather than parenting a span by hand is what
         // makes every `index.cell` below a child of this scope.
         match run_index_cycle(
@@ -1397,12 +2297,18 @@ async fn run_registered_scope(
             retain_previous,
             build_mode,
             incremental_min_edges,
+            &known_covered_sequences,
+            &refreshed_sequences,
             metrics,
+            work,
         )
         .instrument(scope_span.clone())
         .await
         {
-            Ok(built) => scope_built = built,
+            Ok(cycle) => {
+                scope_built = cycle.built;
+                covered_sequences = cycle.covered_sequences;
+            }
             Err(inner) => {
                 scope_failed = true;
                 failures.absorb(inner);
@@ -1410,7 +2316,10 @@ async fn run_registered_scope(
         }
 
         if scope_failed {
-            if let Err(error) = scope_cache.invalidate(&scope, &cluster).await {
+            if let Err(error) = scope_cache
+                .finish_failed_scope(&scope, &cluster, cache_disposition)
+                .await
+            {
                 let failure = IndexFailure::kernel(
                     "cluster_close",
                     format!("close failed scope {scope_name}"),
@@ -1426,12 +2335,84 @@ async fn run_registered_scope(
             scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
         } else {
             scope_cache
-                .finish_scope(&scope, &cluster, cache_hit, scope_built)
+                .finish_scope(&scope, &cluster, cache_disposition, scope_built)
+                .await;
+            scope_cache
+                .update_covered_sequences(&scope, &cluster, &covered_sequences)
                 .await;
             record_success(&scope_span);
         }
     }
-    failures
+    RegisteredScopeOutcome {
+        failures,
+        covered_sequences,
+        empty: false,
+    }
+}
+
+async fn refresh_covered_scope(
+    cluster: &GraphCluster,
+    scope: &str,
+    cells: &[String],
+    metrics: &IndexerMetrics,
+    work: IndexWorkKind,
+) -> Result<BTreeMap<String, u64>, CycleFailures> {
+    let mut failures = CycleFailures::default();
+    let mut refreshed_sequences = BTreeMap::new();
+
+    for cell_id in cells {
+        let Some(shard) = cluster.shard(cell_id) else {
+            failures.push(
+                IndexFailure::config(
+                    "missing_cell",
+                    format!("index scope {scope}: missing configured cell {cell_id}"),
+                )
+                .with_scope(scope)
+                .with_cell(cell_id),
+            );
+            continue;
+        };
+        let refresh_span = tracing::info_span!(
+            "index.refresh_sequence",
+            hydradb.scope = %scope,
+            hydradb.cell_id = %cell_id,
+            hydradb.base_sequence = Empty,
+            hydradb.outcome = Empty,
+            error.class = Empty,
+        );
+        let refresh_timer = metrics.time_stage(work, IndexStage::RefreshSequence);
+        let refresh_result = shard
+            .refresh_storage_sequence(cell_id)
+            .instrument(refresh_span.clone())
+            .await;
+        drop(refresh_timer);
+        match refresh_result {
+            Ok(sequence) => {
+                refresh_span.record(semconv::BASE_SEQUENCE, sequence);
+                record_success(&refresh_span);
+                refreshed_sequences.insert(cell_id.clone(), sequence);
+            }
+            Err(error) => {
+                let failure = IndexFailure::kernel(
+                    "refresh_sequence",
+                    format!("index scope {scope}: refresh {cell_id}"),
+                    &error,
+                )
+                .with_scope(scope)
+                .with_cell(cell_id);
+                record_failure(&refresh_span, &failure);
+                failures.push(failure);
+            }
+        }
+    }
+
+    failures.into_result().map(|()| refreshed_sequences)
+}
+
+fn scope_probe_concurrency(scope_concurrency: usize) -> usize {
+    scope_concurrency
+        .saturating_mul(SCOPE_PROBE_CONCURRENCY_MULTIPLIER)
+        .min(MAX_SCOPE_PROBE_CONCURRENCY)
 }
 
 fn scope_cursor_path(data_path: &str, root_scope: GraphScope) -> Path {
@@ -1489,7 +2470,7 @@ fn completed_scope_sweep(
 async fn load_scope_cursor(
     object_store: &Arc<dyn slatedb::object_store::ObjectStore>,
     path: &Path,
-) -> slatedb_graph_kernel::Result<ScopeCursor> {
+) -> hydradb::Result<ScopeCursor> {
     match object_store.get(path).await {
         Ok(result) => {
             let update_version = UpdateVersion {
@@ -1529,7 +2510,7 @@ async fn advance_scope_cursor(
     path: &Path,
     cursor: ScopeCursor,
     last_scope: &str,
-) -> slatedb_graph_kernel::Result<ScopeCursorAdvance> {
+) -> hydradb::Result<ScopeCursorAdvance> {
     let mode = cursor
         .update_version
         .map_or(PutMode::Create, PutMode::Update);
@@ -1560,7 +2541,7 @@ async fn scope_has_data(
     scope: &GraphScope,
     cells: &[String],
     object_store: &Arc<dyn slatedb::object_store::ObjectStore>,
-) -> slatedb_graph_kernel::Result<bool> {
+) -> hydradb::Result<bool> {
     let scope_path = scope.scoped_store_path(data_path);
     for cell_id in cells {
         let prefix = Path::from(format!("{scope_path}/{cell_id}"));
@@ -1577,6 +2558,7 @@ async fn scope_has_data(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_index_cycle(
     cluster: &GraphCluster,
     scope: &str,
@@ -1584,10 +2566,14 @@ async fn run_index_cycle(
     retain_previous: usize,
     build_mode: IndexBuildMode,
     incremental_min_edges: u64,
+    known_covered_sequences: &BTreeMap<String, u64>,
+    refreshed_sequences: &BTreeMap<String, u64>,
     metrics: &IndexerMetrics,
-) -> Result<bool, CycleFailures> {
+    work: IndexWorkKind,
+) -> Result<IndexCycleOutcome, CycleFailures> {
     let mut failures = CycleFailures::default();
     let mut built_any = false;
+    let mut covered_sequences = BTreeMap::new();
     for cell_id in cells {
         let cell_span = tracing::info_span!(
             "index.cell",
@@ -1610,37 +2596,53 @@ async fn run_index_cycle(
             continue;
         };
 
-        let refresh_span = tracing::info_span!(
-            parent: &cell_span,
-            "index.refresh_sequence",
-            hydradb.scope = %scope,
-            hydradb.cell_id = %cell_id,
-            hydradb.base_sequence = Empty,
-            hydradb.outcome = Empty,
-            error.class = Empty,
-        );
-        match shard
-            .refresh_storage_sequence(cell_id)
-            .instrument(refresh_span.clone())
-            .await
+        let refreshed_sequence = if let Some(sequence) = refreshed_sequences.get(cell_id) {
+            *sequence
+        } else {
+            let refresh_span = tracing::info_span!(
+                parent: &cell_span,
+                "index.refresh_sequence",
+                hydradb.scope = %scope,
+                hydradb.cell_id = %cell_id,
+                hydradb.base_sequence = Empty,
+                hydradb.outcome = Empty,
+                error.class = Empty,
+            );
+            let refresh_timer = metrics.time_stage(work, IndexStage::RefreshSequence);
+            let refresh_result = shard
+                .refresh_storage_sequence(cell_id)
+                .instrument(refresh_span.clone())
+                .await;
+            drop(refresh_timer);
+            match refresh_result {
+                Ok(sequence) => {
+                    refresh_span.record(semconv::BASE_SEQUENCE, sequence);
+                    record_success(&refresh_span);
+                    sequence
+                }
+                Err(error) => {
+                    let failure = IndexFailure::kernel(
+                        "refresh_sequence",
+                        format!("index scope {scope}: refresh {cell_id}"),
+                        &error,
+                    )
+                    .with_scope(scope)
+                    .with_cell(cell_id);
+                    record_failure(&refresh_span, &failure);
+                    cell_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
+                    failures.push(failure);
+                    continue;
+                }
+            }
+        };
+
+        if known_covered_sequences
+            .get(cell_id)
+            .is_some_and(|covered| *covered == refreshed_sequence)
         {
-            Ok(sequence) => {
-                refresh_span.record(semconv::BASE_SEQUENCE, sequence);
-                record_success(&refresh_span);
-            }
-            Err(error) => {
-                let failure = IndexFailure::kernel(
-                    "refresh_sequence",
-                    format!("index scope {scope}: refresh {cell_id}"),
-                    &error,
-                )
-                .with_scope(scope)
-                .with_cell(cell_id);
-                record_failure(&refresh_span, &failure);
-                cell_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
-                failures.push(failure);
-                continue;
-            }
+            covered_sequences.insert(cell_id.clone(), refreshed_sequence);
+            cell_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
+            continue;
         }
 
         let discover_span = tracing::info_span!(
@@ -1652,11 +2654,13 @@ async fn run_index_cycle(
             hydradb.outcome = Empty,
             error.class = Empty,
         );
-        let dirty = match shard
+        let discover_timer = metrics.time_stage(work, IndexStage::DiscoverDirty);
+        let dirty_result = shard
             .dirty_graph_index_edge_types(cell_id)
             .instrument(discover_span.clone())
-            .await
-        {
+            .await;
+        drop(discover_timer);
+        let dirty = match dirty_result {
             Ok(dirty) => {
                 discover_span.record("dirty_count", dirty.len());
                 record_success(&discover_span);
@@ -1706,11 +2710,13 @@ async fn run_index_cycle(
                 hydradb.outcome = Empty,
                 error.class = Empty,
             );
-            let current = match shard
+            let read_timer = metrics.time_stage(work, IndexStage::ReadCurrent);
+            let current_result = shard
                 .current_graph_index(cell_id, &edge_type)
                 .instrument(read_span.clone())
-                .await
-            {
+                .await;
+            drop(read_timer);
+            let current = match current_result {
                 Ok(current) => {
                     read_span.record("present", current.is_some());
                     if let Some(generation) = current.as_ref() {
@@ -1789,6 +2795,7 @@ async fn run_index_cycle(
                 && current
                     .as_ref()
                     .is_some_and(|generation| generation.edge_count >= incremental_min_edges);
+            let build_timer = metrics.time_stage(work, IndexStage::ArtifactBuild);
             let outcome: Result<(GraphIndexGeneration, GraphIndexBuildPath), GraphError> =
                 if attempt_incremental {
                     shard
@@ -1805,6 +2812,7 @@ async fn run_index_cycle(
                             (generated, GraphIndexBuildPath::Full { edges: edge_count })
                         })
                 };
+            drop(build_timer);
             let generation = match outcome {
                 Ok((generation, build_path)) => {
                     build_span.record(semconv::GENERATION, generation.generation.as_str());
@@ -1914,11 +2922,13 @@ async fn run_index_cycle(
                 hydradb.outcome = Empty,
                 error.class = Empty,
             );
-            match shard
+            let gc_timer = metrics.time_stage(work, IndexStage::ArtifactGc);
+            let gc_result = shard
                 .gc_graph_index_generations(cell_id, &edge_type, retain_previous)
                 .instrument(gc_span.clone())
-                .await
-            {
+                .await;
+            drop(gc_timer);
+            match gc_result {
                 Ok(deleted) => {
                     gc_span.record("deleted", deleted);
                     gc_span.record(
@@ -1962,11 +2972,13 @@ async fn run_index_cycle(
                 hydradb.outcome = Empty,
                 error.class = Empty,
             );
-            match shard
+            let xlog_gc_timer = metrics.time_stage(work, IndexStage::XlogGc);
+            let xlog_gc_result = shard
                 .gc_topology_changelog(cell_id, &edge_type)
                 .instrument(xlog_gc_span.clone())
-                .await
-            {
+                .await;
+            drop(xlog_gc_timer);
+            match xlog_gc_result {
                 Ok(deleted) => {
                     xlog_gc_span.record("deleted", deleted);
                     xlog_gc_span.record(
@@ -1999,23 +3011,40 @@ async fn run_index_cycle(
             cell_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
         } else if cell_built {
             built_any = true;
+            covered_sequences.insert(cell_id.clone(), refreshed_sequence);
             record_success(&cell_span);
         } else {
+            covered_sequences.insert(cell_id.clone(), refreshed_sequence);
             cell_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
         }
     }
 
-    failures.into_result().map(|()| built_any)
+    failures.into_result().map(|()| IndexCycleOutcome {
+        built: built_any,
+        covered_sequences,
+    })
 }
 
 impl IndexerAdminServer {
-    async fn bind(addr: SocketAddr, metrics: Arc<IndexerMetrics>) -> std::io::Result<Self> {
+    async fn bind(
+        addr: SocketAddr,
+        metrics: Arc<IndexerMetrics>,
+        change_wake: Arc<Notify>,
+        wake_token: String,
+        wake_min_interval: Duration,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let router = Router::new()
             .route("/livez", get(|| async { StatusCode::OK }))
             .route("/readyz", get(indexer_readiness))
             .route("/metrics", get(indexer_metrics))
-            .with_state(metrics);
+            .route("/v1/changes:process", post(process_index_changes))
+            .with_state(IndexerAdminState {
+                metrics,
+                change_wake,
+                wake_token: Arc::from(wake_token),
+                wake_limiter: Arc::new(WakeRateLimiter::new(wake_min_interval)),
+            });
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
@@ -2038,23 +3067,64 @@ impl IndexerAdminServer {
     }
 }
 
-async fn indexer_readiness(State(metrics): State<Arc<IndexerMetrics>>) -> StatusCode {
-    if metrics.ready.load(Ordering::Acquire) {
+async fn indexer_readiness(State(state): State<IndexerAdminState>) -> StatusCode {
+    if state.metrics.ready.load(Ordering::Acquire) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
 }
 
-async fn indexer_metrics(State(metrics): State<Arc<IndexerMetrics>>) -> Response {
+async fn indexer_metrics(State(state): State<IndexerAdminState>) -> Response {
     (
         [
             ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
             ("cache-control", "no-store"),
         ],
-        render_metrics(&metrics),
+        render_metrics(&state.metrics),
     )
         .into_response()
+}
+
+async fn process_index_changes(
+    State(state): State<IndexerAdminState>,
+    headers: HeaderMap,
+) -> StatusCode {
+    if !valid_wake_bearer(&headers, &state.wake_token) {
+        state
+            .metrics
+            .change_push_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        return StatusCode::UNAUTHORIZED;
+    }
+    if !state.wake_limiter.try_accept() {
+        state
+            .metrics
+            .change_push_throttles
+            .fetch_add(1, Ordering::Relaxed);
+        return StatusCode::ACCEPTED;
+    }
+    state
+        .metrics
+        .change_push_wakes
+        .fetch_add(1, Ordering::Relaxed);
+    state.change_wake.notify_one();
+    StatusCode::ACCEPTED
+}
+
+fn valid_wake_bearer(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(value) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some((scheme, supplied)) = value.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && !supplied.is_empty()
+        && bool::from(supplied.as_bytes().ct_eq(expected.as_bytes()))
 }
 
 /// The `/metrics` body.
@@ -2065,7 +3135,11 @@ async fn indexer_metrics(State(metrics): State<Arc<IndexerMetrics>>) -> Response
 /// were scalars, so a diff of the output shows labels appearing and no series
 /// moving.
 fn render_metrics(metrics: &IndexerMetrics) -> String {
-    let mut output = format!(
+    // Same series, same labels, first in the body — see the graph-node side in
+    // `graph_node/admin.rs`. A build-info gauge only pays for itself if every
+    // service in the fleet reports it identically.
+    let mut output = hydradb_telemetry::build_info::prometheus_gauge();
+    output.push_str(&format!(
         concat!(
             "# TYPE graph_indexer_ready gauge\n",
             "graph_indexer_ready {}\n",
@@ -2093,10 +3167,40 @@ fn render_metrics(metrics: &IndexerMetrics) -> String {
             "graph_indexer_scope_cache_misses {}\n",
             "# TYPE graph_indexer_scope_cache_evictions counter\n",
             "graph_indexer_scope_cache_evictions {}\n",
+            "# TYPE graph_indexer_scope_cache_admission_bypasses counter\n",
+            "graph_indexer_scope_cache_admission_bypasses {}\n",
+            "# TYPE graph_indexer_scope_cache_promotions counter\n",
+            "graph_indexer_scope_cache_promotions {}\n",
+            "# TYPE graph_indexer_scope_cache_idle_demotions counter\n",
+            "graph_indexer_scope_cache_idle_demotions {}\n",
             "# TYPE graph_indexer_scope_cache_close_failures counter\n",
             "graph_indexer_scope_cache_close_failures {}\n",
             "# TYPE graph_indexer_scope_cache_entries gauge\n",
             "graph_indexer_scope_cache_entries {}\n",
+            "# TYPE graph_indexer_scope_cache_capacity gauge\n",
+            "graph_indexer_scope_cache_capacity {}\n",
+            "# TYPE graph_indexer_registered_scopes gauge\n",
+            "graph_indexer_registered_scopes {}\n",
+            "# TYPE graph_indexer_change_notifications_observed counter\n",
+            "graph_indexer_change_notifications_observed {}\n",
+            "# TYPE graph_indexer_change_notifications_cleared counter\n",
+            "graph_indexer_change_notifications_cleared {}\n",
+            "# TYPE graph_indexer_changed_scopes_processed counter\n",
+            "graph_indexer_changed_scopes_processed {}\n",
+            "# TYPE graph_indexer_change_notification_failures counter\n",
+            "graph_indexer_change_notification_failures {}\n",
+            "# TYPE graph_indexer_change_push_wakes counter\n",
+            "graph_indexer_change_push_wakes {}\n",
+            "# TYPE graph_indexer_change_push_rejections counter\n",
+            "graph_indexer_change_push_rejections {}\n",
+            "# TYPE graph_indexer_change_push_throttles counter\n",
+            "graph_indexer_change_push_throttles {}\n",
+            "# TYPE graph_indexer_pending_change_notifications gauge\n",
+            "graph_indexer_pending_change_notifications {}\n",
+            "# TYPE graph_indexer_last_change_success_ms gauge\n",
+            "graph_indexer_last_change_success_ms {}\n",
+            "# TYPE graph_indexer_last_change_lag_ms gauge\n",
+            "graph_indexer_last_change_lag_ms {}\n",
         ),
         u8::from(metrics.ready.load(Ordering::Acquire)),
         metrics.cycles.load(Ordering::Relaxed),
@@ -2111,10 +3215,30 @@ fn render_metrics(metrics: &IndexerMetrics) -> String {
         metrics.scope_cache_hits.load(Ordering::Relaxed),
         metrics.scope_cache_misses.load(Ordering::Relaxed),
         metrics.scope_cache_evictions.load(Ordering::Relaxed),
+        metrics
+            .scope_cache_admission_bypasses
+            .load(Ordering::Relaxed),
+        metrics.scope_cache_promotions.load(Ordering::Relaxed),
+        metrics.scope_cache_idle_demotions.load(Ordering::Relaxed),
         metrics.scope_cache_close_failures.load(Ordering::Relaxed),
         metrics.scope_cache_entries.load(Ordering::Acquire),
-    );
+        metrics.scope_cache_capacity.load(Ordering::Acquire),
+        metrics.registered_scopes.load(Ordering::Acquire),
+        metrics
+            .change_notifications_observed
+            .load(Ordering::Relaxed),
+        metrics.change_notifications_cleared.load(Ordering::Relaxed),
+        metrics.changed_scopes_processed.load(Ordering::Relaxed),
+        metrics.change_notification_failures.load(Ordering::Relaxed),
+        metrics.change_push_wakes.load(Ordering::Relaxed),
+        metrics.change_push_rejections.load(Ordering::Relaxed),
+        metrics.change_push_throttles.load(Ordering::Relaxed),
+        metrics.pending_change_notifications.load(Ordering::Acquire),
+        metrics.last_change_success_ms.load(Ordering::Relaxed),
+        metrics.last_change_lag_ms.load(Ordering::Relaxed),
+    ));
     append_dimensioned(&mut output, &metrics.dimensioned_snapshot());
+    append_stage_timings(&mut output, &metrics.stage_timings_snapshot());
     output.push_str(&format!(
         concat!(
             "# TYPE graph_indexer_last_success_ms gauge\n",
@@ -2126,6 +3250,33 @@ fn render_metrics(metrics: &IndexerMetrics) -> String {
         metrics.last_full_sweep_ms.load(Ordering::Relaxed),
     ));
     output
+}
+
+fn append_stage_timings(
+    output: &mut String,
+    timings: &BTreeMap<(IndexWorkKind, IndexStage), StageTiming>,
+) {
+    output.push_str("# TYPE graph_indexer_stage_duration_seconds summary\n");
+    for ((work, stage), timing) in timings {
+        let labels = format!("work=\"{}\",stage=\"{}\"", work.as_str(), stage.as_str());
+        output.push_str(&format!(
+            "graph_indexer_stage_duration_seconds_sum{{{labels}}} {:.6}\n",
+            timing.elapsed_micros as f64 / 1_000_000.0
+        ));
+        output.push_str(&format!(
+            "graph_indexer_stage_duration_seconds_count{{{labels}}} {}\n",
+            timing.count
+        ));
+    }
+    output.push_str("# TYPE graph_indexer_stage_duration_seconds_max gauge\n");
+    for ((work, stage), timing) in timings {
+        output.push_str(&format!(
+            "graph_indexer_stage_duration_seconds_max{{work=\"{}\",stage=\"{}\"}} {:.6}\n",
+            work.as_str(),
+            stage.as_str(),
+            timing.max_micros as f64 / 1_000_000.0
+        ));
+    }
 }
 
 /// The three `{cell_id, edge_type}` families, plus the gauge that says how much
@@ -2204,7 +3355,7 @@ fn graph_scope() -> RuntimeResult<GraphScope> {
         env_value("GRAPH_NAMESPACE", "default")
             .split('/')
             .map(|segment| NamespaceId::new(segment.to_string()))
-            .collect::<slatedb_graph_kernel::Result<Vec<_>>>()?,
+            .collect::<hydradb::Result<Vec<_>>>()?,
     )?;
     Ok(GraphScope::new(
         namespace,
@@ -2214,6 +3365,21 @@ fn graph_scope() -> RuntimeResult<GraphScope> {
 
 fn env_value(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn read_indexer_wake_token() -> RuntimeResult<String> {
+    let path = env_value(
+        "GRAPH_AUTH_TOKEN_FILE",
+        "/var/run/secrets/slatedb-graph/auth-token",
+    );
+    let token = std::fs::read_to_string(&path)?.trim().to_string();
+    if token.len() < 32 || token.eq_ignore_ascii_case("change-me") {
+        return Err(format!(
+            "GRAPH_AUTH_TOKEN_FILE {path} must contain at least 32 non-placeholder characters"
+        )
+        .into());
+    }
+    Ok(token)
 }
 
 /// How a cycle builds a dirty edge type's index, set by
@@ -2280,10 +3446,61 @@ async fn shutdown_signal() -> RuntimeResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use hydradb::EdgeMutation;
     use slatedb::object_store::memory::InMemory;
-    use slatedb_graph_kernel::EdgeMutation;
 
     use super::*;
+
+    #[tokio::test]
+    async fn push_endpoint_authenticates_and_rate_limits_wakes() {
+        let metrics = Arc::new(IndexerMetrics::default());
+        let change_wake = Arc::new(Notify::new());
+        let state = IndexerAdminState {
+            metrics: Arc::clone(&metrics),
+            change_wake: Arc::clone(&change_wake),
+            wake_token: Arc::from("correct-token"),
+            wake_limiter: Arc::new(WakeRateLimiter::new(Duration::from_millis(20))),
+        };
+
+        let status = process_index_changes(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(metrics.change_push_rejections.load(Ordering::Relaxed), 1);
+
+        let mut wrong_headers = HeaderMap::new();
+        wrong_headers.insert(AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+        let status = process_index_changes(State(state.clone()), wrong_headers).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(metrics.change_push_rejections.load(Ordering::Relaxed), 2);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer correct-token".parse().unwrap());
+        let status = process_index_changes(State(state.clone()), headers.clone()).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_millis(50), change_wake.notified())
+            .await
+            .expect("push endpoint should leave a wake permit");
+        assert_eq!(metrics.change_push_wakes.load(Ordering::Relaxed), 1);
+
+        let status = process_index_changes(State(state.clone()), headers.clone()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), change_wake.notified())
+                .await
+                .is_err(),
+            "throttled request must not wake object-store discovery"
+        );
+        assert_eq!(metrics.change_push_throttles.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.change_push_wakes.load(Ordering::Relaxed), 1);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let status = process_index_changes(State(state), headers).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_millis(50), change_wake.notified())
+            .await
+            .expect("wake should be accepted after the rate-limit interval");
+        assert_eq!(metrics.change_push_wakes.load(Ordering::Relaxed), 2);
+    }
 
     fn test_scope_cache(
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
@@ -2294,10 +3511,27 @@ mod tests {
             "graph/data".to_string(),
             vec!["cell-0".to_string()],
             object_store,
-            GraphOpenOptions::default(),
+            indexer_open_options(
+                GraphLimits::default().max_wal_tail_files,
+                GraphOpenOptions::default().cache.slatedb_cache_bytes,
+            ),
             max_open_scopes,
+            DEFAULT_SCOPE_CONCURRENCY,
             metrics,
         ))
+    }
+
+    #[test]
+    fn indexer_readers_are_checkpoint_free_and_refresh_on_demand() {
+        let options = indexer_open_options(123, 456);
+
+        assert_eq!(options.limits.max_wal_tail_files, 123);
+        assert_eq!(options.cache.slatedb_cache_bytes, 456);
+        assert_eq!(options.reader_mode, GraphReaderMode::FollowLatest);
+        assert_eq!(
+            options.reader_manifest_poll_interval,
+            INDEXER_READER_MANIFEST_POLL_INTERVAL
+        );
     }
 
     /// The kill switch defaults to the pre-existing behaviour, and refuses a
@@ -2367,6 +3601,14 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn clean_scope_probes_run_wider_than_dirty_builds_with_a_hard_cap() {
+        assert_eq!(scope_probe_concurrency(1), 2);
+        assert_eq!(scope_probe_concurrency(16), 32);
+        assert_eq!(scope_probe_concurrency(MAX_SCOPE_CONCURRENCY), 128);
+        assert_eq!(scope_probe_concurrency(usize::MAX), 128);
+    }
+
     #[tokio::test]
     async fn scope_cursor_cas_never_overwrites_another_indexer() {
         let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
@@ -2406,7 +3648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scope_cache_reuses_and_evicts_idle_readers() {
+    async fn full_scope_cache_bypasses_cold_scans_without_churning_residents() {
         let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
         let metrics = Arc::new(IndexerMetrics::default());
         let cache = test_scope_cache(object_store, Arc::clone(&metrics), 1);
@@ -2420,27 +3662,39 @@ mod tests {
             GraphId::new("hydradb").unwrap(),
         );
 
-        let (first, first_hit) = cache.cluster_for_scope(&first_scope).await.unwrap();
-        let (reused, reused_hit) = cache.cluster_for_scope(&first_scope).await.unwrap();
-        assert!(!first_hit);
-        assert!(reused_hit);
+        let (first, first_disposition) = cache.cluster_for_scope(&first_scope).await.unwrap();
+        let (reused, reused_disposition) = cache.cluster_for_scope(&first_scope).await.unwrap();
+        assert_eq!(first_disposition, ScopeCacheDisposition::Admitted);
+        assert_eq!(reused_disposition, ScopeCacheDisposition::Hit);
         assert!(Arc::ptr_eq(&first, &reused));
         drop(first);
         drop(reused);
 
-        let (second, second_hit) = cache.cluster_for_scope(&second_scope).await.unwrap();
-        assert!(!second_hit);
-        drop(second);
+        let (second, second_disposition) = cache.cluster_for_scope(&second_scope).await.unwrap();
+        assert_eq!(second_disposition, ScopeCacheDisposition::Bypassed);
+        cache
+            .finish_scope(&second_scope, &second, second_disposition, false)
+            .await;
 
-        assert_eq!(metrics.scope_cache_hits.load(Ordering::Relaxed), 1);
+        let (resident, resident_disposition) = cache.cluster_for_scope(&first_scope).await.unwrap();
+        assert_eq!(resident_disposition, ScopeCacheDisposition::Hit);
+        drop(resident);
+
+        assert_eq!(metrics.scope_cache_hits.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.scope_cache_misses.load(Ordering::Relaxed), 2);
-        assert_eq!(metrics.scope_cache_evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.scope_cache_evictions.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .scope_cache_admission_bypasses
+                .load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(metrics.scope_cache_entries.load(Ordering::Acquire), 1);
         cache.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn idle_scan_misses_do_not_evict_hot_scope_readers() {
+    async fn clean_scopes_remain_cached_and_idle_hot_scopes_are_demoted() {
         let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
         let metrics = Arc::new(IndexerMetrics::default());
         let cache = test_scope_cache(object_store, Arc::clone(&metrics), 2);
@@ -2454,18 +3708,215 @@ mod tests {
         let hot_scope = scope("hot");
         let idle_scope = scope("idle");
 
-        let (hot, hot_hit) = cache.cluster_for_scope(&hot_scope).await.unwrap();
-        cache.finish_scope(&hot_scope, &hot, hot_hit, true).await;
-        let (idle, idle_hit) = cache.cluster_for_scope(&idle_scope).await.unwrap();
+        let (hot, hot_disposition) = cache.cluster_for_scope(&hot_scope).await.unwrap();
         cache
-            .finish_scope(&idle_scope, &idle, idle_hit, false)
+            .finish_scope(&hot_scope, &hot, hot_disposition, true)
+            .await;
+        let (idle, idle_disposition) = cache.cluster_for_scope(&idle_scope).await.unwrap();
+        cache
+            .finish_scope(&idle_scope, &idle, idle_disposition, false)
             .await;
 
         assert_eq!(cache.hot_scopes(10).await, vec![hot_scope.clone()]);
+        assert_eq!(metrics.scope_cache_entries.load(Ordering::Acquire), 2);
+        let (reused_idle, idle_hit) = cache.cluster_for_scope(&idle_scope).await.unwrap();
+        assert_eq!(idle_hit, ScopeCacheDisposition::Hit);
+        assert!(Arc::ptr_eq(&idle, &reused_idle));
+
+        for _ in 0..HOT_SCOPE_IDLE_RECHECKS {
+            let (reused_hot, hot_hit) = cache.cluster_for_scope(&hot_scope).await.unwrap();
+            assert_eq!(hot_hit, ScopeCacheDisposition::Hit);
+            assert!(Arc::ptr_eq(&hot, &reused_hot));
+            cache
+                .finish_scope(&hot_scope, &reused_hot, hot_hit, false)
+                .await;
+        }
+        assert!(cache.hot_scopes(10).await.is_empty());
+        assert_eq!(metrics.scope_cache_entries.load(Ordering::Acquire), 2);
+        assert_eq!(
+            metrics.scope_cache_idle_demotions.load(Ordering::Relaxed),
+            1
+        );
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resident_scope_skips_redundant_existence_scan() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let metrics = Arc::new(IndexerMetrics::default());
+        let cache = test_scope_cache(Arc::clone(&object_store), Arc::clone(&metrics), 1);
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let scope = GraphScope::new(
+            root.child(NamespaceId::new("tenant-a").unwrap()).unwrap(),
+            GraphId::new("hydradb").unwrap(),
+        );
+        let writer = GraphCluster::open_cells_standalone_writers_scoped(
+            "graph/data",
+            scope.clone(),
+            ["cell-0"],
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap();
+        writer
+            .shard("cell-0")
+            .unwrap()
+            .write_edge(EdgeMutation {
+                cell_id: "cell-0".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "resident-scope-edge".to_string(),
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        for _ in 0..2 {
+            let outcome = run_registered_scope(
+                scope.clone(),
+                1,
+                IndexBuildMode::Full,
+                250_000,
+                &cache,
+                &metrics,
+                IndexWorkKind::Sweep,
+            )
+            .await;
+            assert!(outcome.failures.is_empty(), "{}", outcome.failures);
+        }
+
+        let writer = GraphCluster::open_cells_standalone_writers_scoped(
+            "graph/data",
+            scope.clone(),
+            ["cell-0"],
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap();
+        writer
+            .shard("cell-0")
+            .unwrap()
+            .write_edge(EdgeMutation {
+                cell_id: "cell-0".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 2,
+                dst: 3,
+                idempotency_key: "resident-scope-edge-2".to_string(),
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let changed = run_registered_scope(
+            scope.clone(),
+            1,
+            IndexBuildMode::Full,
+            250_000,
+            &cache,
+            &metrics,
+            IndexWorkKind::Sweep,
+        )
+        .await;
+        assert!(changed.failures.is_empty(), "{}", changed.failures);
+
+        let timings = metrics.stage_timings_snapshot();
+        assert_eq!(
+            timings
+                .get(&(IndexWorkKind::Sweep, IndexStage::ScopeTotal))
+                .map(|timing| timing.count),
+            Some(3)
+        );
+        assert_eq!(
+            timings
+                .get(&(IndexWorkKind::Sweep, IndexStage::ScopeHasData))
+                .map(|timing| timing.count),
+            Some(1),
+            "the resident reader makes another object-store existence scan unnecessary"
+        );
+        assert_eq!(
+            timings
+                .get(&(IndexWorkKind::Sweep, IndexStage::RefreshSequence))
+                .map(|timing| timing.count),
+            Some(3)
+        );
+        assert_eq!(
+            timings
+                .get(&(IndexWorkKind::Sweep, IndexStage::DiscoverDirty))
+                .map(|timing| timing.count),
+            Some(2),
+            "only the unchanged storage sequence should skip dirty-index discovery"
+        );
+        assert_eq!(metrics.scope_cache_misses.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.scope_cache_hits.load(Ordering::Relaxed), 2);
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn built_bypassed_scope_displaces_oldest_idle_resident() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let metrics = Arc::new(IndexerMetrics::default());
+        let cache = test_scope_cache(object_store, Arc::clone(&metrics), 1);
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let scope = |tenant: &str| {
+            GraphScope::new(
+                root.child(NamespaceId::new(tenant).unwrap()).unwrap(),
+                GraphId::new("hydradb").unwrap(),
+            )
+        };
+        let idle_scope = scope("idle");
+        let built_scope = scope("built");
+
+        let (idle, idle_disposition) = cache.cluster_for_scope(&idle_scope).await.unwrap();
+        cache
+            .finish_scope(&idle_scope, &idle, idle_disposition, false)
+            .await;
+        drop(idle);
+        let (built, built_disposition) = cache.cluster_for_scope(&built_scope).await.unwrap();
+        assert_eq!(built_disposition, ScopeCacheDisposition::Bypassed);
+        cache
+            .finish_scope(&built_scope, &built, built_disposition, true)
+            .await;
+
+        let (reused, disposition) = cache.cluster_for_scope(&built_scope).await.unwrap();
+        assert_eq!(disposition, ScopeCacheDisposition::Hit);
+        assert!(Arc::ptr_eq(&built, &reused));
+        assert_eq!(metrics.scope_cache_evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.scope_cache_promotions.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.scope_cache_entries.load(Ordering::Acquire), 1);
-        let (reused, reused_hit) = cache.cluster_for_scope(&hot_scope).await.unwrap();
-        assert!(reused_hit);
-        assert!(Arc::ptr_eq(&hot, &reused));
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_bypassed_scope_closes_without_invalidating_residents() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let metrics = Arc::new(IndexerMetrics::default());
+        let cache = test_scope_cache(object_store, Arc::clone(&metrics), 1);
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let scope = |tenant: &str| {
+            GraphScope::new(
+                root.child(NamespaceId::new(tenant).unwrap()).unwrap(),
+                GraphId::new("hydradb").unwrap(),
+            )
+        };
+        let resident_scope = scope("resident");
+        let failed_scope = scope("failed");
+
+        let (resident, resident_disposition) =
+            cache.cluster_for_scope(&resident_scope).await.unwrap();
+        assert_eq!(resident_disposition, ScopeCacheDisposition::Admitted);
+        drop(resident);
+
+        let (failed, failed_disposition) = cache.cluster_for_scope(&failed_scope).await.unwrap();
+        assert_eq!(failed_disposition, ScopeCacheDisposition::Bypassed);
+        cache
+            .finish_failed_scope(&failed_scope, &failed, failed_disposition)
+            .await
+            .unwrap();
+
+        let (reused, disposition) = cache.cluster_for_scope(&resident_scope).await.unwrap();
+        assert_eq!(disposition, ScopeCacheDisposition::Hit);
+        assert_eq!(metrics.scope_cache_entries.load(Ordering::Acquire), 1);
+        drop(reused);
         cache.close().await.unwrap();
     }
 
@@ -2526,6 +3977,8 @@ mod tests {
 
         assert_eq!(metrics.scopes_processed.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.scopes_deferred.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.registered_scopes.load(Ordering::Acquire), 5);
+        assert_eq!(metrics.scope_cache_capacity.load(Ordering::Acquire), 1);
         assert_eq!(registered_scopes.scopes.len(), 5);
         assert!(registered_scopes.cursor.is_some());
         let cursor = load_scope_cursor(
@@ -2559,6 +4012,18 @@ mod tests {
         assert!(completed);
         assert!(registered_scopes.scopes.is_empty());
         cache.close().await.unwrap();
+    }
+
+    #[test]
+    fn stable_scope_cache_shortfall_warns_once() {
+        let metrics = IndexerMetrics::default();
+
+        assert_eq!(metrics.record_scope_cache_population(5, 2), Some(3));
+        assert_eq!(metrics.record_scope_cache_population(5, 2), None);
+        assert_eq!(metrics.record_scope_cache_population(6, 2), Some(4));
+        assert_eq!(metrics.record_scope_cache_population(2, 2), None);
+        assert_eq!(metrics.record_scope_cache_population(5, 2), Some(3));
+        assert_eq!(metrics.registered_scopes.load(Ordering::Acquire), 5);
     }
 
     #[tokio::test]
@@ -2757,6 +4222,217 @@ mod tests {
         cache.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn changed_scope_fast_lane_builds_and_acknowledges_exact_hints() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let graph_id = GraphId::new("hydradb").unwrap();
+        let scope = GraphScope::new(
+            root.child(NamespaceId::new("tenant-fast").unwrap())
+                .unwrap()
+                .child(NamespaceId::new("collection-fast").unwrap())
+                .unwrap(),
+            graph_id.clone(),
+        );
+        let directory = ObjectStoreGraphScopeDirectory::new(
+            "graph/data",
+            root,
+            graph_id,
+            Arc::clone(&object_store),
+        );
+        directory.register(&scope).await.unwrap();
+
+        let writer = GraphCluster::open_cells_standalone_writers_scoped(
+            "graph/data",
+            scope.clone(),
+            ["cell-0"],
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap();
+        writer
+            .shard("cell-0")
+            .unwrap()
+            .write_edge(EdgeMutation {
+                cell_id: "cell-0".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "fast-lane-write".to_string(),
+            })
+            .await
+            .unwrap();
+        let sequence = writer
+            .shard("cell-0")
+            .unwrap()
+            .current_storage_sequence("cell-0")
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        directory
+            .notify_changed(&scope, "cell-0", sequence)
+            .await
+            .unwrap();
+        directory
+            .notify_changed(&scope, "cell-0", sequence)
+            .await
+            .unwrap();
+        let metrics = Arc::new(IndexerMetrics::default());
+        let cache = test_scope_cache(Arc::clone(&object_store), Arc::clone(&metrics), 1);
+
+        let failures = run_scope_change_pass(
+            &directory,
+            1,
+            IndexBuildMode::Full,
+            250_000,
+            1,
+            &cache,
+            &metrics,
+        )
+        .await;
+
+        assert!(failures.is_empty(), "fast lane failed: {failures}");
+        assert!(directory.list_changes().await.unwrap().is_empty());
+        assert_eq!(
+            metrics
+                .change_notifications_observed
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics.change_notifications_cleared.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(metrics.changed_scopes_processed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.pending_change_notifications.load(Ordering::Acquire),
+            0
+        );
+
+        // A notification can land after the build that already covered its
+        // commit. The durable sequence watermark must clear it without opening
+        // or refreshing the scope a second time.
+        directory
+            .notify_changed(&scope, "cell-0", sequence)
+            .await
+            .unwrap();
+        let second_failures = run_scope_change_pass(
+            &directory,
+            1,
+            IndexBuildMode::Full,
+            250_000,
+            1,
+            &cache,
+            &metrics,
+        )
+        .await;
+        assert!(
+            second_failures.is_empty(),
+            "covered hint cleanup failed: {second_failures}"
+        );
+        assert!(directory.list_changes().await.unwrap().is_empty());
+        assert_eq!(
+            metrics
+                .change_notifications_observed
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(
+            metrics.change_notifications_cleared.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(metrics.changed_scopes_processed.load(Ordering::Relaxed), 1);
+        let timings = metrics.stage_timings_snapshot();
+        assert_eq!(
+            timings
+                .get(&(IndexWorkKind::Change, IndexStage::ScopeTotal))
+                .map(|timing| timing.count),
+            Some(1)
+        );
+        for stage in [
+            IndexStage::Pass,
+            IndexStage::ListChanges,
+            IndexStage::ScopeTotal,
+            IndexStage::ScopeQueue,
+            IndexStage::ScopeHasData,
+            IndexStage::ClusterOpen,
+            IndexStage::RefreshSequence,
+            IndexStage::DiscoverDirty,
+            IndexStage::ReadCurrent,
+            IndexStage::ArtifactBuild,
+            IndexStage::ArtifactGc,
+            IndexStage::XlogGc,
+            IndexStage::ClearChanges,
+        ] {
+            assert!(
+                timings.contains_key(&(IndexWorkKind::Change, stage)),
+                "missing timing for {stage:?}"
+            );
+        }
+
+        let reader = GraphCluster::open_cells_scoped(
+            "graph/data",
+            scope,
+            ["cell-0"],
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reader
+                .shard("cell-0")
+                .unwrap()
+                .current_graph_index("cell-0", "FOLLOWS")
+                .await
+                .unwrap()
+                .map(|generation| generation.edge_count),
+            Some(1)
+        );
+        reader.close().await.unwrap();
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sequence_coverage_never_skips_a_newer_hint() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let graph_id = GraphId::new("hydradb").unwrap();
+        let scope = GraphScope::new(
+            root.child(NamespaceId::new("tenant-a").unwrap()).unwrap(),
+            graph_id.clone(),
+        );
+        let directory =
+            ObjectStoreGraphScopeDirectory::new("graph/data", root, graph_id, object_store);
+        directory
+            .acknowledge_sequence(&scope, "cell-0", 10)
+            .await
+            .unwrap();
+        directory.notify_changed(&scope, "cell-0", 9).await.unwrap();
+        directory
+            .notify_changed(&scope, "cell-0", 11)
+            .await
+            .unwrap();
+
+        let changes = directory.list_changes().await.unwrap();
+        let (covered, pending) = partition_scope_changes(&directory, &changes).await.unwrap();
+
+        assert_eq!(
+            covered
+                .iter()
+                .map(|change| change.sequence)
+                .collect::<Vec<_>>(),
+            vec![Some(9)]
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .map(|change| change.sequence)
+                .collect::<Vec<_>>(),
+            vec![Some(11)]
+        );
+    }
+
     /// Every series a scrape sees when nothing has been indexed yet.
     ///
     /// Pinned in full rather than probed, because the point of this change is
@@ -2764,14 +4440,25 @@ mod tests {
     /// `open_failures` and `last_success_ms` keep their exact names, their
     /// absence of labels and their positions, and the six families that carry
     /// labels still declare a `# TYPE` line with no samples under it.
+    ///
+    /// The build-info preamble is stripped rather than pinned: it names the
+    /// commit, so its text differs on every build and no literal could match
+    /// it. `strip_prefix` still proves the document opens with exactly that
+    /// series, and what stays pinned below is the property this test is for —
+    /// that adding it moved nothing underneath.
     #[test]
     fn an_idle_indexer_declares_every_family() {
         let metrics = IndexerMetrics::default();
         metrics.ready.store(true, Ordering::Release);
         metrics.cycles.store(3, Ordering::Relaxed);
 
+        let document = render_metrics(&metrics);
+        let body = document
+            .strip_prefix(&hydradb_telemetry::build_info::prometheus_gauge())
+            .expect("the document opens with the build-info series");
+
         assert_eq!(
-            render_metrics(&metrics),
+            body,
             concat!(
                 "# TYPE graph_indexer_ready gauge\n",
                 "graph_indexer_ready 1\n",
@@ -2799,10 +4486,40 @@ mod tests {
                 "graph_indexer_scope_cache_misses 0\n",
                 "# TYPE graph_indexer_scope_cache_evictions counter\n",
                 "graph_indexer_scope_cache_evictions 0\n",
+                "# TYPE graph_indexer_scope_cache_admission_bypasses counter\n",
+                "graph_indexer_scope_cache_admission_bypasses 0\n",
+                "# TYPE graph_indexer_scope_cache_promotions counter\n",
+                "graph_indexer_scope_cache_promotions 0\n",
+                "# TYPE graph_indexer_scope_cache_idle_demotions counter\n",
+                "graph_indexer_scope_cache_idle_demotions 0\n",
                 "# TYPE graph_indexer_scope_cache_close_failures counter\n",
                 "graph_indexer_scope_cache_close_failures 0\n",
                 "# TYPE graph_indexer_scope_cache_entries gauge\n",
                 "graph_indexer_scope_cache_entries 0\n",
+                "# TYPE graph_indexer_scope_cache_capacity gauge\n",
+                "graph_indexer_scope_cache_capacity 0\n",
+                "# TYPE graph_indexer_registered_scopes gauge\n",
+                "graph_indexer_registered_scopes 0\n",
+                "# TYPE graph_indexer_change_notifications_observed counter\n",
+                "graph_indexer_change_notifications_observed 0\n",
+                "# TYPE graph_indexer_change_notifications_cleared counter\n",
+                "graph_indexer_change_notifications_cleared 0\n",
+                "# TYPE graph_indexer_changed_scopes_processed counter\n",
+                "graph_indexer_changed_scopes_processed 0\n",
+                "# TYPE graph_indexer_change_notification_failures counter\n",
+                "graph_indexer_change_notification_failures 0\n",
+                "# TYPE graph_indexer_change_push_wakes counter\n",
+                "graph_indexer_change_push_wakes 0\n",
+                "# TYPE graph_indexer_change_push_rejections counter\n",
+                "graph_indexer_change_push_rejections 0\n",
+                "# TYPE graph_indexer_change_push_throttles counter\n",
+                "graph_indexer_change_push_throttles 0\n",
+                "# TYPE graph_indexer_pending_change_notifications gauge\n",
+                "graph_indexer_pending_change_notifications 0\n",
+                "# TYPE graph_indexer_last_change_success_ms gauge\n",
+                "graph_indexer_last_change_success_ms 0\n",
+                "# TYPE graph_indexer_last_change_lag_ms gauge\n",
+                "graph_indexer_last_change_lag_ms 0\n",
                 "# TYPE graph_indexer_generations_published counter\n",
                 "# TYPE graph_indexer_generation_failures counter\n",
                 "# TYPE graph_indexer_generations_deleted counter\n",
@@ -2811,12 +4528,40 @@ mod tests {
                 "# TYPE graph_indexer_incremental_fallbacks counter\n",
                 "# TYPE graph_indexer_dimensions gauge\n",
                 "graph_indexer_dimensions 0\n",
+                "# TYPE graph_indexer_stage_duration_seconds summary\n",
+                "# TYPE graph_indexer_stage_duration_seconds_max gauge\n",
                 "# TYPE graph_indexer_last_success_ms gauge\n",
                 "graph_indexer_last_success_ms 0\n",
                 "# TYPE graph_indexer_last_full_sweep_ms gauge\n",
                 "graph_indexer_last_full_sweep_ms 0\n",
             )
         );
+    }
+
+    #[test]
+    fn stage_timings_expose_bounded_work_and_stage_labels() {
+        let metrics = IndexerMetrics::default();
+        metrics.record_stage(
+            IndexWorkKind::Change,
+            IndexStage::ArtifactBuild,
+            Duration::from_millis(12),
+        );
+        metrics.record_stage(
+            IndexWorkKind::Change,
+            IndexStage::ArtifactBuild,
+            Duration::from_millis(8),
+        );
+
+        let output = render_metrics(&metrics);
+        assert!(output.contains(
+            "graph_indexer_stage_duration_seconds_sum{work=\"change\",stage=\"artifact_build\"} 0.020000\n"
+        ));
+        assert!(output.contains(
+            "graph_indexer_stage_duration_seconds_count{work=\"change\",stage=\"artifact_build\"} 2\n"
+        ));
+        assert!(output.contains(
+            "graph_indexer_stage_duration_seconds_max{work=\"change\",stage=\"artifact_build\"} 0.012000\n"
+        ));
     }
 
     #[test]

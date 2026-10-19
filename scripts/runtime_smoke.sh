@@ -65,7 +65,11 @@ for _ in $(seq 1 160); do
   sleep 0.25
 done
 curl -fsS http://127.0.0.1:19091/readyz >/dev/null
-curl -fsS http://127.0.0.1:19091/metrics | grep -q graph_runtime_ready
+# Fetch first, then search: under pipefail, `curl | grep -q` fails with curl's
+# exit 23 whenever grep matches and exits before a large /metrics body is
+# fully written.
+curl -fsS http://127.0.0.1:19091/metrics >"$ROOT/metrics.prom"
+grep -q graph_runtime_ready "$ROOT/metrics.prom"
 
 if ! "$PYTHON" -c 'import neo4j' >/dev/null 2>&1; then
   echo "python neo4j package is required for runtime smoke" >&2

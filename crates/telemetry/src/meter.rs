@@ -702,10 +702,99 @@ fn attributes_of(key: &SeriesKey) -> Vec<KeyValue> {
         .collect()
 }
 
+/// A cached non-monotonic measurement for a bounded set of metric labels.
+#[derive(Debug)]
+pub struct ObservableGauge {
+    name: &'static str,
+    state: Arc<RwLock<HashMap<SeriesKey, f64>>>,
+}
+impl ObservableGauge {
+    /// Register a gauge; the collection task must publish current values.
+    pub fn register(
+        meter: &Meter,
+        name: &'static str,
+        description: &'static str,
+        unit: &'static str,
+    ) -> Self {
+        let state = Arc::new(RwLock::new(HashMap::<SeriesKey, f64>::new()));
+        let observed = Arc::clone(&state);
+        let _ = meter
+            .f64_observable_gauge(name)
+            .with_description(description)
+            .with_unit(unit)
+            .with_callback(move |observer| {
+                for (key, value) in observed.read().unwrap_or_else(|p| p.into_inner()).iter() {
+                    observer.observe(*value, &attributes_of(key));
+                }
+            })
+            .build();
+        Self { name, state }
+    }
+    /// Replace one series, including zeroes when its tracked objects drain.
+    pub fn record(&self, labels: &[(MetricLabel, &str)], value: f64) -> Result<(), CounterError> {
+        let mut key: SeriesKey = labels
+            .iter()
+            .map(|(label, value)| (label.key(), (*value).to_string()))
+            .collect();
+        if key.iter().any(|(name, _)| *name == LE) {
+            return Err(CounterError::ReservedLabel { name: self.name });
+        }
+        key.sort_unstable();
+        if let Some(duplicate) = key
+            .windows(2)
+            .find(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0)
+        {
+            return Err(CounterError::DuplicateLabel {
+                name: self.name,
+                key: duplicate,
+            });
+        }
+        self.state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, value);
+        Ok(())
+    }
+    /// The latest values, also used to verify reset and attribute semantics.
+    pub fn observations(&self) -> Vec<Observation<f64>> {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(key, value)| Observation {
+                attributes: attributes_of(key),
+                value: *value,
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::semconv::{L_CELL_ID, L_DB_SYSTEM_NAME};
+
+    #[test]
+    fn gauge_reports_decrease_and_zero_with_the_same_stage_label() {
+        let meter = opentelemetry::global::meter("memory-gauge-test");
+        let gauge = ObservableGauge::register(&meter, "hydradb.test.memory", "test", "By");
+        let labels = [(crate::semconv::L_MEMORY_STAGE, "client_query_wait")];
+        gauge.record(&labels, 4096.0).unwrap();
+        gauge.record(&labels, 0.0).unwrap();
+        let samples = gauge.observations();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].value, 0.0);
+        assert_eq!(
+            samples[0].attributes,
+            vec![KeyValue::new(
+                crate::semconv::MEMORY_STAGE,
+                "client_query_wait"
+            )]
+        );
+        assert!(gauge.record(&[(crate::semconv::L_LE, "1")], 0.0).is_err());
+        assert!(gauge.record(&[labels[0], labels[0]], 0.0).is_err());
+    }
 
     /// A three-bound ladder: four buckets with the overflow.
     const BOUNDS: &[u64] = &[100, 1_000, 30_000_000];

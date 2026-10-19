@@ -29,6 +29,128 @@ struct CursorTestClient {
     executions: Arc<AtomicU64>,
 }
 
+#[cfg(feature = "experimental-cypher-engine")]
+struct ExperimentalModeClient {
+    observed: Arc<Mutex<Option<CypherEngineMode>>>,
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+struct ExperimentalMutationClient {
+    executions: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+struct ExperimentalDispatchClient {
+    batch_executions: Arc<AtomicU64>,
+    cypher_queries: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[async_trait]
+impl QueryCellClient for ExperimentalModeClient {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        *self.observed.lock().await = Some(context.cypher_engine);
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+        )
+        .with_read_epoch(7)
+        .with_storage_sequence(7))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[async_trait]
+impl QueryCellClient for ExperimentalMutationClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        self.executions.fetch_add(1, Ordering::Relaxed);
+        Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        self.executions.fetch_add(1, Ordering::Relaxed);
+        Ok(QueryResultPage::new(Vec::new(), Vec::new(), None))
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
+        Ok(Some(11))
+    }
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[async_trait]
+impl QueryCellClient for ExperimentalDispatchClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        query: &str,
+    ) -> Result<QueryResultSet> {
+        self.cypher_queries.lock().await.push(query.to_string());
+        Ok(
+            QueryResultSet::new(vec![QueryColumn::new("path")], Vec::new())
+                .with_read_epoch(17)
+                .with_storage_sequence(17),
+        )
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn execute_batch(
+        &self,
+        _context: QueryContext,
+        _operation: QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        self.batch_executions.fetch_add(1, Ordering::Relaxed);
+        Ok(QueryResultSet::new(Vec::new(), Vec::new()).with_storage_sequence(18))
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
+        Ok(Some(18))
+    }
+}
+
 #[test]
 fn hierarchical_database_resolver_maps_each_collection_to_a_native_scope() {
     let root = GraphScope::new(
@@ -411,6 +533,7 @@ fn query_context_separates_mutation_identity_from_the_query_handle() {
         &session("caller-a"),
         &request,
         BTreeMap::new(),
+        BTreeMap::new(),
         QueryCancellationToken::new(),
     );
 
@@ -428,6 +551,7 @@ fn query_context_keeps_the_legacy_fallback_for_non_bolt_callers() {
         &session("caller-a"),
         &request,
         BTreeMap::new(),
+        BTreeMap::new(),
         QueryCancellationToken::new(),
     );
 
@@ -443,11 +567,13 @@ fn caller_mutation_identity_is_stable_within_one_principal() {
         &session("caller-a"),
         &request,
         BTreeMap::new(),
+        BTreeMap::new(),
         QueryCancellationToken::new(),
     );
     let second = query_context(
         &session("caller-a"),
         &request,
+        BTreeMap::new(),
         BTreeMap::new(),
         QueryCancellationToken::new(),
     );
@@ -465,11 +591,13 @@ fn identical_caller_mutation_ids_are_isolated_between_principals() {
         &session("caller-a"),
         &request,
         BTreeMap::new(),
+        BTreeMap::new(),
         QueryCancellationToken::new(),
     );
     let second = query_context(
         &session("caller-b"),
         &request,
+        BTreeMap::new(),
         BTreeMap::new(),
         QueryCancellationToken::new(),
     );
@@ -747,6 +875,580 @@ async fn prepares_native_path_procedure_columns_for_bolt_execution() {
     assert_eq!(prepared.action, QueryTransportAction::Read);
     assert_eq!(prepared.columns, vec![QueryColumn::new("path")]);
     assert!(prepared.batch_operation.is_none());
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn experimental_mode_prepares_native_path_procedures_without_generic_parsing() {
+    let service = ClientQueryService::new(
+        Arc::new(TestClient {
+            epoch: AtomicU64::new(7),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+    let prepared = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-native-mspaths",
+                "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+                 sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], \
+                 pairwise: true, relTypes: ['RELATES'], maxLen: 3, \
+                 relDirection: 'both', pathCount: 5, \
+                 fairRelationshipVariants: true, resultLimit: 100}) \
+                 YIELD path RETURN path",
+            ),
+            256,
+        )
+        .await
+        .expect("prepare native path call in experimental mode");
+
+    assert_eq!(prepared.action, QueryTransportAction::Read);
+    assert_eq!(prepared.columns, vec![QueryColumn::new("path")]);
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn experimental_mode_prepares_bolt_columns_with_the_new_parser_and_reaches_the_client() {
+    let observed = Arc::new(Mutex::new(None));
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(ExperimentalModeClient {
+            observed: Arc::clone(&observed),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+    let query = "MATCH (e:Entity) RETURN e.entity_id AS id, e.rank AS rank \
+                 ORDER BY rank DESC SKIP 1 LIMIT 2";
+    let prepared = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(target(), "experimental-bolt-prepare", query),
+            128,
+        )
+        .await
+        .expect("prepare Bolt RUN with the experimental parser");
+    assert_eq!(
+        prepared.columns,
+        vec![QueryColumn::new("id"), QueryColumn::new("rank")]
+    );
+
+    service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-client-mode",
+                "MATCH (e:Entity) RETURN e",
+            ),
+        )
+        .await
+        .expect("execute experimental client query");
+    assert_eq!(*observed.lock().await, Some(CypherEngineMode::Experimental));
+
+    let explain = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-bolt-explain",
+                "EXPLAIN MATCH (e:Entity) RETURN e",
+            ),
+            128,
+        )
+        .await
+        .expect("prepare experimental EXPLAIN over Bolt");
+    assert_eq!(explain.columns, vec![QueryColumn::new("plan")]);
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn experimental_mutation_uses_write_authorization_without_a_read_watermark() {
+    let executions = Arc::new(AtomicU64::new(0));
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::graph(GraphScope::default(), [QueryTransportAction::Write]),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(ExperimentalMutationClient {
+            executions: Arc::clone(&executions),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+
+    let response = service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-mutation",
+                "CREATE (n:Entity {id: 1})",
+            ),
+        )
+        .await
+        .expect("execute experimental mutation through write authorization");
+
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+    assert_eq!(response.read_epoch, None);
+    assert_eq!(response.bookmark.expect("write bookmark").epoch, 11);
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn experimental_access_classification_enforces_read_and_write_grants() {
+    let executions = Arc::new(AtomicU64::new(0));
+    let read_authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let read_service = ClientQueryService::new(
+        Arc::new(ExperimentalMutationClient {
+            executions: Arc::clone(&executions),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(read_authorizer))
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let read_session = authenticated_session(&read_service);
+    let mutation_error = read_service
+        .execute_rows(
+            &read_session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-read-only-mutation",
+                "CREATE (n:Entity {id: 1})",
+            ),
+        )
+        .await
+        .expect_err("read-only grant must reject mutations");
+    assert!(matches!(
+        mutation_error,
+        GraphError::GraphScopeAccessDenied { .. }
+    ));
+    assert_eq!(executions.load(Ordering::Relaxed), 0);
+
+    let write_authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::graph(GraphScope::default(), [QueryTransportAction::Write]),
+        )
+        .unwrap();
+    let write_service = ClientQueryService::new(
+        Arc::new(ExperimentalMutationClient {
+            executions: Arc::clone(&executions),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(write_authorizer))
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let write_session = authenticated_session(&write_service);
+    let read_error = write_service
+        .prepare_page_request(
+            &write_session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-write-only-native-read",
+                "CALL algo.SSpaths({sourceNode: 1, relTypes: ['ROUTE'], maxLen: 1}) \
+                 YIELD path RETURN path",
+            ),
+            128,
+        )
+        .await
+        .expect_err("write-only grant must reject native reads");
+    assert!(matches!(
+        read_error,
+        GraphError::GraphScopeAccessDenied { .. }
+    ));
+    assert_eq!(executions.load(Ordering::Relaxed), 0);
+}
+
+/// Bolt sends field names in the RUN response, before any record, so a
+/// mutation that ends in `RETURN count(r) AS deleted` has to declare that
+/// column at preparation — long before the delete runs. A mutation without a
+/// RETURN still prepares no columns, which is the shape every existing write
+/// keeps.
+///
+/// Both engine modes are asserted because the experimental route dispatches
+/// mutations to the same lowerer: the column a client sees must not depend on
+/// which route is configured. The experimental mode needs its engine compiled
+/// in even though this query never reaches it, because preparation rejects the
+/// mode itself without the feature.
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn prepares_the_returned_column_of_a_bounded_delete_on_both_engines() {
+    for engine in [CypherEngineMode::Legacy, CypherEngineMode::Experimental] {
+        let authorizer = StaticQueryTransportScopeAuthorizer::new()
+            .with_bearer_grant(
+                "secret",
+                QueryTransportScopeGrant::graph(
+                    GraphScope::default(),
+                    [QueryTransportAction::Write],
+                ),
+            )
+            .unwrap();
+        let service = ClientQueryService::new(
+            Arc::new(TestClient {
+                epoch: AtomicU64::new(7),
+            }),
+            ClientQueryServiceConfig::default()
+                .with_required_bearer_token("secret")
+                .with_scope_authorizer(Arc::new(authorizer))
+                .with_cypher_engine(engine),
+        )
+        .unwrap();
+        let session = authenticated_session(&service);
+
+        let scope_parameters = [
+            (
+                "source_id".to_string(),
+                QueryParameterValue::Scalar(VertexPropertyValue::String("src-1".to_string())),
+            ),
+            (
+                "tenant_id".to_string(),
+                QueryParameterValue::Scalar(VertexPropertyValue::String("tenant-1".to_string())),
+            ),
+            (
+                "sub_tenant_id".to_string(),
+                QueryParameterValue::Scalar(VertexPropertyValue::String("sub-1".to_string())),
+            ),
+        ];
+
+        let prepared = service
+            .prepare_page_request(
+                &session,
+                ClientQueryRequest::new(
+                    target(),
+                    "bounded-delete-columns",
+                    "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
+                     WHERE s.tenant_id = $tenant_id \
+                         AND s.sub_tenant_id = $sub_tenant_id \
+                     WITH r LIMIT 1000 \
+                     DELETE r \
+                     RETURN count(r) AS deleted",
+                )
+                .with_query_parameters(scope_parameters.clone()),
+                128,
+            )
+            .await
+            .expect("bounded delete must prepare");
+
+        assert_eq!(prepared.action, QueryTransportAction::Write, "{engine:?}");
+        assert_eq!(
+            prepared.columns,
+            vec![QueryColumn::new("deleted")],
+            "{engine:?} must declare the returned column"
+        );
+
+        let silent = service
+            .prepare_page_request(
+                &session,
+                ClientQueryRequest::new(
+                    target(),
+                    "bounded-delete-no-columns",
+                    "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
+                     WITH r LIMIT 1000 DELETE r",
+                )
+                .with_query_parameters(scope_parameters),
+                128,
+            )
+            .await
+            .expect("a delete without RETURN must still prepare");
+        assert!(
+            silent.columns.is_empty(),
+            "{engine:?} must declare no columns without a RETURN"
+        );
+    }
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn experimental_mode_prepares_specialized_unwind_batches_before_generic_parsing() {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::graph(GraphScope::default(), [QueryTransportAction::Write]),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(TestClient {
+            epoch: AtomicU64::new(7),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+    let row = QueryParameterValue::Map(BTreeMap::from([(
+        "vertex".to_string(),
+        QueryParameterValue::Scalar(VertexPropertyValue::Integer(42)),
+    )]));
+    let prepared = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-specialized-delete",
+                "UNWIND $vertices AS row MATCH (n {id: row.vertex}) DETACH DELETE n",
+            )
+            .with_query_parameters([(
+                "vertices".to_string(),
+                QueryParameterValue::List(vec![row]),
+            )]),
+            128,
+        )
+        .await
+        .expect("prepare specialized batch in experimental mode");
+
+    assert_eq!(prepared.action, QueryTransportAction::Write);
+    assert!(prepared.columns.is_empty());
+    assert!(matches!(
+        prepared.batch_operation,
+        Some(QueryBatchOperation::DeleteVertices {
+            vertices,
+            detach: true,
+        }) if vertices == vec![42]
+    ));
+}
+
+/// A read UNWIND batch carries its rows as a list of maps, which is an
+/// UNWIND input rather than an `IN` list. The experimental engine used to
+/// reject the parameter while classifying access, before the batch path that
+/// consumes it was reached, so a query the legacy engine ran happily failed
+/// with "composite parameter $rows is only supported as an UNWIND input".
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn experimental_mode_prepares_a_read_unwind_batch_carrying_rows() {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(TestClient {
+            epoch: AtomicU64::new(7),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+    let row = QueryParameterValue::Map(BTreeMap::from([(
+        "src".to_string(),
+        QueryParameterValue::Scalar(VertexPropertyValue::Integer(42)),
+    )]));
+    let prepared = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-read-unwind-batch",
+                "UNWIND $rows AS row MATCH (s {id: row.src})-[:RELATES]->(d) \
+                 RETURN row.src AS src, d.id AS dst",
+            )
+            .with_query_parameters([("rows".to_string(), QueryParameterValue::List(vec![row]))]),
+            128,
+        )
+        .await
+        .expect("prepare a read UNWIND batch in experimental mode");
+
+    assert_eq!(prepared.action, QueryTransportAction::Read);
+    assert!(matches!(
+        prepared.batch_operation,
+        Some(QueryBatchOperation::OutNeighbors { ref sources, .. }) if sources == &vec![42]
+    ));
+
+    // The rejection still stands for a query that is not an UNWIND batch:
+    // nothing downstream would consume the rows.
+    let error = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-composite-parameter",
+                "MATCH (n:Entity) WHERE n.id = $rows RETURN n.id AS id",
+            )
+            .with_query_parameters([(
+                "rows".to_string(),
+                QueryParameterValue::List(vec![QueryParameterValue::Map(BTreeMap::from([(
+                    "src".to_string(),
+                    QueryParameterValue::Scalar(VertexPropertyValue::Integer(42)),
+                )]))]),
+            )]),
+            128,
+        )
+        .await
+        .expect_err("a composite parameter outside an UNWIND batch has no consumer");
+    assert!(
+        error
+            .to_string()
+            .contains("composite parameter $rows is only supported as an UNWIND input"),
+        "{error}"
+    );
+
+    // And a read this engine genuinely cannot plan still fails: only a
+    // recognized batch is allowed past the planner.
+    let error = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-unplannable-read",
+                "MATCH (n:Entity) WHERE n.name CONTAINS 'a' RETURN n.id AS id",
+            ),
+            128,
+        )
+        .await
+        .expect_err("the experimental planner does not lower CONTAINS");
+    assert!(error.to_string().contains("not supported yet"), "{error}");
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn experimental_mode_prepares_an_empty_read_unwind_batch() {
+    let query = "UNWIND $rows AS row MATCH (s {id: row.src})-[:RELATES]->(d) \
+                 RETURN row.src AS src, d.id AS dst";
+
+    for engine in [CypherEngineMode::Legacy, CypherEngineMode::Experimental] {
+        let authorizer = StaticQueryTransportScopeAuthorizer::new()
+            .with_bearer_grant(
+                "secret",
+                QueryTransportScopeGrant::read_graph(GraphScope::default()),
+            )
+            .unwrap();
+        let service = ClientQueryService::new(
+            Arc::new(TestClient {
+                epoch: AtomicU64::new(7),
+            }),
+            ClientQueryServiceConfig::default()
+                .with_required_bearer_token("secret")
+                .with_scope_authorizer(Arc::new(authorizer))
+                .with_cypher_engine(engine),
+        )
+        .unwrap();
+        let session = authenticated_session(&service);
+        let prepared = service
+            .prepare_page_request(
+                &session,
+                ClientQueryRequest::new(target(), "empty-read-unwind-batch", query)
+                    .with_query_parameters([(
+                        "rows".to_string(),
+                        QueryParameterValue::List(vec![]),
+                    )]),
+                128,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{engine:?} should prepare an empty batch: {error}"));
+
+        assert_eq!(prepared.action, QueryTransportAction::Read);
+        assert!(matches!(
+            prepared.batch_operation,
+            Some(QueryBatchOperation::OutNeighbors { ref sources, .. }) if sources.is_empty()
+        ));
+    }
+}
+
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn experimental_mode_executes_specialized_batches_and_native_paths_on_their_routes() {
+    let batch_executions = Arc::new(AtomicU64::new(0));
+    let cypher_queries = Arc::new(Mutex::new(Vec::new()));
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::graph(
+                GraphScope::default(),
+                [QueryTransportAction::Read, QueryTransportAction::Write],
+            ),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(ExperimentalDispatchClient {
+            batch_executions: Arc::clone(&batch_executions),
+            cypher_queries: Arc::clone(&cypher_queries),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+    let batch_row = QueryParameterValue::Map(BTreeMap::from([
+        (
+            "src".to_string(),
+            QueryParameterValue::Scalar(VertexPropertyValue::Integer(1)),
+        ),
+        (
+            "dst".to_string(),
+            QueryParameterValue::Scalar(VertexPropertyValue::Integer(2)),
+        ),
+    ]));
+    service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-execute-batch",
+                "UNWIND $rows AS row CREATE (s {id: row.src})-[:RELATES]->(d {id: row.dst})",
+            )
+            .with_query_parameters([(
+                "rows".to_string(),
+                QueryParameterValue::List(vec![batch_row]),
+            )])
+            .with_server_generated_mutation_idempotency_key(
+                "experimental-execute-batch-01K00000000000000000000000",
+            ),
+        )
+        .await
+        .expect("execute specialized batch route");
+
+    let native_query = "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+                        sourceValues: ['alpha'], targetValues: ['beta'], pairwise: true, \
+                        relTypes: ['RELATES'], maxLen: 3, relDirection: 'both', pathCount: 1}) \
+                        YIELD path RETURN path";
+    service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(target(), "experimental-execute-native-path", native_query),
+        )
+        .await
+        .expect("execute native path route");
+
+    assert_eq!(batch_executions.load(Ordering::Relaxed), 1);
+    assert_eq!(cypher_queries.lock().await.as_slice(), [native_query]);
 }
 
 #[tokio::test]
@@ -1166,11 +1868,21 @@ fn derived_execution_duration_is_bit_exact_over_the_recorded_durations() {
     const WRITES_US: [u64; 3] = [250, 999_999, 12_345_678];
 
     let metrics = ClientQueryMetrics::default();
-    for micros in READS_US {
-        metrics.record_execution(QueryTransportAction::Read, Duration::from_micros(micros));
+    // Split across the engines as well, so the sum is proven total over all
+    // four histograms and not just over a matching pair.
+    for (index, micros) in READS_US.into_iter().enumerate() {
+        metrics.record_execution(
+            QueryTransportAction::Read,
+            Duration::from_micros(micros),
+            engine(index),
+        );
     }
-    for micros in WRITES_US {
-        metrics.record_execution(QueryTransportAction::Write, Duration::from_micros(micros));
+    for (index, micros) in WRITES_US.into_iter().enumerate() {
+        metrics.record_execution(
+            QueryTransportAction::Write,
+            Duration::from_micros(micros),
+            engine(index),
+        );
     }
 
     let snapshot = metrics.snapshot();
@@ -1179,11 +1891,66 @@ fn derived_execution_duration_is_bit_exact_over_the_recorded_durations() {
     // The same equality stated the other way round, so a regression that
     // reintroduced a separate counter fails here rather than drifting quietly.
     assert_eq!(
-        snapshot.read_latency.sum_us + snapshot.write_latency.sum_us,
+        snapshot.read_latency_legacy.sum_us
+            + snapshot.read_latency_experimental.sum_us
+            + snapshot.write_latency_legacy.sum_us
+            + snapshot.write_latency_experimental.sum_us,
         snapshot.execution_duration_us
     );
-    assert_eq!(snapshot.read_latency.count(), READS_US.len() as u64);
-    assert_eq!(snapshot.write_latency.count(), WRITES_US.len() as u64);
+    assert_eq!(
+        snapshot.read_latency_legacy.count() + snapshot.read_latency_experimental.count(),
+        READS_US.len() as u64
+    );
+    assert_eq!(
+        snapshot.write_latency_legacy.count() + snapshot.write_latency_experimental.count(),
+        WRITES_US.len() as u64
+    );
+}
+
+/// Alternating engines, so no test above depends on which one a given index
+/// lands on — only on every observation reaching exactly one histogram.
+fn engine(index: usize) -> CypherEngineMode {
+    if index.is_multiple_of(2) {
+        CypherEngineMode::Legacy
+    } else {
+        CypherEngineMode::Experimental
+    }
+}
+
+/// The kill switch can flip a node mid-life, so one process holds both
+/// populations. An observation belongs to the engine that produced it, whatever
+/// the node is set to afterwards — otherwise the engine comparison these
+/// families exist for reads a legacy number as an experimental one.
+#[test]
+fn an_execution_lands_in_the_histogram_for_the_engine_that_ran_it() {
+    let metrics = ClientQueryMetrics::default();
+    metrics.record_execution(
+        QueryTransportAction::Read,
+        Duration::from_micros(1_000),
+        CypherEngineMode::Experimental,
+    );
+    metrics.record_execution(
+        QueryTransportAction::Read,
+        Duration::from_micros(2_000),
+        CypherEngineMode::Legacy,
+    );
+    metrics.record_execution(
+        QueryTransportAction::Write,
+        Duration::from_micros(3_000),
+        CypherEngineMode::Experimental,
+    );
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.read_latency_experimental.count(), 1);
+    assert_eq!(snapshot.read_latency_experimental.sum_us, 1_000);
+    assert_eq!(snapshot.read_latency_legacy.count(), 1);
+    assert_eq!(snapshot.read_latency_legacy.sum_us, 2_000);
+    assert_eq!(snapshot.write_latency_experimental.count(), 1);
+    assert_eq!(snapshot.write_latency_experimental.sum_us, 3_000);
+    // A write on the engine that ran no write stays empty: the four are
+    // populations, not a pair of totals split two ways.
+    assert_eq!(snapshot.write_latency_legacy.count(), 0);
+    assert_eq!(snapshot.write_latency_legacy.sum_us, 0);
 }
 
 /// The point of the split: a mutation's commit path and a read must not share
@@ -1191,35 +1958,40 @@ fn derived_execution_duration_is_bit_exact_over_the_recorded_durations() {
 #[test]
 fn a_read_and_a_write_land_in_different_histograms() {
     let metrics = ClientQueryMetrics::default();
-    metrics.record_execution(QueryTransportAction::Read, Duration::from_micros(1_000));
+    metrics.record_execution(
+        QueryTransportAction::Read,
+        Duration::from_micros(1_000),
+        CypherEngineMode::Legacy,
+    );
     metrics.record_execution(
         QueryTransportAction::Write,
         Duration::from_micros(5_000_000),
+        CypherEngineMode::Legacy,
     );
 
     let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.read_latency.count(), 1);
-    assert_eq!(snapshot.read_latency.sum_us, 1_000);
-    assert_eq!(snapshot.write_latency.count(), 1);
-    assert_eq!(snapshot.write_latency.sum_us, 5_000_000);
+    assert_eq!(snapshot.read_latency_legacy.count(), 1);
+    assert_eq!(snapshot.read_latency_legacy.sum_us, 1_000);
+    assert_eq!(snapshot.write_latency_legacy.count(), 1);
+    assert_eq!(snapshot.write_latency_legacy.sum_us, 5_000_000);
 
     // Neither observation appears in the other's buckets, which is the claim
     // the counts alone only imply.
     let read_bucket = snapshot
-        .read_latency
+        .read_latency_legacy
         .bucket_counts
         .iter()
         .position(|count| *count > 0)
         .unwrap();
     let write_bucket = snapshot
-        .write_latency
+        .write_latency_legacy
         .bucket_counts
         .iter()
         .position(|count| *count > 0)
         .unwrap();
     assert_ne!(read_bucket, write_bucket);
-    assert_eq!(snapshot.write_latency.bucket_counts[read_bucket], 0);
-    assert_eq!(snapshot.read_latency.bucket_counts[write_bucket], 0);
+    assert_eq!(snapshot.write_latency_legacy.bucket_counts[read_bucket], 0);
+    assert_eq!(snapshot.read_latency_legacy.bucket_counts[write_bucket], 0);
 }
 
 /// Each of the ten classes lands in its own slot on the client's counter too,
@@ -1289,4 +2061,292 @@ fn client_class_counter_rows_sum_to_the_undimensioned_total() {
         rows.iter().map(|(_, _, count)| count).sum::<u64>(),
         snapshot.queries_failed
     );
+}
+
+/// A list parameter used to be refused here, before the query text was even
+/// looked at, whichever engine was selected. That rejection is what made
+/// `WHERE x IN $ids` unreachable from a client.
+#[test]
+fn a_list_of_scalars_is_split_out_rather_than_refused() {
+    let parameters = BTreeMap::from([
+        (
+            "tenant_id".to_string(),
+            QueryParameterValue::Scalar(VertexPropertyValue::String("tenant-1".to_string())),
+        ),
+        (
+            "chunk_ids".to_string(),
+            QueryParameterValue::List(vec![
+                QueryParameterValue::Scalar(VertexPropertyValue::String("chunk-a".to_string())),
+                QueryParameterValue::Scalar(VertexPropertyValue::String("chunk-b".to_string())),
+            ]),
+        ),
+    ]);
+
+    let (scalars, lists) = split_query_parameters(&parameters).expect("lists are accepted");
+
+    assert_eq!(
+        scalars.keys().collect::<Vec<_>>(),
+        vec!["tenant_id"],
+        "a list must not land in the scalar map"
+    );
+    assert_eq!(
+        lists.get("chunk_ids").map(Vec::len),
+        Some(2),
+        "the list must reach the sidecar intact"
+    );
+}
+
+/// A list of rows is an UNWIND input, not an `IN` list, and still gets the
+/// message it always had. Widening that would send batch payloads somewhere
+/// they cannot be interpreted.
+#[test]
+fn a_list_of_rows_is_still_an_unwind_only_input() {
+    let parameters = BTreeMap::from([(
+        "rows".to_string(),
+        QueryParameterValue::List(vec![QueryParameterValue::Map(BTreeMap::from([(
+            "id".to_string(),
+            QueryParameterValue::Scalar(VertexPropertyValue::Integer(1)),
+        )]))]),
+    )]);
+
+    let error = split_query_parameters(&parameters).expect_err("a list of maps is refused");
+
+    assert!(
+        error
+            .to_string()
+            .contains("only supported as an UNWIND input"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A map parameter is refused for the same reason, unchanged.
+#[test]
+fn a_map_parameter_is_still_refused() {
+    let parameters = BTreeMap::from([(
+        "filter".to_string(),
+        QueryParameterValue::Map(BTreeMap::from([(
+            "id".to_string(),
+            QueryParameterValue::Scalar(VertexPropertyValue::Integer(1)),
+        )])),
+    )]);
+
+    assert!(split_query_parameters(&parameters).is_err());
+}
+
+#[tokio::test]
+async fn memory_diagnostics_prepared_copies_have_independent_lifetimes() {
+    let service = service();
+    let session = session("secret");
+    let prepared = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(target(), "memory-prepared", "MATCH (n {id: 1}) RETURN n.id"),
+            1,
+        )
+        .await
+        .unwrap();
+    let original_live = prepared.memory_diagnostic.probe();
+    let clone = prepared.clone();
+    let clone_live = clone.memory_diagnostic.probe();
+    drop(prepared);
+    assert!(!original_live());
+    assert!(clone_live());
+    drop(clone);
+    assert!(!clone_live());
+}
+
+fn failure_count(snapshot: &ClientQueryMetricsSnapshot, stage: &str, reason: &str) -> u64 {
+    snapshot
+        .failure_counter_fields()
+        .filter(|(_, row_stage, row_reason, _)| (*row_stage, *row_reason) == (stage, reason))
+        .map(|(.., count)| count)
+        .sum()
+}
+
+fn failure_total(snapshot: &ClientQueryMetricsSnapshot) -> u64 {
+    snapshot
+        .failure_counter_fields()
+        .map(|(.., count)| count)
+        .sum()
+}
+
+/// A query failure lands in exactly one row, under its reason; a failure of
+/// any other class -- a timeout, admission, storage -- is not counted at all,
+/// and neither is a remote failure its owner did not classify.
+#[test]
+fn only_query_failures_are_counted_each_under_its_reason() {
+    for error in GraphError::one_per_class() {
+        let metrics = ClientQueryMetrics::default();
+        metrics
+            .queries_failed_by_reason_legacy
+            .record(QueryFailureStage::Execute, &error);
+        let snapshot = metrics.snapshot();
+        match error.failure_reason() {
+            Some(reason) => {
+                assert_eq!(failure_total(&snapshot), 1, "{error:?}");
+                assert_eq!(
+                    failure_count(&snapshot, "execute", reason.as_str()),
+                    1,
+                    "{error:?}"
+                );
+            }
+            None => assert_eq!(failure_total(&snapshot), 0, "{error:?}"),
+        }
+    }
+    let metrics = ClientQueryMetrics::default();
+    metrics.queries_failed_by_reason_legacy.record(
+        QueryFailureStage::Execute,
+        &GraphError::UnclassifiedQuery {
+            dialect: "QueryTransport",
+            feature: "query/transport/rows: exceeded query timeout".to_string(),
+        },
+    );
+    assert_eq!(failure_total(&metrics.snapshot()), 0);
+    // Two engines x two stages x every reason: the enumeration is the
+    // product, and `failure_count` sums the engines because which one served
+    // a failure is not what these assertions are about.
+    assert_eq!(
+        ClientQueryMetricsSnapshot::default()
+            .failure_counter_fields()
+            .count(),
+        2 * 2 * QueryFailureReason::COUNT
+    );
+}
+
+/// The engine a failure is counted against is fixed when it is recorded, so a
+/// kill-switch flip afterwards cannot move it. Without the split, a scrape
+/// after a rollback would report every experimental failure as legacy.
+#[test]
+fn a_failure_is_counted_against_the_engine_that_produced_it() {
+    let metrics = ClientQueryMetrics::default();
+    let error = GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Where,
+        dialect: "Cypher25",
+        feature: "a predicate no engine supports".to_string(),
+    };
+    metrics
+        .queries_failed_by_reason_experimental
+        .record(QueryFailureStage::Prepare, &error);
+
+    let snapshot = metrics.snapshot();
+    let rows = |counts: &crate::QueryFailureCountsSnapshot| -> u64 {
+        counts.rows().map(|(.., count)| count).sum()
+    };
+    assert_eq!(rows(&snapshot.queries_failed_by_reason_experimental), 1);
+    assert_eq!(rows(&snapshot.queries_failed_by_reason_legacy), 0);
+    // And the enumeration keeps both populations apart, which is what the
+    // export reads the label from.
+    assert_eq!(
+        snapshot
+            .failure_counter_fields()
+            .filter(|(field, ..)| *field == "queries_failed_by_reason_experimental")
+            .map(|(.., count)| count)
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .failure_counter_fields()
+            .filter(|(field, ..)| *field == "queries_failed_by_reason_legacy")
+            .map(|(.., count)| count)
+            .sum::<u64>(),
+        0
+    );
+}
+
+/// The production gap this family closes: a query the engine cannot plan
+/// fails in prepare, goes straight back to a Bolt client, and was counted by
+/// nothing -- `queries_failed` still reads zero afterwards.
+#[tokio::test]
+async fn an_unsupported_query_is_counted_at_prepare_under_its_reason() {
+    let service = service();
+    let session = authenticated_session(&service);
+    let error = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "legacy-unsupported-where",
+                "MATCH (n:Entity) WHERE n.name CONTAINS 'a' RETURN n.name AS name",
+            ),
+            128,
+        )
+        .await
+        .expect_err("legacy WHERE does not lower CONTAINS");
+    assert_eq!(error.failure_reason(), Some(QueryFailureReason::Where));
+
+    let snapshot = service.metrics();
+    assert_eq!(failure_count(&snapshot, "prepare", "unsupported_where"), 1);
+    assert_eq!(failure_total(&snapshot), 1);
+    assert_eq!(snapshot.queries_failed, 0);
+}
+
+/// The comparison the dashboard is for: the same unsupported predicate on an
+/// experimental node lands in the same bucket as on a legacy one, rather than
+/// in `untyped_statement`, because the Cypher 25 lowering reports the clause
+/// it stopped in.
+#[cfg(feature = "experimental-cypher-engine")]
+#[tokio::test]
+async fn both_engines_file_the_same_unsupported_predicate_under_the_same_reason() {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(ExperimentalModeClient {
+            observed: Arc::new(Mutex::new(None)),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_cypher_engine(CypherEngineMode::Experimental),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+    let error = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "experimental-unsupported-where",
+                "MATCH (n:Entity) WHERE n.name CONTAINS 'a' RETURN n.name AS name",
+            ),
+            128,
+        )
+        .await
+        .expect_err("Cypher 25 lowering does not type CONTAINS");
+    assert!(
+        error
+            .to_string()
+            .contains("expected exactly one typed query statement"),
+        "{error}"
+    );
+    assert_eq!(error.failure_reason(), Some(QueryFailureReason::Where));
+    assert_eq!(
+        failure_count(&service.metrics(), "prepare", "unsupported_where"),
+        1
+    );
+}
+
+/// `execute_page` rejects a historical epoch before preparing, which neither
+/// the prepare nor the execute wrapper sees.
+#[tokio::test]
+async fn a_historical_epoch_page_request_is_counted_at_prepare() {
+    let service = service();
+    let session = authenticated_session(&service);
+    let mut request = ClientQueryRequest::new(
+        target(),
+        "historical-epoch",
+        "MATCH (n {id: 1}) RETURN n.id",
+    );
+    request.read_epoch = Some(7);
+    service
+        .execute_page(&session, request, None, 16)
+        .await
+        .expect_err("a first page cannot pin a historical epoch");
+    let snapshot = service.metrics();
+    assert_eq!(failure_count(&snapshot, "prepare", "invalid_request"), 1);
+    assert_eq!(failure_total(&snapshot), 1);
 }

@@ -280,13 +280,11 @@ impl GraphShard {
 
     #[cfg(test)]
     pub(crate) async fn write_strict_for_test(&self, batch: WriteBatch) -> Result<()> {
-        let options = WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        };
         self.db
             .writer()?
-            .write_with_options(batch, &options)
+            .write_with_options(batch, &WriteOptions::default())
+            .await?
+            .await_durable()
             .await?;
         Ok(())
     }
@@ -390,11 +388,11 @@ impl GraphShard {
         operation: &'static str,
         batch: GraphWriteBatch,
     ) -> Result<()> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let writer = self.db.writer()?;
+        let txn = writer.begin(IsolationLevel::SerializableSnapshot).await?;
+        if self.await_durable_writes {
+            super::write_pipeline::wait_durable(&writer, txn.seqnum()).await?;
+        }
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
         for op in batch.ops {
@@ -413,11 +411,13 @@ impl GraphShard {
         guards: &[GraphWriteGuard],
         batch: GraphWriteBatch,
     ) -> Result<()> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
+        let writer = self.db.writer()?;
+        let txn = writer.begin(IsolationLevel::SerializableSnapshot).await?;
+        // Artifact work can bypass the foreground mutex. Make its fixed
+        // transaction snapshot durable before testing guards with Remote reads.
+        if self.await_durable_writes {
+            super::write_pipeline::wait_durable(&writer, txn.seqnum()).await?;
+        }
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
         for guard in guards {

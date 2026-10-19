@@ -232,7 +232,8 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
         GraphError::InvalidKeyComponent { .. }
         | GraphError::MissingQueryParameter { .. }
         | GraphError::QueryParse { .. }
-        | GraphError::UnsupportedQuery { .. } => BoltError::Query {
+        | GraphError::UnsupportedQuery { .. }
+        | GraphError::UnclassifiedQuery { .. } => BoltError::Query {
             code: "Neo.ClientError.Statement.InvalidSyntax".to_string(),
             message: error.to_string(),
         },
@@ -267,7 +268,7 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             message: error.to_string(),
         },
         _ => {
-            tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt suppressed internal graph error");
+            tracing::warn!(target: "hydradb", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())
         }
     }
