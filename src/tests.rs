@@ -18972,6 +18972,7 @@ async fn cypher_anonymous_interior_node_joins_segments_instead_of_cross_joining(
             matched_rows: 1,
             deleted_edges: 1,
             updated_vertices: 1,
+            topology_sequence: Some(4),
             ..QueryMutationResult::default()
         })
     );
