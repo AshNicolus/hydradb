@@ -4797,12 +4797,10 @@ fn lower_row_patterns(
                         // If it has no real name, give both segments the same
                         // synthetic one so the executor's binding-name join sees
                         // they must be the same vertex instead of cross-joining.
-                        let left_synthetic = (edge_idx > 0).then(|| {
-                            synthetic_interior_binding(match_idx, path_idx, left_idx)
-                        });
-                        let right_synthetic = (edge_idx + 1 < edge_count).then(|| {
-                            synthetic_interior_binding(match_idx, path_idx, right_idx)
-                        });
+                        let left_synthetic = (edge_idx > 0)
+                            .then(|| synthetic_interior_binding(match_idx, path_idx, left_idx));
+                        let right_synthetic = (edge_idx + 1 < edge_count)
+                            .then(|| synthetic_interior_binding(match_idx, path_idx, right_idx));
                         patterns.push(RowPattern::Edge(lower_row_edge_path_segment(
                             path,
                             edge_idx,
@@ -6705,10 +6703,8 @@ mod tests {
 
         // An ordinary name sharing only the leading underscores, not the
         // reserved prefix, is unaffected.
-        let parsed = parse_opencypher_row_query(
-            "MATCH (a)-[:R]->(__b)-[:S]->(c) RETURN c.id",
-        )
-        .unwrap();
+        let parsed =
+            parse_opencypher_row_query("MATCH (a)-[:R]->(__b)-[:S]->(c) RETURN c.id").unwrap();
         assert_eq!(parsed.patterns.len(), 2);
     }
 
@@ -7061,10 +7057,8 @@ mod tests {
 
     #[test]
     fn lowers_anonymous_interior_node_with_a_shared_synthetic_binding() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (a {id: 1})-[:R]->()-[:S]->(c) RETURN c.id",
-        )
-        .unwrap();
+        let parsed =
+            parse_opencypher_row_query("MATCH (a {id: 1})-[:R]->()-[:S]->(c) RETURN c.id").unwrap();
         assert_eq!(parsed.patterns.len(), 2);
         let RowPattern::Edge(first) = &parsed.patterns[0] else {
             panic!("expected first edge row pattern");
