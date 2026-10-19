@@ -3,7 +3,7 @@
 //!
 //! # The shape of this crate
 //!
-//! `hydradb-telemetry` does **not** depend on `slatedb-graph-kernel`, and the
+//! `hydradb-telemetry` does **not** depend on `hydradb`, and the
 //! kernel must not gain a dependency on it. The arrow points this way for the
 //! same reason it does in `hydradb-placement`: the kernel emits through the
 //! plain [`tracing`] facade — which compiles to a no-op when no subscriber is
@@ -78,6 +78,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod build_info;
 pub mod config;
 pub mod error_class;
 pub mod layers;
@@ -94,6 +95,7 @@ pub mod otlp;
 #[cfg(feature = "otlp")]
 pub mod sampling;
 
+pub use build_info::{BuildInfo, BUILD_INFO};
 pub use config::{OtlpProtocol, ServiceIdentity, TelemetryConfig};
 pub use error_class::{ErrorClass, Outcome};
 pub use propagate::{TraceContext, TraceContextError};

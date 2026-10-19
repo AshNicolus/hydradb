@@ -5,7 +5,7 @@
 //! The kernel declares a `TraceContextBridge` trait for exactly these two
 //! operations, and the obvious move is to implement it here. That would be
 //! wrong: implementing a trait requires naming it, naming it requires
-//! depending on `slatedb-graph-kernel`, and this crate must not — it is the
+//! depending on `hydradb`, and this crate must not — it is the
 //! same arrow `hydradb-placement` keeps pointing away from the kernel, and
 //! the reason `cargo test` never pulls `opentelemetry-*`.
 //!

@@ -58,7 +58,20 @@ fn the_field_enumeration_is_keyed_by_the_rust_identifier() {
     let snapshot = metrics.snapshot();
 
     let histograms: Vec<&'static str> = snapshot.histogram_fields().map(|(key, _)| key).collect();
-    assert_eq!(histograms, vec!["query_rows_latency"]);
+    assert_eq!(
+        histograms,
+        vec![
+            "query_rows_latency",
+            "query_property_fetch_latency",
+            "create_relationships_batch_latency",
+            "delete_relationship_mutations_batch_latency",
+            "delete_vertices_and_isolated_candidates_batch_latency",
+            "detach_delete_vertices_batch_latency",
+            "merge_relationships_batch_latency",
+            "merge_vertex_metadata_batch_latency",
+            "reserve_edge_delete_noops_batch_latency",
+        ]
+    );
 
     let counters: Vec<(&'static str, u64)> = snapshot.counter_fields().collect();
     assert!(counters
@@ -81,8 +94,8 @@ fn every_field_is_enumerated_exactly_once() {
     let histograms = snapshot.histogram_fields().count();
     let class_counters = snapshot.class_counter_fields().count();
 
-    assert_eq!(counters, 35);
-    assert_eq!(histograms, 1);
+    assert_eq!(counters, 86);
+    assert_eq!(histograms, 9);
     // One field, ten rows: the enumeration is already flattened by class.
     assert_eq!(class_counters, GraphError::CLASS_COUNT);
 

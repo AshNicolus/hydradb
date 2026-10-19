@@ -451,7 +451,7 @@ impl GraphShard {
         .await;
         if cleanup.cleanup_errors > 0 {
             tracing::warn!(
-                target: "slatedb_graph_kernel",
+                target: "hydradb",
                 cell_id,
                 edge_type,
                 base_epoch,

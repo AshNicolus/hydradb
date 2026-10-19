@@ -20,9 +20,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use config::RuntimeConfig;
-use readiness::NodeReadiness;
-use slatedb::object_store::{path::Path, ObjectStore};
-use slatedb_graph_kernel::{
+use hydradb::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
     ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
     HierarchicalClientDatabaseResolver, HttpQueryServerConfig, ObjectStoreBoltRoutingTableProvider,
@@ -32,8 +30,12 @@ use slatedb_graph_kernel::{
 use hydradb_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
 use hydradb_placement::liveness::HeartbeatAction;
 use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
+use readiness::NodeReadiness;
+use slatedb::object_store::{path::Path, ObjectStore};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+const INDEXER_NOTIFY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Join the kernel's trace-context hook to the OpenTelemetry implementation.
 ///
@@ -54,7 +56,7 @@ type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 fn install_trace_context_bridge() {
     struct Bridge;
 
-    impl slatedb_graph_kernel::TraceContextBridge for Bridge {
+    impl hydradb::TraceContextBridge for Bridge {
         fn current_traceparent(&self) -> Option<String> {
             hydradb_telemetry::bridge::current_traceparent()
         }
@@ -66,7 +68,7 @@ fn install_trace_context_bridge() {
 
     // Failure means one was already installed, which in a single `main` cannot
     // happen — and if it somehow did, the first one is as good as this one.
-    if let Err(error) = slatedb_graph_kernel::install_trace_context_bridge(&Bridge) {
+    if let Err(error) = hydradb::install_trace_context_bridge(&Bridge) {
         tracing::warn!(error, "trace context bridge was already installed");
     }
 }
@@ -76,6 +78,19 @@ fn install_trace_context_bridge() {}
 
 #[tokio::main]
 async fn main() -> RuntimeResult<()> {
+    // Ahead of the subscriber on purpose: `--version` is asked from a shell,
+    // usually `docker run --rm <image> --version` against an image nobody can
+    // otherwise identify, and the answer has to be one plain block on stdout
+    // rather than a JSON log line wrapped around it.
+    if hydradb_telemetry::build_info::version_flag_requested() {
+        println!(
+            "{} {}",
+            ServiceIdentity::GraphNode.binary(),
+            hydradb_telemetry::BUILD_INFO.long_version()
+        );
+        return Ok(());
+    }
+
     // First statement in the process: everything after it, including a config
     // error, is logged rather than lost. `init` is total — with no
     // `OTEL_EXPORTER_OTLP_ENDPOINT` set it installs the fmt layer alone, so a
@@ -90,6 +105,7 @@ async fn main() -> RuntimeResult<()> {
     let metric_export_interval = telemetry_config.metric_export_interval;
     let telemetry = hydradb_telemetry::init(telemetry_config)?;
     install_trace_context_bridge();
+    hydradb_telemetry::build_info::log();
 
     let result = boot(&telemetry, metric_export_interval).await;
 
@@ -158,7 +174,12 @@ async fn run_node(
         .refresh(object_store.as_ref(), &placement_base)
         .await;
     let placement_refresh = placement.spawn_refresh(Arc::clone(&object_store), placement_base);
-    let node = Arc::new(ScopedRoutedGraphCluster::new_with_writer_lease_duration(
+    let token = config.read_auth_token()?;
+    let indexer_change_wake = config
+        .indexer_notify_url
+        .as_ref()
+        .map(|_| Arc::new(tokio::sync::Notify::new()));
+    let mut node = ScopedRoutedGraphCluster::new_with_writer_lease_duration(
         config.data_path.clone(),
         config.scope.namespace.clone(),
         config.scope.graph_id.clone(),
@@ -170,7 +191,15 @@ async fn run_node(
         memory_config,
         config.max_open_scopes,
         config.writer_lease_duration,
-    )?);
+    )?;
+    if let Some(wake) = &indexer_change_wake {
+        node = node.with_indexer_change_wake(Arc::clone(wake));
+    }
+    let node = Arc::new(node);
+    let indexer_notifier = match (config.indexer_notify_url.clone(), indexer_change_wake) {
+        (Some(url), Some(wake)) => Some(start_indexer_change_notifier(url, wake, token.clone())?),
+        _ => None,
+    };
     let (writer_reconcile_stop, writer_reconcile_task) =
         start_writer_ownership_reconciler(Arc::clone(&node), config.heartbeat_interval);
     let (writer_lease_stop, writer_lease_task) = start_writer_lease_reconciler(
@@ -183,7 +212,6 @@ async fn run_node(
         config.index_discovery_interval,
     );
 
-    let token = config.read_auth_token()?;
     let authorizer = StaticQueryTransportScopeAuthorizer::new().with_bearer_grant(
         token.clone(),
         QueryTransportScopeGrant::graph_namespace(
@@ -199,9 +227,9 @@ async fn run_node(
         ),
     )?;
     let service = ClientQueryService::new(
-        Arc::clone(&node) as Arc<dyn slatedb_graph_kernel::QueryCellClient>,
+        Arc::clone(&node) as Arc<dyn hydradb::QueryCellClient>,
         ClientQueryServiceConfig::default()
-            .with_required_bearer_token(token)
+            .with_required_bearer_token(token.clone())
             .with_scope_authorizer(Arc::new(authorizer))
             .with_max_concurrent_queries(config.max_concurrent_queries)
             .with_max_query_runtime_ms(config.max_query_runtime_ms)
@@ -209,7 +237,8 @@ async fn run_node(
                 config.max_server_cursors,
                 config.max_cursor_buffer_bytes,
                 config.cursor_ttl.as_millis().try_into()?,
-            ),
+            )
+            .with_cypher_engine(config.cypher_engine),
     )?;
     let target = ClientQueryTarget::new(config.scope.clone(), config.cell_id.clone())?;
     let resolver = Arc::new(HierarchicalClientDatabaseResolver::new(
@@ -243,11 +272,17 @@ async fn run_node(
     // No `/readyz` fan-out any more (decision 4): readiness rides the heartbeat
     // the publisher below writes, and the routing table is derived from the same
     // live set `ensure_local_writer` enforces.
+    //
+    // `GRAPH_READ_ROUTING` decides whether `READ` names the whole live fleet or
+    // just the cell's owner. Default `fleet`, i.e. inert, so the flip is an env
+    // change per environment rather than a fleet-wide behaviour change carried
+    // by an image (docs/plans/2026-08-21-cell-affine-read-routing.md, change 2).
     let routing = ObjectStoreBoltRoutingTableProvider::new(
         config.bolt_node_addresses.clone(),
         30,
         placement.clone(),
     )?
+    .with_read_routing(config.read_routing)
     .with_writer_lease_directory(node.writer_lease_directory());
     bolt_config = bolt_config.with_routing_table_provider(Arc::new(routing));
     if let Some(provider) = &tls_provider {
@@ -280,6 +315,7 @@ async fn run_node(
         ready.clone(),
         service.clone(),
         Arc::clone(&node),
+        token,
     )
     .await?;
     ready.mark_ready();
@@ -345,6 +381,10 @@ async fn run_node(
     writer_reconcile_task.await??;
     let _ = writer_lease_stop.send(true);
     writer_lease_task.await??;
+    if let Some((stop, task)) = indexer_notifier {
+        let _ = stop.send(true);
+        task.await??;
+    }
     // Before `drop(service)` and before the `try_unwrap` below: the task holds
     // a clone of both, so a collection still in flight would turn a clean
     // shutdown into "graph node still has active runtime references".
@@ -355,6 +395,54 @@ async fn run_node(
     node.close().await?;
     tracing::info!(node_id = %config.node_id, "graph node stopped");
     Ok(())
+}
+
+fn start_indexer_change_notifier(
+    url: String,
+    wake: Arc<tokio::sync::Notify>,
+    bearer_token: String,
+) -> RuntimeResult<(
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<RuntimeResult<()>>,
+)> {
+    let url = reqwest::Url::parse(&url)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("GRAPH_INDEXER_NOTIFY_URL must use http or https".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(INDEXER_NOTIFY_TIMEOUT)
+        .build()?;
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = wake.notified() => {
+                    match client
+                        .post(url.clone())
+                        .bearer_auth(&bearer_token)
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status().is_success() => {}
+                        Ok(response) => tracing::debug!(
+                            status = %response.status(),
+                            "indexer wake was rejected; durable polling will recover"
+                        ),
+                        Err(error) => tracing::debug!(
+                            %error,
+                            "indexer wake failed; durable polling will recover"
+                        ),
+                    }
+                }
+            }
+        }
+    });
+    Ok((stop_tx, task))
 }
 
 fn start_writer_lease_reconciler(
@@ -476,9 +564,14 @@ async fn publish_heartbeat(
     // 10 keeps every function below it pure, so the two timestamps are passed
     // inward rather than read there. Both are this node's own clock and are
     // observability only: liveness is the object's `LastModified`.
+    // The commit, not just the package version. A heartbeat is the only place
+    // the *live set* records what each node is running, so this is what answers
+    // "is every node on the same build?" during a rolling deploy — a question
+    // `CARGO_PKG_VERSION` could never answer, since it reads `0.1.0` on both
+    // sides of every upgrade this repository has ever shipped.
     let body = Heartbeat::new(
         node_id,
-        env!("CARGO_PKG_VERSION"),
+        hydradb_telemetry::BUILD_INFO.version_string(),
         started_at,
         Utc::now(),
         cells.to_vec(),
@@ -612,6 +705,8 @@ async fn shutdown_signal() -> RuntimeResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use slatedb::object_store::{memory::InMemory, ObjectStoreExt};
 
     use super::*;
@@ -708,5 +803,59 @@ mod tests {
             store.head(&path).await.is_err(),
             "heartbeat outlived the process"
         );
+    }
+
+    #[tokio::test]
+    async fn indexer_notifier_coalesces_a_write_burst_into_one_http_wake() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let authenticated_hits = Arc::new(AtomicUsize::new(0));
+        let handler_hits = Arc::clone(&hits);
+        let handler_authenticated_hits = Arc::clone(&authenticated_hits);
+        let app = axum::Router::new().route(
+            "/v1/changes:process",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let hits = Arc::clone(&handler_hits);
+                let authenticated_hits = Arc::clone(&handler_authenticated_hits);
+                async move {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    if headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer test-indexer-token")
+                    {
+                        authenticated_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    axum::http::StatusCode::ACCEPTED
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (stop, task) = start_indexer_change_notifier(
+            format!("http://{address}/v1/changes:process"),
+            Arc::clone(&wake),
+            "test-indexer-token".to_string(),
+        )
+        .unwrap();
+
+        for _ in 0..100 {
+            wake.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while hits.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("notifier did not deliver the wake");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        assert_eq!(authenticated_hits.load(Ordering::Relaxed), 1);
+
+        let _ = stop.send(true);
+        task.await.unwrap().unwrap();
+        server.abort();
     }
 }

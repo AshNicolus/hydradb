@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use slatedb::object_store::ObjectStore;
-use slatedb_graph_kernel::{
+use hydradb::{
     local_object_store, object_store_from_env, EdgeMutation, GraphCacheConfig, GraphCachePolicy,
     GraphLimits, GraphOpenOptions, GraphShard, QueryContext, QueryResultPage, QueryResultSet,
     QueryValue,
 };
+use slatedb::object_store::ObjectStore;
 
 type CheckResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

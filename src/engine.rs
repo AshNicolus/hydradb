@@ -21,12 +21,12 @@ use crate::{
     parse_u64, process_writer_registry, segment_edge_visible, validate_component, EdgeRecord,
     GraphCacheEntryCounts, GraphCacheKind, GraphCacheMetricsSnapshot, GraphCacheResidentBytes,
     GraphCorrectnessReport, GraphError, GraphExportDigest, GraphMemoryConfig, GraphOpenOptions,
-    GraphOperationalMetricsSnapshot, GraphScope, GraphShard, GraphStore, GraphWriteBatch,
-    GraphWriteGuard, LocalWriteGuard, MatrixAdjacency, MatrixCacheKey, ProcessWriterRegistry,
-    RelationshipId, RelationshipRecord, Result, StorageSequence, VertexId,
+    GraphOperationalMetricsSnapshot, GraphScope, GraphShard, GraphStorageMetricsSnapshot,
+    GraphStore, GraphWriteBatch, GraphWriteGuard, LocalWriteGuard, MatrixAdjacency, MatrixCacheKey,
+    ProcessWriterRegistry, RelationshipId, RelationshipRecord, Result, StorageSequence, VertexId,
 };
 #[cfg(feature = "query-transport")]
-use crate::{GraphId, NamespacePath};
+use crate::{GraphId, NamespacePath, SharedSlateDbCache, SlateDbCacheMetricsSnapshot};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum MatrixDirection {
@@ -92,6 +92,8 @@ pub struct RoutedGraphCluster {
     placement: PlacementView,
     writer_leases: Option<Arc<ObjectStoreWriterLeaseDirectory>>,
     writer_lease_registration_active: AtomicBool,
+    #[cfg(feature = "query-transport")]
+    scope_registration: tokio::sync::OnceCell<()>,
     shards: BTreeMap<String, Arc<GraphShard>>,
     promotable: bool,
 }
@@ -111,9 +113,11 @@ pub struct ScopedRoutedGraphCluster {
     directory: ObjectStoreNodeDirectory,
     placement: PlacementView,
     object_store: Arc<dyn ObjectStore>,
+    slatedb_cache: Arc<SharedSlateDbCache>,
     writer_leases: Arc<ObjectStoreWriterLeaseDirectory>,
     writer_registry: Arc<ProcessWriterRegistry>,
     scope_directory: ObjectStoreGraphScopeDirectory,
+    indexer_change_wake: Option<Arc<tokio::sync::Notify>>,
     options: GraphOpenOptions,
     memory: GraphMemoryConfig,
     max_open_scopes: usize,
@@ -126,7 +130,8 @@ pub struct ScopedRoutedGraphCluster {
     /// can overlap the retiring writer and fence it from the same process.
     scope_closures: Arc<std::sync::Mutex<BTreeMap<GraphScope, tokio::sync::watch::Receiver<bool>>>>,
     scope_capacity_gate: tokio::sync::Mutex<()>,
-    scope_open_reservations: AtomicUsize,
+    scope_capacity_available: Arc<tokio::sync::Notify>,
+    scope_open_reservations: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +141,7 @@ pub struct GraphShardRuntimeMetrics {
     pub cache: GraphCacheMetricsSnapshot,
     pub cache_entries: GraphCacheEntryCounts,
     pub cache_resident_bytes: GraphCacheResidentBytes,
+    pub storage: GraphStorageMetricsSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,7 +234,7 @@ mod writer_lease;
 
 pub use placement::{CellOwnership, PlacementConfig, PlacementRefreshHandle, PlacementView};
 
-pub use scope_directory::ObjectStoreGraphScopeDirectory;
+pub use scope_directory::{GraphScopeChange, ObjectStoreGraphScopeDirectory};
 pub use writer_lease::{
     ObjectStoreWriterLeaseDirectory, WriterLeaseOwner, WriterLeaseRenewalFailure,
 };
@@ -564,6 +570,25 @@ fn parse_relationship_property_index_key_for_verify(
     }
 }
 
+/// The `rmerge_idx` twin of the parser above: same components minus the
+/// trailing relationship id, which lives in the value. Only the components
+/// the verifier compares are returned.
+fn parse_relationship_merge_index_key_for_verify(
+    key: &str,
+) -> Result<(String, VertexId, VertexId)> {
+    match key.split('/').collect::<Vec<_>>().as_slice() {
+        ["cell", _cell_id, "rmerge_idx", _edge_type, _property, encoded, src, dst] => Ok((
+            (*encoded).to_string(),
+            parse_u64(key, src, "src")?,
+            parse_u64(key, dst, "dst")?,
+        )),
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship merge index key".to_string(),
+        }),
+    }
+}
+
 fn record_mismatch(report: &mut GraphCorrectnessReport, message: String) {
     report.mismatch_count = report.mismatch_count.saturating_add(1);
     if report.mismatch_samples.len() < GRAPH_VERIFY_MISMATCH_SAMPLES {
@@ -840,7 +865,7 @@ impl MatrixArtifactCleanupResult {
     {
         self.cleanup_errors = self.cleanup_errors.saturating_add(1);
         tracing::warn!(
-            target: "slatedb_graph_kernel",
+            target: "hydradb",
             cell_id,
             edge_type,
             base_epoch,
@@ -1168,7 +1193,7 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
         Err(GraphError::ConditionalWriteConflict { key, .. }) if key == manifest_key => {
             result.skipped_published_manifest = true;
             tracing::warn!(
-                target: "slatedb_graph_kernel",
+                target: "hydradb",
                 cell_id,
                 edge_type,
                 base_epoch,
@@ -1807,7 +1832,9 @@ fn decode_binary_u64s(
         field,
     )?;
     bytes
-        .chunks_exact(std::mem::size_of::<u64>())
+        .as_chunks::<{ std::mem::size_of::<u64>() }>()
+        .0
+        .iter()
         .map(|chunk| decode_binary_u64_bytes(key, chunk, field))
         .collect()
 }
@@ -1831,7 +1858,7 @@ fn decode_binary_u32s_from_u64s(
         field,
     )?;
     let mut out = Vec::with_capacity(len);
-    for chunk in bytes.chunks_exact(std::mem::size_of::<u64>()) {
+    for chunk in bytes.as_chunks::<{ std::mem::size_of::<u64>() }>().0 {
         let value = decode_binary_u64_bytes(key, chunk, field)?;
         out.push(u32::try_from(value).map_err(|_| GraphError::CorruptValue {
             key: key.to_string(),

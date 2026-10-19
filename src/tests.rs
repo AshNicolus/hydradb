@@ -10,6 +10,681 @@ async fn open_test_shard(path: &str, object_store: Arc<dyn ObjectStore>) -> Grap
 }
 
 #[tokio::test]
+async fn changing_metadata_batch_overlaps_cold_reads_and_remains_durable() {
+    let store = ReadCountingObjectStore::new();
+    let path = "graph/changing-batch-cold-reads";
+    let options = GraphOpenOptions {
+        cache: GraphCacheConfig {
+            slatedb_cache_bytes: 0,
+            ..Default::default()
+        },
+        reader_manifest_poll_interval: std::time::Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let shard =
+        GraphShard::open_standalone_writer_with_options(path, store.clone(), options.clone())
+            .await
+            .unwrap();
+    let original = VertexMetadata::default()
+        .with_label("Old")
+        .with_property("value", VertexPropertyValue::Integer(1));
+    shard
+        .set_vertex_metadata_batch("cell-a", (1..=65).map(|id| (id, original.clone())))
+        .await
+        .unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    store.get_delay_ms.store(5, Ordering::Relaxed);
+    store.peak_gets.store(0, Ordering::Relaxed);
+    let replacement = VertexMetadata::default()
+        .with_label("New")
+        .with_property("value", VertexPropertyValue::Integer(2));
+    let before = store.reads();
+    let started = std::time::Instant::now();
+    let changed = shard
+        .set_vertex_metadata_batch("cell-a", (1..=65).map(|id| (id, replacement.clone())))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    let peak = store.peak_gets.load(Ordering::Relaxed);
+    println!(
+        "changing_batch elapsed_us={} object_reads={} peak_parallel_gets={peak}",
+        elapsed.as_micros(),
+        store.reads() - before
+    );
+    store.get_delay_ms.store(0, Ordering::Relaxed);
+    assert_eq!(changed, 65);
+    shard.close().await.unwrap();
+    let reopened = GraphShard::open_standalone_writer_with_options(path, store.clone(), options)
+        .await
+        .unwrap();
+    for id in 1..=65 {
+        let key = keys::vertex("cell-a", id);
+        let value = reopened.read_remote(&key).await.unwrap().unwrap();
+        assert_eq!(decode_vertex_metadata(&key, &value).unwrap(), replacement);
+    }
+    assert_eq!(
+        reopened
+            .set_vertex_metadata_batch("cell-a", (1..=65).map(|id| (id, replacement.clone())))
+            .await
+            .unwrap(),
+        0
+    );
+    let mut corrupt = WriteBatch::new();
+    corrupt.put(
+        keys::vertex("cell-a", 66).as_bytes(),
+        b"invalid-metadata".as_slice(),
+    );
+    reopened.write_strict_for_test(corrupt).await.unwrap();
+    assert!(reopened
+        .set_vertex_metadata_batch("cell-a", (1..=66).map(|id| (id, original.clone())))
+        .await
+        .is_err());
+    let key = keys::vertex("cell-a", 1);
+    let value = reopened.read_remote(&key).await.unwrap().unwrap();
+    assert_eq!(
+        decode_vertex_metadata(&key, &value).unwrap(),
+        replacement,
+        "a failure in the last read group must not commit earlier groups"
+    );
+    reopened.close().await.unwrap();
+    assert!(
+        peak > 1,
+        "cold batch reads must overlap instead of serializing each vertex"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_cell_checks_avoid_repeated_cold_marker_io() {
+    let store = ReadCountingObjectStore::new();
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cold-marker-reads",
+        store.clone(),
+        GraphOpenOptions {
+            cache: GraphCacheConfig {
+                slatedb_cache_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Keep the missing marker keys inside the SST's range, so a negative
+    // bloom-filter lookup still needs its uncached object-store filter.
+    let mut batch = WriteBatch::new();
+    batch.put(b"!", b"lower".as_slice());
+    batch.put(b"~", b"upper".as_slice());
+    shard.write_strict_for_test(batch).await.unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    let snapshot = shard.db.snapshot().await.unwrap();
+    let before = store.reads();
+    GraphStore::scope_snapshot(snapshot.clone(), async {
+        for _ in 0..32 {
+            assert!(shard
+                .read_remote(&keys::cell_drop_marker("cell-a"))
+                .await
+                .unwrap()
+                .is_none());
+            assert!(shard
+                .read_remote(&keys::cell_drop_pending_marker("cell-a"))
+                .await
+                .unwrap()
+                .is_none());
+        }
+    })
+    .await;
+    let original_reads = store.reads() - before;
+    let before = store.reads();
+    GraphStore::scope_snapshot(snapshot.clone(), async {
+        for _ in 0..32 {
+            shard
+                .ensure_cell_readable("cell-a", "cold-marker-test")
+                .await
+                .unwrap();
+        }
+    })
+    .await;
+    let reused_reads = store.reads() - before;
+    println!("snapshot_marker_original_reads={original_reads} reused_reads={reused_reads}");
+    drop(snapshot);
+    shard.close().await.unwrap();
+    assert!(original_reads > 0, "fixture must exercise object storage");
+    assert!(
+        reused_reads * 8 < original_reads,
+        "reuse should remove repeated marker I/O"
+    );
+}
+
+#[tokio::test]
+async fn readable_cell_reuse_is_confined_to_its_storage_snapshot() {
+    let shard = open_test_shard("graph/readable-cell-snapshot", Arc::new(InMemory::new())).await;
+    shard
+        .set_vertex_metadata("cell-a", 1, VertexMetadata::default().with_label("Entity"))
+        .await
+        .unwrap();
+    let old = shard.db.snapshot().await.unwrap();
+    GraphStore::scope_snapshot(old.clone(), async {
+        assert!(!GraphStore::snapshot_cell_is_readable("cell-a"));
+        for _ in 0..32 {
+            shard
+                .ensure_cell_readable("cell-a", "snapshot-test")
+                .await
+                .unwrap();
+        }
+        assert!(GraphStore::snapshot_cell_is_readable("cell-a"));
+        assert!(!GraphStore::snapshot_cell_is_readable("cell-b"));
+        // Nested requests get their own bounded state, even on this task.
+        GraphStore::scope_snapshot(old.clone(), async {
+            assert!(!GraphStore::snapshot_cell_is_readable("cell-a"));
+        })
+        .await;
+        assert!(GraphStore::snapshot_cell_is_readable("cell-a"));
+    })
+    .await;
+    assert!(!GraphStore::snapshot_cell_is_readable("cell-a"));
+    let mut dropped = WriteBatch::new();
+    dropped.put(
+        keys::cell_drop_pending_marker("cell-a").as_bytes(),
+        encode_u64(1),
+    );
+    shard.write_strict_for_test(dropped).await.unwrap();
+    let fresh = shard.db.snapshot().await.unwrap();
+    GraphStore::scope_snapshot(fresh, async {
+        for operation in ["first-attempt", "retry"] {
+            assert!(
+                matches!(shard.ensure_cell_readable("cell-a", operation).await,
+                Err(GraphError::CellDropped { operation: actual, .. }) if actual == operation)
+            );
+            assert!(!GraphStore::snapshot_cell_is_readable("cell-a"));
+        }
+    })
+    .await;
+    // An already pinned pre-drop read still has precisely its old semantics.
+    GraphStore::scope_snapshot(old.clone(), async {
+        shard
+            .ensure_cell_readable("cell-a", "old-snapshot")
+            .await
+            .unwrap();
+    })
+    .await;
+    let mut cancelled = Box::pin(GraphStore::scope_snapshot(old.clone(), async {
+        shard
+            .ensure_cell_readable("cell-a", "cancelled")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    }));
+    assert!(futures::poll!(cancelled.as_mut()).is_pending());
+    drop(cancelled);
+    assert!(!GraphStore::snapshot_cell_is_readable("cell-a"));
+    assert!(matches!(
+        shard
+            .ensure_cell_readable("cell-a", "outside-snapshot")
+            .await,
+        Err(GraphError::CellDropped { .. })
+    ));
+    drop(old);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unchanged_metadata_merge_does_not_queue_behind_a_write() {
+    let shard = open_test_shard("graph/metadata-noop-wait", Arc::new(InMemory::new())).await;
+    let metadata = VertexMetadata::default()
+        .with_property("name", VertexPropertyValue::String("existing".to_string()));
+    shard
+        .set_vertex_metadata("cell-a", 1, metadata.clone())
+        .await
+        .unwrap();
+    let before = shard.current_storage_sequence("cell-a").await.unwrap();
+    let permit = shard
+        .acquire_graph_write_permit("test-held-write")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let writer_released = std::sync::atomic::AtomicBool::new(false);
+    let merge = shard.merge_vertex_metadata_batch("cell-a", [(1, metadata)], None);
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        writer_released.store(true, Ordering::Release);
+        drop(permit);
+    };
+    let (result, ()) = tokio::join!(
+        async {
+            let result = merge.await.unwrap();
+            (
+                result,
+                started.elapsed(),
+                writer_released.load(Ordering::Acquire),
+            )
+        },
+        release
+    );
+    println!("unchanged_merge_elapsed_us={}", result.1.as_micros());
+    assert_eq!(result.0, 0);
+    assert_eq!(
+        shard.current_storage_sequence("cell-a").await.unwrap(),
+        before
+    );
+    shard.close().await.unwrap();
+    assert!(
+        !result.2,
+        "unchanged merge must finish while the writer is busy"
+    );
+}
+
+#[tokio::test]
+async fn changed_metadata_merge_does_not_wait_for_stalled_noop_preflight() {
+    let store = ReadCountingObjectStore::new();
+    let shard = Arc::new(
+        GraphShard::open_standalone_writer_with_options(
+            "graph/stalled-noop-preflight",
+            store.clone(),
+            GraphOpenOptions {
+                cache: GraphCacheConfig {
+                    slatedb_cache_bytes: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    shard
+        .set_vertex_metadata("cell-a", 1, VertexMetadata::default().with_label("Entity"))
+        .await
+        .unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    let held = shard
+        .acquire_graph_write_permit("test-holder")
+        .await
+        .unwrap();
+    let (started, release) = store.pause_next_get();
+    let merging = {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            shard
+                .merge_vertex_metadata_batch(
+                    "cell-a",
+                    [(
+                        1,
+                        VertexMetadata::default()
+                            .with_property("name", VertexPropertyValue::String("changed".into())),
+                    )],
+                    None,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(held);
+    let mut merging = merging;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut merging).await;
+    // Always release the injected I/O before reporting an assertion failure.
+    let _ = release.send(());
+    if result.is_err() {
+        merging.await.unwrap().unwrap();
+    }
+    shard.close().await.unwrap();
+    assert_eq!(
+        result
+            .expect("free writer must not wait for optional preflight")
+            .unwrap()
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn single_vertex_detach_commits_all_incident_edges_once() {
+    for (case, index_policy) in [GraphIndexPolicy::default(), GraphIndexPolicy::OutboundOnly]
+        .into_iter()
+        .enumerate()
+    {
+        let shard = GraphShard::open_standalone_writer_with_options(
+            format!("graph/single-atomic-detach-{case}"),
+            Arc::new(InMemory::new()),
+            GraphOpenOptions {
+                index_policy,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        shard
+            .set_vertex_metadata("cell-a", 1, VertexMetadata::default().with_label("Source"))
+            .await
+            .unwrap();
+        shard
+            .write_edges_batch("cell-a", "EDGE", (2..=5).map(|dst| (1, dst)), "seed")
+            .await
+            .unwrap();
+        let before = shard.current_storage_sequence("cell-a").await.unwrap();
+        let deleted = shard
+            .detach_delete_vertex("cell-a", 1, "delete")
+            .await
+            .unwrap();
+        assert!(deleted.vertex_deleted);
+        assert_eq!(deleted.incident_edges_deleted, 4);
+        assert_eq!(
+            deleted.epoch,
+            before + 1,
+            "single detach still committed each edge separately"
+        );
+        let replay = shard
+            .detach_delete_vertex("cell-a", 1, "delete")
+            .await
+            .unwrap();
+        assert_eq!(replay.epoch, deleted.epoch);
+        assert_eq!(replay.incident_edges_deleted, 4);
+        assert_eq!(
+            shard.current_storage_sequence("cell-a").await.unwrap(),
+            deleted.epoch
+        );
+        shard.close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_vertex_detach_prepares_without_holding_writer_gate() {
+    let store = ReadCountingObjectStore::new();
+    let shard = Arc::new(
+        GraphShard::open_standalone_writer_with_options(
+            "graph/single-detach-gate",
+            store.clone(),
+            GraphOpenOptions {
+                cache: GraphCacheConfig {
+                    slatedb_cache_bytes: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    shard
+        .set_vertex_metadata("cell-a", 1, VertexMetadata::default().with_label("Source"))
+        .await
+        .unwrap();
+    shard
+        .write_edges_batch("cell-a", "EDGE", [(1, 2)], "seed")
+        .await
+        .unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    let (started, release) = store.pause_next_get();
+    let deleting = {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move { shard.detach_delete_vertex("cell-a", 1, "delete").await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let write = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        shard.set_vertex_metadata(
+            "cell-a",
+            9000,
+            VertexMetadata::default().with_label("Concurrent"),
+        ),
+    )
+    .await;
+    let _ = release.send(());
+    let deleted = deleting.await.unwrap().unwrap();
+    shard.close().await.unwrap();
+    write
+        .expect("single-vertex cleanup held the writer gate during discovery")
+        .unwrap();
+    assert!(deleted.vertex_deleted);
+    assert_eq!(deleted.incident_edges_deleted, 1);
+}
+
+#[tokio::test]
+async fn cleanup_cancellation_releases_pipeline_during_stalled_storage() {
+    let store = ReadCountingObjectStore::new();
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cancel-cleanup-storage",
+        store.clone(),
+        GraphOpenOptions {
+            cache: GraphCacheConfig {
+                slatedb_cache_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    shard
+        .set_vertex_metadata("cell-a", 1, VertexMetadata::default().with_label("Source"))
+        .await
+        .unwrap();
+    shard
+        .write_edges_batch("cell-a", "EDGE", [(1, 2)], "seed")
+        .await
+        .unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    let epoch = shard.current_epoch("cell-a").await.unwrap();
+    let token = QueryCancellationToken::new();
+    let (started, release) = store.pause_next_get();
+    let mut deleting = Box::pin(token.scope(shard.detach_delete_vertex("cell-a", 1, "delete")));
+    tokio::select! {
+        result = &mut deleting => panic!("cleanup escaped stalled GET: {result:?}"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), started) => { result.unwrap().unwrap(); }
+    }
+    token.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut deleting).await;
+    drop(deleting);
+    // Assert cancellation before releasing the GET: otherwise a broken
+    // implementation could pass merely because the storage operation finished.
+    assert!(matches!(
+        result.unwrap(),
+        Err(GraphError::QueryTimeout {
+            operation: "query_cancelled",
+            ..
+        })
+    ));
+    assert_eq!(shard.write_pipeline_gate.available_permits(), 16);
+    assert_eq!(shard.current_epoch("cell-a").await.unwrap(), epoch);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        shard.set_vertex_metadata(
+            "cell-a",
+            9000,
+            VertexMetadata::default().with_label("Concurrent"),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let _ = release.send(());
+    // No idempotency marker or partial delete may survive cancellation.
+    let deleted = shard
+        .detach_delete_vertex("cell-a", 1, "delete")
+        .await
+        .unwrap();
+    assert!(deleted.vertex_deleted);
+    assert_eq!(deleted.incident_edges_deleted, 1);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn changed_metadata_merge_rereads_after_waiting() {
+    let shard = open_test_shard("graph/metadata-changed-wait", Arc::new(InMemory::new())).await;
+    let original =
+        VertexMetadata::default().with_property("name", VertexPropertyValue::String("old".into()));
+    shard
+        .set_vertex_metadata("cell-a", 1, original.clone())
+        .await
+        .unwrap();
+    let permit = shard
+        .acquire_graph_write_permit("test-held-write")
+        .await
+        .unwrap();
+    let attempts = shard.graph_operational_metrics().write_attempts;
+    let mut merge = Box::pin(
+        shard.merge_vertex_metadata_batch(
+            "cell-a",
+            [(
+                1,
+                VertexMetadata::default()
+                    .with_property("name", VertexPropertyValue::String("new".into())),
+            )],
+            None,
+        ),
+    );
+    assert!(futures::poll!(merge.as_mut()).is_pending());
+    assert_eq!(
+        shard.graph_operational_metrics().write_attempts,
+        attempts + 1
+    );
+
+    // Finish the already-running write after preflight but before admission.
+    let concurrent = original.with_property("preserved", VertexPropertyValue::Integer(42));
+    let key = keys::vertex("cell-a", 1);
+    let txn = shard
+        .db
+        .writer()
+        .unwrap()
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    txn.put(key.as_bytes(), encode_vertex_metadata(&concurrent))
+        .unwrap();
+    commit_txn_strict(txn, true).await.unwrap();
+    drop(permit);
+    assert_eq!(merge.await.unwrap(), 1);
+    let stored =
+        decode_vertex_metadata(&key, &shard.read_remote(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(
+        stored.properties.get("name"),
+        Some(&VertexPropertyValue::String("new".into()))
+    );
+    assert_eq!(
+        stored.properties.get("preserved"),
+        Some(&VertexPropertyValue::Integer(42))
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn metadata_noop_preflight_preserves_bounds_and_guards() {
+    let shard = open_test_shard("graph/metadata-preflight-bounds", Arc::new(InMemory::new())).await;
+    let metadata =
+        VertexMetadata::default().with_property("version", VertexPropertyValue::Integer(1));
+    shard
+        .set_vertex_metadata("cell-a", 1, metadata.clone())
+        .await
+        .unwrap();
+    let permit = shard
+        .acquire_graph_write_permit("test-held-write")
+        .await
+        .unwrap();
+    let policy = QueryBatchMergePolicy {
+        update_if_newer_by: "version".into(),
+        create_only_properties: BTreeSet::new(),
+    };
+    let mut guarded =
+        Box::pin(shard.merge_vertex_metadata_batch("cell-a", [(1, metadata)], Some(&policy)));
+    assert!(futures::poll!(guarded.as_mut()).is_pending());
+    let mut large = Box::pin(shard.merge_vertex_metadata_batch(
+        "cell-a",
+        (2..35).map(|id| (id, VertexMetadata::default())),
+        None,
+    ));
+    assert!(futures::poll!(large.as_mut()).is_pending());
+    drop(permit);
+    assert_eq!(guarded.await.unwrap(), 0);
+    assert_eq!(large.await.unwrap(), 0);
+
+    let hydration = Arc::clone(&shard.hydration_gate)
+        .acquire_many_owned(shard.hydration_gate.available_permits() as u32)
+        .await
+        .unwrap();
+    let permit = shard
+        .acquire_graph_write_permit("test-held-write")
+        .await
+        .unwrap();
+    let mut saturated = Box::pin(shard.merge_vertex_metadata_batch(
+        "cell-a",
+        [(1, VertexMetadata::default())],
+        None,
+    ));
+    assert!(futures::poll!(saturated.as_mut()).is_pending());
+    drop(permit);
+    assert_eq!(saturated.await.unwrap(), 0);
+    drop(hydration);
+
+    let key = keys::cell_drop_pending_marker("cell-a");
+    let txn = shard
+        .db
+        .writer()
+        .unwrap()
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    txn.put(key.as_bytes(), vec![1]).unwrap();
+    commit_txn_strict(txn, true).await.unwrap();
+    let permit = shard
+        .acquire_graph_write_permit("test-held-write")
+        .await
+        .unwrap();
+    assert!(matches!(
+        shard
+            .merge_vertex_metadata_batch("cell-a", [(1, VertexMetadata::default())], None)
+            .await,
+        Err(GraphError::CellDropped { .. })
+    ));
+    drop(permit);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn sparse_wal_flushes_reach_l0_at_the_default_count_bound() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "graph/sparse-wal-l0-bound";
@@ -42,6 +717,574 @@ async fn sparse_wal_flushes_reach_l0_at_the_default_count_bound() {
         l0_created,
         "sparse durable WAL flushes must consolidate into L0 at the configured count bound"
     );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn node_or_equality_seeks_before_hydrating_the_tenant() {
+    let shard = open_test_shard("graph/node-or-index-seed", Arc::new(InMemory::new())).await;
+    shard
+        .set_vertex_metadata_batch(
+            "cell-a",
+            (1..=2_000).map(|id| {
+                (
+                    id,
+                    VertexMetadata::default()
+                        .with_label("Entity")
+                        .with_property("tenant_id", VertexPropertyValue::String("tenant-a".into()))
+                        .with_property(
+                            "entity_id",
+                            VertexPropertyValue::String(format!("entity-{id}")),
+                        ),
+                )
+            }),
+        )
+        .await
+        .unwrap();
+    let before = shard.graph_operational_metrics().query_property_fetches;
+    let started = std::time::Instant::now();
+    let rows = shard.execute_cypher_rows(
+        QueryContext::new("cell-a", "or-index-seed"),
+        "MATCH (e:Entity {tenant_id: 'tenant-a'}) WHERE e.entity_id = 'entity-3' OR e.entity_id = 'entity-1900' RETURN e.entity_id ORDER BY e.entity_id",
+    ).await.unwrap();
+    let elapsed = started.elapsed();
+    let fetches = shard.graph_operational_metrics().query_property_fetches - before;
+    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(
+        rows.rows[0].values,
+        vec![QueryValue::Property(VertexPropertyValue::String(
+            "entity-1900".into()
+        ))]
+    );
+    assert_eq!(
+        rows.rows[1].values,
+        vec![QueryValue::Property(VertexPropertyValue::String(
+            "entity-3".into()
+        ))]
+    );
+    println!(
+        "node_or_lookup_elapsed_us={},property_fetches={fetches}",
+        elapsed.as_micros()
+    );
+    for (query, expected) in [
+        ("MATCH (e:Entity) WHERE (e.tenant_id = 'tenant-a' OR e.tenant_id = 'missing') AND (e.entity_id = 'entity-3' OR e.entity_id = 'entity-1900') RETURN count(e.id)", 2),
+        ("MATCH (e:Entity {tenant_id: 'other'}) WHERE e.entity_id = 'entity-3' OR e.entity_id = 'entity-1900' RETURN count(e.id)", 0),
+        ("MATCH (e:Other) WHERE e.entity_id = 'entity-3' OR e.entity_id = 'entity-1900' RETURN count(e.id)", 0),
+        ("MATCH (e:Entity) WHERE e.entity_id = 'entity-3' OR e.entity_id = 'entity-1900' OR e.entity_id = 'entity-3' RETURN count(e.id)", 2),
+        ("MATCH (e:Entity) WHERE e.entity_id = 'entity-3' OR e.tenant_id = 'tenant-a' RETURN count(e.id)", 2000),
+        ("MATCH (e:Entity) WHERE e.tenant_id = 'tenant-a' OR e.tenant_id = 'missing' RETURN count(e.id)", 2000),
+        ("MATCH (e:Entity) WHERE e.entity_id = 'entity-3' OR e.entity_id = 'entity-1900' MATCH (e:Entity) WHERE e.entity_id = 'entity-3' OR e.entity_id = 'missing' RETURN count(e.id)", 1),
+        ("MATCH (anchor {id: 1}) OPTIONAL MATCH (e:Entity) WHERE e.entity_id = 'missing-a' OR e.entity_id = 'missing-b' RETURN count(e.id)", 0),
+    ] {
+        let result = shard.execute_cypher_rows(QueryContext::new("cell-a", "or-residuals"), query).await.unwrap_or_else(|error| panic!("{query}: {error:?}"));
+        assert_eq!(result.rows, vec![QueryRow::new(vec![QueryValue::Count(expected)])], "{query}");
+    }
+    for (id, score) in [
+        (3001, VertexPropertyValue::Integer(42)),
+        (3002, VertexPropertyValue::SignedInteger(42)),
+        (3003, VertexPropertyValue::Float(QueryFloat(42.0))),
+        (3004, VertexPropertyValue::SignedInteger(-1)),
+        (3005, VertexPropertyValue::Integer(0)),
+        (3006, VertexPropertyValue::SignedInteger(0)),
+        (3007, VertexPropertyValue::Float(QueryFloat(0.0))),
+        (3008, VertexPropertyValue::Float(QueryFloat(-0.0))),
+    ] {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                id,
+                VertexMetadata::default()
+                    .with_label("Numeric")
+                    .with_property("score", score),
+            )
+            .await
+            .unwrap();
+    }
+    let numeric = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "or-numeric"),
+            "MATCH (n:Numeric) WHERE n.score = 42 OR n.score = -1 RETURN count(n.id)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        numeric.rows,
+        vec![QueryRow::new(vec![QueryValue::Count(4)])]
+    );
+    for (needle, count) in [
+        (VertexPropertyValue::Integer(42), 3),
+        (VertexPropertyValue::SignedInteger(42), 3),
+        (VertexPropertyValue::Float(QueryFloat(42.0)), 3),
+        (VertexPropertyValue::Integer(0), 4),
+        (VertexPropertyValue::SignedInteger(0), 4),
+        (VertexPropertyValue::Float(QueryFloat(-0.0)), 4),
+    ] {
+        let result = shard
+            .execute_cypher_rows(
+                QueryContext::new("cell-a", "or-numeric-parameter")
+                    .with_parameter("needle", needle),
+                "MATCH (n:Numeric) WHERE n.score = $needle OR n.score = 999 RETURN count(n.id)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![QueryRow::new(vec![QueryValue::Count(count)])]
+        );
+    }
+    shard.close().await.unwrap();
+    assert!(
+        fetches <= 4,
+        "OR lookup must not hydrate the entire tenant: {fetches}"
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_read_io_cancellation_drops_pending_io() {
+    let token = QueryCancellationToken::new();
+    let budget = crate::shard::QueryBudget::new(None, Some(token.clone()));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+    let read = async move {
+        let _owned_resource = dropped_tx;
+        started_tx.send(()).unwrap();
+        std::future::pending::<Result<()>>().await
+    };
+    let execution = budget.read_only_io("test_read", read);
+    let cancel = async {
+        started_rx.await.unwrap();
+        token.cancel();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::join!(execution, cancel)
+    })
+    .await
+    .expect("read cancellation must not wait for storage");
+    assert!(matches!(
+        result,
+        Err(GraphError::QueryTimeout {
+            operation: "query_cancelled",
+            ..
+        })
+    ));
+    assert!(
+        dropped_rx.await.is_err(),
+        "read-owned resources must be released"
+    );
+    let polled = std::sync::atomic::AtomicBool::new(false);
+    let result = budget
+        .read_only_io("cancelled_read", async {
+            polled.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+    assert!(matches!(result, Err(GraphError::QueryTimeout { .. })));
+    assert!(!polled.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn cancelled_write_leaves_the_admission_queue_without_mutating() {
+    let shard = open_test_shard("graph/cancelled-write-admission", Arc::new(InMemory::new())).await;
+    let held = Arc::clone(&shard.graph_write_gate)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let token = QueryCancellationToken::new();
+    let before = shard.current_epoch("cell-a").await.unwrap();
+    let waits_before = shard
+        .operation_metrics
+        .backpressure_waits
+        .load(Ordering::Relaxed);
+    let write = token.scope(shard.set_vertex_metadata(
+        "cell-a",
+        1,
+        VertexMetadata::default().with_label("Entity"),
+    ));
+    let cancel = async {
+        while shard
+            .operation_metrics
+            .backpressure_waits
+            .load(Ordering::Relaxed)
+            == waits_before
+        {
+            tokio::task::yield_now().await;
+        }
+        token.cancel();
+    };
+    let started = std::time::Instant::now();
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::join!(write, cancel)
+    })
+    .await
+    .expect("cancelled write must leave the queue while the prior writer is still active");
+    println!(
+        "cancelled_write_queue elapsed_us={}",
+        started.elapsed().as_micros()
+    );
+    assert!(matches!(
+        result,
+        Err(GraphError::QueryTimeout {
+            operation: "query_cancelled",
+            ..
+        })
+    ));
+    assert_eq!(shard.current_epoch("cell-a").await.unwrap(), before);
+    assert_eq!(shard.graph_write_gate.available_permits(), 0);
+    drop(held);
+    assert!(QueryCancellationToken::current().is_none());
+    shard
+        .set_vertex_metadata("cell-a", 1, VertexMetadata::default().with_label("Entity"))
+        .await
+        .unwrap();
+    assert!(shard.current_epoch("cell-a").await.unwrap() > before);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cached_read_loop_yields_to_other_requests_and_cancellation() {
+    let token = QueryCancellationToken::new();
+    let budget = crate::shard::QueryBudget::new(None, Some(token.clone()));
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let scan = tokio::spawn(async move {
+        started.send(()).unwrap();
+        for _ in 0..10_000 {
+            budget.read_only_io("cached_scan", async { Ok(()) }).await?;
+        }
+        Ok::<_, GraphError>(())
+    });
+    waiting.await.unwrap();
+    token.cancel();
+    assert!(
+        matches!(
+            scan.await.unwrap(),
+            Err(GraphError::QueryTimeout {
+                operation: "query_cancelled",
+                ..
+            })
+        ),
+        "a cache-ready scan monopolized the worker until it completed"
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_read_io_preserves_results_and_the_original_deadline() {
+    let budget = crate::shard::QueryBudget::new(None, None);
+    assert_eq!(
+        budget
+            .read_only_io("test_read", async { Ok(42) })
+            .await
+            .unwrap(),
+        42
+    );
+    let result: Result<()> = budget
+        .read_only_io("test_read", async { Err(GraphError::ReadOnlyShardStorage) })
+        .await;
+    assert!(matches!(result, Err(GraphError::ReadOnlyShardStorage)));
+    let budget = crate::shard::QueryBudget::new(Some(30), None);
+    let result: Result<()> = budget
+        .read_only_io("stalled_read", std::future::pending())
+        .await;
+    assert!(matches!(
+        result,
+        Err(GraphError::QueryTimeout {
+            operation: "stalled_read",
+            limit_ms: 30,
+            ..
+        })
+    ));
+    let polled = std::sync::atomic::AtomicBool::new(false);
+    let result = budget
+        .read_only_io("next_read", async {
+            polled.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(GraphError::QueryTimeout {
+            operation: "next_read",
+            ..
+        })
+    ));
+    assert!(
+        !polled.load(Ordering::Relaxed),
+        "a later phase must not receive a fresh time budget"
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cancelled_query_releases_stalled_metadata_and_planner_reads() {
+    let store = ReadCountingObjectStore::new();
+    let options = GraphOpenOptions {
+        cache: GraphCacheConfig {
+            slatedb_cache_bytes: 0,
+            ..Default::default()
+        },
+        reader_manifest_poll_interval: std::time::Duration::from_secs(60),
+        ..Default::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cancelled-read-io",
+        store.clone(),
+        options.clone(),
+    )
+    .await
+    .unwrap();
+    shard
+        .set_vertex_metadata(
+            "cell-a",
+            1,
+            VertexMetadata::default()
+                .with_label("Entity")
+                .with_property("name", VertexPropertyValue::String("Alice".to_string())),
+        )
+        .await
+        .unwrap();
+    // A missing statistics key can be answered by a bloom filter without GETs.
+    let key = keys::query_stats_vertex_label("cell-a", "Entity");
+    let mut batch = WriteBatch::new();
+    batch.put(
+        keys::query_stats_record_key(&key).as_bytes(),
+        encode_query_stats_record(&QueryStatsRecord::point_count(1, 0, graph_now_millis())),
+    );
+    shard.write_strict_for_test(batch).await.unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    shard.close().await.unwrap();
+    for operation in ["metadata", "planner", "property_probe"] {
+        let shard = GraphShard::open_with_options(
+            "graph/cancelled-read-io",
+            store.clone(),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+        let snapshot = shard.db.snapshot().await.unwrap();
+        let epoch = snapshot.seq();
+        let token = QueryCancellationToken::new();
+        let budget = crate::shard::QueryBudget::new(None, Some(token.clone()));
+        let (started, release) = store.pause_next_get();
+        let execution = GraphStore::scope_snapshot(snapshot, async {
+            match operation {
+                "planner" => {
+                    let node = crate::query::opencypher::RowNodePattern {
+                        binding: Some("n".to_string()),
+                        id: None,
+                        labels: BTreeSet::from(["Entity".to_string()]),
+                        properties: BTreeMap::new(),
+                    };
+                    budget
+                        .read_only_io(
+                            "test_planner",
+                            shard.best_row_node_access_with_stats(
+                                "cell-a",
+                                &node,
+                                &BTreeSet::new(),
+                            ),
+                        )
+                        .await
+                        .map(|_| ())
+                }
+                "property_probe" => shard
+                    .try_scan_vertex_property_value_at(
+                        "cell-a",
+                        "name",
+                        &VertexPropertyValue::String("Alice".to_string()),
+                        &budget,
+                        8,
+                        8,
+                    )
+                    .await
+                    .map(|_| ()),
+                "metadata" => shard
+                    .vertex_metadata_at("cell-a", 1, epoch, &budget)
+                    .await
+                    .map(|_| ()),
+                _ => unreachable!(),
+            }
+        });
+        let cancel = async {
+            started.await.unwrap();
+            token.cancel();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(execution, cancel)
+        })
+        .await
+        .expect("a cancelled query must not wait for a stalled object-store GET");
+        assert!(
+            matches!(
+                result,
+                Err(GraphError::QueryTimeout {
+                    operation: "query_cancelled",
+                    ..
+                })
+            ),
+            "operation={operation} result={result:?}"
+        );
+        let _ = release.send(());
+        shard.close().await.unwrap();
+    }
+    let shard = GraphShard::open_with_options("graph/cancelled-read-io", store.clone(), options)
+        .await
+        .unwrap();
+    let metadata = shard
+        .vertex_metadata_at("cell-a", 1, 0, &crate::shard::QueryBudget::new(None, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata.properties.get("name"),
+        Some(&VertexPropertyValue::String("Alice".to_string()))
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn planner_candidate_reads_overlap_without_changing_the_selected_index() {
+    let store = ReadCountingObjectStore::new();
+    let options = GraphOpenOptions {
+        cache: GraphCacheConfig {
+            slatedb_cache_bytes: 0,
+            ..Default::default()
+        },
+        reader_manifest_poll_interval: std::time::Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/planner-cold-candidates",
+        store.clone(),
+        options,
+    )
+    .await
+    .unwrap();
+    let mut node = crate::query::opencypher::RowNodePattern {
+        binding: Some("n".to_string()),
+        id: None,
+        labels: BTreeSet::from(["Entity".to_string()]),
+        properties: BTreeMap::new(),
+    };
+    let mut batch = WriteBatch::new();
+    for index in 0..17 {
+        let property = format!("p{index:02}");
+        let value = VertexPropertyValue::Integer(1);
+        let key = keys::query_stats_vertex_property(
+            "cell-a",
+            &property,
+            &encode_vertex_property_value_key(&value),
+        );
+        let count = if index == 16 { 1 } else { 1000 };
+        batch.put(
+            keys::query_stats_record_key(&key).as_bytes(),
+            encode_query_stats_record(&QueryStatsRecord::point_count(count, 0, graph_now_millis())),
+        );
+        node.properties.insert(property, value);
+    }
+    let key = keys::query_stats_vertex_label("cell-a", "Entity");
+    batch.put(
+        keys::query_stats_record_key(&key).as_bytes(),
+        encode_query_stats_record(&QueryStatsRecord::point_count(10000, 0, graph_now_millis())),
+    );
+    shard.write_strict_for_test(batch).await.unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    let snapshot = shard.db.snapshot().await.unwrap();
+    store.get_delay_ms.store(5, Ordering::Relaxed);
+    store.peak_gets.store(0, Ordering::Relaxed);
+    let before = store.reads();
+    let started = std::time::Instant::now();
+    let access = GraphStore::scope_snapshot(snapshot, async {
+        shard
+            .best_row_node_access_with_stats("cell-a", &node, &BTreeSet::new())
+            .await
+            .unwrap()
+    })
+    .await;
+    let peak = store.peak_gets.load(Ordering::Relaxed);
+    println!(
+        "planner_candidates elapsed_us={} object_reads={} peak_parallel_gets={peak}",
+        started.elapsed().as_micros(),
+        store.reads() - before
+    );
+    store.get_delay_ms.store(0, Ordering::Relaxed);
+    assert_eq!(
+        access,
+        RowQueryAccess::VertexPropertyIndex {
+            property: "p16".to_string()
+        }
+    );
+    shard.close().await.unwrap();
+    assert!(peak > 1, "independent planner reads must overlap");
+    assert!(peak <= 8, "planner reads must remain bounded");
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn planner_statistics_reuse_only_the_active_snapshot() {
+    let shard = open_test_shard("graph/planner-stat-reuse", Arc::new(InMemory::new())).await;
+    let key = keys::query_stats_vertex_label("cell-a", "Entity");
+    let missing = keys::query_stats_vertex_label("cell-a", "Missing");
+    let record_key = keys::query_stats_record_key(&key);
+    let record = QueryStatsRecord::point_count(7, 0, graph_now_millis());
+    let mut batch = WriteBatch::new();
+    batch.put(record_key.as_bytes(), encode_query_stats_record(&record));
+    shard.write_strict_for_test(batch).await.unwrap();
+    let snapshot = shard.db.snapshot().await.unwrap();
+    GraphStore::scope_snapshot(snapshot, async {
+        assert_eq!(GraphStore::snapshot_query_stats(&key), None);
+        for _ in 0..16 {
+            assert_eq!(
+                shard.query_stats_record(&key).await.unwrap(),
+                Some(record.clone())
+            );
+            assert_eq!(shard.query_stats_record(&missing).await.unwrap(), None);
+        }
+        assert_eq!(
+            GraphStore::snapshot_query_stats(&key),
+            Some(Some(record.clone()))
+        );
+        assert_eq!(GraphStore::snapshot_query_stats(&missing), Some(None));
+    })
+    .await;
+    assert_eq!(GraphStore::snapshot_query_stats(&key), None);
+    let updated = QueryStatsRecord::point_count(19, 0, graph_now_millis());
+    let mut batch = WriteBatch::new();
+    batch.put(record_key.as_bytes(), encode_query_stats_record(&updated));
+    batch.put(
+        keys::query_stats_record_key(&missing).as_bytes(),
+        encode_query_stats_record(&updated),
+    );
+    shard.write_strict_for_test(batch).await.unwrap();
+    GraphStore::scope_snapshot(shard.db.snapshot().await.unwrap(), async {
+        assert_eq!(
+            shard.query_stats_record(&key).await.unwrap(),
+            Some(updated.clone())
+        );
+        assert_eq!(
+            shard.query_stats_record(&missing).await.unwrap(),
+            Some(updated)
+        );
+    })
+    .await;
     shard.close().await.unwrap();
 }
 
@@ -1667,6 +2910,414 @@ fn mutation(src: VertexId, dst: VertexId, idempotency_key: &str) -> EdgeMutation
     }
 }
 
+/// The property-fetch counter must move for a query that returns a stored
+/// property and stay still for one that does not.
+///
+/// Both halves matter. Counting is the easy part; what makes the metric worth
+/// having is that it is *specific* — `RETURN v.id` is rewritten to
+/// `RowProjection::NodeId` and answered without touching storage, so a counter
+/// that ticked for it too would be measuring row count, not fetch cost, and
+/// would go on looking healthy after the fetch strategy changed.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn only_a_property_projection_counts_as_a_property_fetch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/property-fetch-metric", object_store).await;
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "prop-metric-edge"))
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "cell-a",
+            2,
+            VertexMetadata::default()
+                .with_label("Entity")
+                .with_property("name", VertexPropertyValue::String("beta".to_string())),
+        )
+        .await
+        .unwrap();
+
+    let before = shard.graph_operational_metrics().query_property_fetches;
+    shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "prop-metric-ids"),
+            "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap();
+    let after_ids = shard.graph_operational_metrics().query_property_fetches;
+    assert_eq!(
+        after_ids, before,
+        "RETURN v.id is served from the compiled kernel and reads no stored property"
+    );
+
+    shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "prop-metric-props"),
+            "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.name",
+        )
+        .await
+        .unwrap();
+    let after_props = shard.graph_operational_metrics().query_property_fetches;
+    assert!(
+        after_props > after_ids,
+        "RETURN v.name must fetch stored metadata: {after_ids} -> {after_props}"
+    );
+
+    // Count and distribution are written by one call, so they cannot disagree.
+    let snapshot = shard.graph_operational_metrics();
+    assert_eq!(
+        snapshot.query_property_fetch_latency.count(),
+        snapshot.query_property_fetches,
+        "the histogram's count and the fetch counter are the same quantity"
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn batched_reachable_hydration_reads_each_bound_vertex_once() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/reachable-batch-hydration", object_store).await;
+    for id in 1..5 {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                id,
+                id + 1,
+                &format!("reachable-batch-{id}"),
+            ))
+            .await
+            .unwrap();
+    }
+    for id in 1..=5 {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                id,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("name", VertexPropertyValue::String(format!("v{id}"))),
+            )
+            .await
+            .unwrap();
+    }
+
+    let before = shard.graph_operational_metrics().query_property_fetches;
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "reachable-batch-props"),
+            "MATCH (u {id: 1})-[:CHAIN*1..4]->(v) RETURN v.name ORDER BY v.name",
+        )
+        .await
+        .unwrap();
+    let fetched = shard.graph_operational_metrics().query_property_fetches - before;
+
+    assert_eq!(
+        result.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "v2".to_string()
+            ))]),
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "v3".to_string()
+            ))]),
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "v4".to_string()
+            ))]),
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "v5".to_string()
+            ))]),
+        ],
+    );
+    assert_eq!(
+        fetched, 5,
+        "expected one read per distinct bound vertex, got {fetched}"
+    );
+
+    shard.close().await.unwrap();
+}
+
+/// The node-only pattern carries the same invariant as the reachable one: one
+/// read per distinct candidate the rows bind, and identical rows out.
+///
+/// Worth its own test rather than trusting the shared helper, because this path
+/// reaches the helper by a different route — candidates come from a label scan
+/// rather than a traversal, and it binds one vertex per row where the reachable
+/// path binds two and shares the source.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn batched_node_hydration_reads_each_candidate_once() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/node-batch-hydration", object_store).await;
+    for id in 1..=4 {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                id,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("name", VertexPropertyValue::String(format!("n{id}"))),
+            )
+            .await
+            .unwrap();
+    }
+
+    let before = shard.graph_operational_metrics().query_property_fetches;
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "node-batch-props"),
+            "MATCH (n:Entity) RETURN n.name ORDER BY n.name",
+        )
+        .await
+        .unwrap();
+    let fetched = shard.graph_operational_metrics().query_property_fetches - before;
+
+    assert_eq!(
+        result.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "n1".to_string()
+            ))]),
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "n2".to_string()
+            ))]),
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "n3".to_string()
+            ))]),
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "n4".to_string()
+            ))]),
+        ],
+    );
+    assert_eq!(
+        fetched, 4,
+        "expected one read per labelled candidate, got {fetched}"
+    );
+
+    shard.close().await.unwrap();
+}
+
+/// Every single-edge traversal must flush the rows it accumulated.
+///
+/// The six callers of `push_matching_edge_row` each own their loop and each
+/// have to drain the batch afterwards; a caller that forgets returns fewer rows
+/// than it matched, with no error anywhere. `EdgeRowMatchState`'s `Drop` catches
+/// that in a debug build, but only for a path a test actually walks — so this
+/// covers the two reached by an unconstrained pattern and a bound-source one,
+/// which between them were previously exercised by no test at all.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn every_edge_traversal_flushes_its_accumulated_rows() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/edge-batch-flush", object_store).await;
+    for id in 1..=3 {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                id,
+                id + 10,
+                &format!("edge-flush-{id}"),
+            ))
+            .await
+            .unwrap();
+    }
+    for id in [1, 2, 3, 11, 12, 13] {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                id,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("name", VertexPropertyValue::String(format!("e{id}"))),
+            )
+            .await
+            .unwrap();
+    }
+
+    // No predicate on either endpoint: the optimizer has nothing to seek on and
+    // routes this to the full edge scan.
+    let scanned = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "edge-flush-full-scan"),
+            "MATCH (a)-[:CHAIN]->(b) RETURN b.name ORDER BY b.name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scanned.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "e11".to_string()
+            ))]),
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "e12".to_string()
+            ))]),
+            QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                "e13".to_string()
+            ))]),
+        ],
+        "the full edge scan must return every matched row, not just the ones \
+         hydrated before the last flush"
+    );
+
+    // A fixed source id gives the optimizer a seek, routing this to the
+    // bound-source expansion instead.
+    let expanded = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "edge-flush-bound-source"),
+            "MATCH (a {id: 2})-[:CHAIN]->(b) RETURN b.name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        expanded.rows,
+        vec![QueryRow::new(vec![QueryValue::Property(
+            VertexPropertyValue::String("e12".to_string())
+        )])],
+    );
+
+    shard.close().await.unwrap();
+}
+
+/// A batched expand-into must join each match back to the input row that
+/// produced it.
+///
+/// This is the one traversal that narrows its pattern per input row, so
+/// deferring hydration means carrying the match and its originating row together
+/// through the batch. Every pre-existing test that reaches this path supplies a
+/// single input row, where any association at all looks correct -- two input
+/// rows is the smallest case that can tell a preserved pairing from a lost one.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn batched_expand_into_joins_each_match_to_its_own_input_row() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/expand-into-batch", object_store).await;
+    // Two disjoint pairs, each joined by both edge types, so the first pattern
+    // yields two input rows and the second is an expand-into over both.
+    for (src, dst) in [(1_u64, 2_u64), (4, 5)] {
+        for edge_type in ["P", "Q"] {
+            shard
+                .write_edge(typed_mutation(
+                    "cell-a",
+                    edge_type,
+                    src,
+                    dst,
+                    &format!("expand-into-{edge_type}-{src}"),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+    for id in [1_u64, 2, 4, 5] {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                id,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("name", VertexPropertyValue::String(format!("x{id}"))),
+            )
+            .await
+            .unwrap();
+    }
+
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "expand-into-batch-props"),
+            "MATCH (a)-[:P]->(b), (a)-[:Q]->(b) RETURN a.name, b.name ORDER BY a.name",
+        )
+        .await
+        .unwrap();
+
+    // x1 pairs with x2 and x4 with x5. A batch that lost track of which input
+    // row a match came from would pair one source with both destinations.
+    assert_eq!(
+        result.rows,
+        vec![
+            QueryRow::new(vec![
+                QueryValue::Property(VertexPropertyValue::String("x1".to_string())),
+                QueryValue::Property(VertexPropertyValue::String("x2".to_string())),
+            ]),
+            QueryRow::new(vec![
+                QueryValue::Property(VertexPropertyValue::String("x4".to_string())),
+                QueryValue::Property(VertexPropertyValue::String("x5".to_string())),
+            ]),
+        ],
+    );
+
+    shard.close().await.unwrap();
+}
+
+/// A traversal that trips a limit part-way must return that error, not panic.
+///
+/// Rows accumulate before they are hydrated, so an admission failure raised
+/// after some have been buffered unwinds past the flush. The buffered rows are
+/// correctly discarded — the query failed — but anything that treats a
+/// non-empty buffer as a bug has to distinguish "never flushed" from "failed
+/// before flushing".
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn a_traversal_that_trips_a_limit_mid_scan_returns_the_error() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/edge-batch-limit";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    // Two sources, each with its own neighbour: the first buffers a row, and
+    // the scan admission then rejects the second before the loop can flush.
+    for (src, dst) in [(1_u64, 2_u64), (3, 4)] {
+        writer
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                src,
+                dst,
+                &format!("limit-mid-scan-{src}"),
+            ))
+            .await
+            .unwrap();
+    }
+    // Labelled so the planner seeks two sources and expands each in turn,
+    // rather than taking the full scan whose admission check happens before any
+    // row is buffered.
+    for id in [1_u64, 3] {
+        writer
+            .set_vertex_metadata("cell-a", id, VertexMetadata::default().with_label("Entity"))
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+
+    let reader = GraphShard::open_with_limits(
+        path,
+        object_store,
+        GraphLimits {
+            max_query_scan_edges: 1,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+
+    let error = reader
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "edge-batch-limit-mid-scan"),
+            "MATCH (a:Entity)-[:CHAIN]->(b) RETURN b.id",
+        )
+        .await
+        .expect_err("the scan limit must reject this query");
+    assert!(
+        matches!(error, GraphError::AdmissionRejected { .. }),
+        "expected an admission rejection, got {error:?}"
+    );
+
+    reader.close().await.unwrap();
+}
+
 fn typed_mutation(
     cell_id: &str,
     edge_type: &str,
@@ -1843,6 +3494,149 @@ async fn batch_reads_share_one_snapshot_and_preserve_input_order() {
     );
 }
 
+/// Seed one Source and `actors` Actors, each with one `ACTED_ON` edge into it.
+#[cfg(feature = "opencypher")]
+async fn seed_acted_on_fixture(shard: &GraphShard, actors: u64) {
+    shard
+        .set_vertex_metadata(
+            "cell-a",
+            1,
+            VertexMetadata::default()
+                .with_label("Source")
+                .with_property(
+                    "source_id",
+                    VertexPropertyValue::String("src-1".to_string()),
+                )
+                .with_property(
+                    "tenant_id",
+                    VertexPropertyValue::String("tenant-1".to_string()),
+                )
+                .with_property(
+                    "sub_tenant_id",
+                    VertexPropertyValue::String("sub-1".to_string()),
+                ),
+        )
+        .await
+        .unwrap();
+    for actor in 0..actors {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                10 + actor,
+                VertexMetadata::default().with_label("Actor"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .write_edges_batch(
+            "cell-a",
+            "ACTED_ON",
+            (0..actors).map(|actor| (10 + actor, 1)),
+            "acted-on-seed",
+        )
+        .await
+        .unwrap();
+}
+
+/// Run one round of the PRO-2165 §I3 cleanup query and report the `deleted`
+/// column it projected.
+#[cfg(feature = "opencypher")]
+async fn run_acted_on_cleanup(
+    shard: &GraphShard,
+    engine: CypherEngineMode,
+    limit: u64,
+    round: usize,
+) -> u64 {
+    let context = QueryContext::new("cell-a", format!("acted-on-cleanup-{engine:?}-{round}"))
+        .with_cypher_engine(engine)
+        .with_parameter(
+            "source_id",
+            VertexPropertyValue::String("src-1".to_string()),
+        )
+        .with_parameter(
+            "tenant_id",
+            VertexPropertyValue::String("tenant-1".to_string()),
+        )
+        .with_parameter(
+            "sub_tenant_id",
+            VertexPropertyValue::String("sub-1".to_string()),
+        )
+        .with_parameter("batch", VertexPropertyValue::Integer(limit));
+
+    let output = shard
+        .execute_cypher(
+            context,
+            "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
+             WHERE s.tenant_id = $tenant_id \
+                 AND s.sub_tenant_id = $sub_tenant_id \
+             WITH r LIMIT $batch \
+             DELETE r \
+             RETURN count(r) AS deleted",
+        )
+        .await
+        .unwrap();
+
+    let QueryOutput::Mutation(mutation) = output else {
+        panic!("a bounded delete must report a mutation, got {output:?}");
+    };
+    let rows = mutation
+        .returned_rows
+        .expect("RETURN count(r) must produce rows");
+    assert_eq!(rows.columns, vec![QueryColumn::new("deleted")]);
+    let [row] = rows.rows.as_slice() else {
+        panic!("count is one row, got {:?}", rows.rows);
+    };
+    let [QueryValue::Count(deleted)] = row.values.as_slice() else {
+        panic!("count is one value, got {:?}", row.values);
+    };
+    *deleted
+}
+
+/// The cleanup loop from PRO-2165 §I3, run to exhaustion on both engine routes.
+///
+/// The caller repeats this query until `deleted` comes back zero, so the test
+/// asserts the whole trace rather than one call: the ceiling has to bound each
+/// round, the count has to report what that round took, and the loop has to
+/// terminate. Both routes run it because the experimental route dispatches
+/// mutations to this same lowerer — the assertion is that they agree, which is
+/// what keeps the route switch invisible to this workload.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn bounded_returning_relationship_delete_drains_on_both_engines() {
+    let mut traces = Vec::new();
+    for engine in [CypherEngineMode::Legacy, CypherEngineMode::Experimental] {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard("graph/bounded-returning-delete", object_store).await;
+        seed_acted_on_fixture(&shard, 5).await;
+
+        let mut trace = Vec::new();
+        for round in 0..4 {
+            trace.push(run_acted_on_cleanup(&shard, engine, 2, round).await);
+        }
+
+        // Two, two, one, then nothing left to take.
+        assert_eq!(trace, vec![2, 2, 1, 0], "{engine:?} did not drain in order");
+        assert_eq!(
+            shard
+                .out_neighbors_batch("cell-a", "ACTED_ON", [10, 11, 12, 13, 14])
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.neighbors.len())
+                .sum::<usize>(),
+            0,
+            "{engine:?} left ACTED_ON edges behind"
+        );
+        traces.push(trace);
+    }
+
+    assert_eq!(
+        traces[0], traces[1],
+        "the legacy and experimental routes must report the same deletions"
+    );
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_batches_multi_pattern_create_and_multi_row_delete() {
@@ -1861,6 +3655,7 @@ async fn cypher_batches_multi_pattern_create_and_multi_row_delete() {
             .unwrap(),
         QueryOutput::Mutation(QueryMutationResult {
             created_edges: 3,
+            topology_sequence: Some(1),
             ..QueryMutationResult::default()
         })
     );
@@ -1874,6 +3669,7 @@ async fn cypher_batches_multi_pattern_create_and_multi_row_delete() {
             .unwrap(),
         QueryOutput::Mutation(QueryMutationResult {
             created_edges: 3,
+            topology_sequence: Some(1),
             ..QueryMutationResult::default()
         })
     );
@@ -1889,6 +3685,7 @@ async fn cypher_batches_multi_pattern_create_and_multi_row_delete() {
         QueryOutput::Mutation(QueryMutationResult {
             matched_rows: 2,
             deleted_edges: 2,
+            topology_sequence: Some(2),
             ..QueryMutationResult::default()
         })
     );
@@ -3855,6 +5652,917 @@ async fn second_writer_open_fences_first_writer_instance() {
 }
 
 #[tokio::test]
+async fn changing_metadata_and_relationship_writes_wait_for_wal_and_reject_fenced_writers() {
+    for kind in 0..5 {
+        let store = ReadCountingObjectStore::new();
+        let path = format!("graph/durable-changing-write-{kind}");
+        let first = open_test_shard(&path, store.clone()).await;
+        async fn write(shard: &GraphShard, id: u64, kind: u8) -> Result<()> {
+            if kind == 4 {
+                return shard
+                    .detach_delete_vertex("cell-a", id, &format!("delete-{id}"))
+                    .await
+                    .map(|_| ());
+            }
+            if kind == 2 || kind == 3 {
+                let metadata = VertexMetadata::default()
+                    .with_property("version", VertexPropertyValue::Integer(id));
+                return if kind == 2 {
+                    shard.set_vertex_metadata("cell-a", 1, metadata).await
+                } else {
+                    shard
+                        .set_vertex_metadata_batch("cell-a", [(1, metadata)])
+                        .await
+                        .map(|_| ())
+                };
+            }
+            if kind == 1 {
+                shard
+                    .import_relationships_batch(
+                        "cell-a",
+                        "RELATES",
+                        [RelationshipMutation {
+                            cell_id: "cell-a".into(),
+                            edge_type: "RELATES".into(),
+                            src: 1,
+                            dst: 2,
+                            relationship_id: id,
+                            metadata: EdgeMetadata::default(),
+                        }],
+                        &format!("request-{id}"),
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                shard
+                    .merge_vertex_metadata_batch(
+                        "cell-a",
+                        [(
+                            1,
+                            VertexMetadata::default()
+                                .with_property("version", VertexPropertyValue::Integer(id)),
+                        )],
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        }
+        let before = first.current_epoch("cell-a").await.unwrap();
+        let (started, release) = store.pause_next_wal();
+        let mut pending = Box::pin(write(&first, 1, kind));
+        tokio::select! {
+            result = &mut pending => panic!("write returned before WAL upload: {result:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), started) => { result.unwrap().unwrap(); }
+        }
+        assert_eq!(first.db.writer().unwrap().status().durable_seq, before);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        pending.await.unwrap();
+        assert!(first.db.writer().unwrap().status().durable_seq > before);
+
+        let second = open_test_shard(&path, store.clone()).await;
+        write(&second, 2, kind).await.unwrap();
+        let error = write(&first, 3, kind).await.unwrap_err();
+        assert!(
+            matches!(error, GraphError::Slate(ref error) if matches!(error.kind(), ErrorKind::Closed(_))),
+            "{error:?}"
+        );
+        if kind == 1 {
+            assert!(second
+                .read_remote(&keys::relationship("cell-a", "RELATES", 1, 2, 3))
+                .await
+                .unwrap()
+                .is_none());
+            // Replays do not upload a new WAL, but still must reject a stale writer.
+            assert!(write(&first, 1, kind).await.is_err());
+        } else if kind != 4 {
+            let key = keys::vertex("cell-a", 1);
+            let bytes = second.read_remote(&key).await.unwrap().unwrap();
+            assert_eq!(
+                decode_vertex_metadata(&key, &bytes)
+                    .unwrap()
+                    .properties
+                    .get("version"),
+                Some(&VertexPropertyValue::Integer(2))
+            );
+        }
+        second.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn configured_small_disk_cache_parts_bound_cold_point_read_downloads() {
+    let store = ReadCountingObjectStore::new();
+    let path = "graph/disk-cache-point-granularity";
+    let options = GraphOpenOptions {
+        cache: GraphCacheConfig {
+            slatedb_cache_bytes: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let shard =
+        GraphShard::open_standalone_writer_with_options(path, store.clone(), options.clone())
+            .await
+            .unwrap();
+    let mut random = 0x1234_5678_u64;
+    let records = (1..=320)
+        .map(|id| {
+            let payload = (0..4096)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    (b'a' + (random % 26) as u8) as char
+                })
+                .collect::<String>();
+            (
+                id,
+                VertexMetadata::default()
+                    .with_property("payload", VertexPropertyValue::String(payload)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = records[0].1.clone();
+    shard
+        .set_vertex_metadata_batch("cell-a", records)
+        .await
+        .unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    shard.close().await.unwrap();
+    drop(shard);
+    let disk = tempfile::tempdir().unwrap();
+    let mut cache = GraphCacheConfig::disk_cache_without_preload(disk.path(), 16 * 1024 * 1024);
+    cache.object_store_cache_part_bytes = 256 * 1024;
+    cache.slatedb_cache_bytes = 0;
+    let shard = GraphShard::open_standalone_writer_with_options(
+        path,
+        store.clone(),
+        GraphOpenOptions { cache, ..options },
+    )
+    .await
+    .unwrap();
+    store.max_compacted_range.store(0, Ordering::Relaxed);
+    let key = keys::vertex("cell-a", 1);
+    let actual =
+        decode_vertex_metadata(&key, &shard.read_remote(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(actual, expected);
+    let largest = store.max_compacted_range.load(Ordering::Relaxed);
+    assert!(largest > 0, "fixture must fetch cold SST data");
+    assert!(
+        largest <= 512 * 1024,
+        "one point read fetched {largest} bytes"
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn set_and_delete_without_a_durable_commit_reject_takeover() {
+    for kind in 0..3 {
+        let store = ReadCountingObjectStore::new();
+        let path = format!("graph/noop-takeover-{kind}");
+        let first = open_test_shard(&path, store.clone()).await;
+        let metadata = VertexMetadata::default().with_label("Entity");
+        first
+            .set_vertex_metadata("cell-a", 1, metadata.clone())
+            .await
+            .unwrap();
+        first
+            .detach_delete_vertex("cell-a", 2, "absent-delete")
+            .await
+            .unwrap();
+        first
+            .db
+            .writer()
+            .unwrap()
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::Wal,
+            })
+            .await
+            .unwrap();
+        let second = open_test_shard(&path, store).await;
+        // The stale local state sees exactly the same metadata / request ID.
+        // These responses cannot rely on a new WAL to detect the takeover.
+        let result = match kind {
+            0 => first.set_vertex_metadata("cell-a", 1, metadata).await,
+            1 => first
+                .set_vertex_metadata_batch("cell-a", [(1, metadata)])
+                .await
+                .map(|_| ()),
+            _ => first
+                .detach_delete_vertex("cell-a", 2, "absent-delete")
+                .await
+                .map(|_| ()),
+        };
+        assert!(
+            result.is_err(),
+            "stale non-durable response {kind} acknowledged success"
+        );
+        second.close().await.unwrap();
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn ordered_limit_reuses_bounded_immutable_index_blocks() {
+    let store = ReadCountingObjectStore::new();
+    let path = "graph/ordered-limit-block-reuse";
+    let shard = GraphShard::open_standalone_writer_with_options(
+        path,
+        store.clone(),
+        GraphOpenOptions {
+            reader_manifest_poll_interval: std::time::Duration::from_secs(3600),
+            cache: GraphCacheConfig {
+                slatedb_cache_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    shard
+        .set_vertex_metadata_batch(
+            "cell-a",
+            (1..=1600).map(|id| {
+                (
+                    id,
+                    VertexMetadata::default()
+                        .with_label("Entity")
+                        .with_property("tenant", VertexPropertyValue::String("tenant-a".into()))
+                        .with_property(
+                            "created_at",
+                            VertexPropertyValue::String(format!("2026-{id:04}")),
+                        ),
+                )
+            }),
+        )
+        .await
+        .unwrap();
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    shard.close().await.unwrap();
+    drop(shard);
+    let shard = GraphShard::open_standalone_writer_with_options(
+        path,
+        store.clone(),
+        GraphOpenOptions {
+            reader_manifest_poll_interval: std::time::Duration::from_secs(3600),
+            cache: GraphCacheConfig {
+                slatedb_cache_bytes: 8 * 1024 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for (direction, first_id) in [("DESC", 1600), ("ASC", 1)] {
+        let query = format!("MATCH (e:Entity {{tenant: 'tenant-a'}}) WHERE e.created_at STARTS WITH '' RETURN e.id ORDER BY e.created_at {direction} LIMIT 20");
+        let before = store.reads();
+        let first = shard
+            .execute_cypher_rows(QueryContext::new("cell-a", "cold"), &query)
+            .await
+            .unwrap();
+        let cold_reads = store.reads() - before;
+        let before = store.reads();
+        let second = shard
+            .execute_cypher_rows(QueryContext::new("cell-a", "repeat"), &query)
+            .await
+            .unwrap();
+        let repeat_reads = store.reads() - before;
+        assert_eq!(first.rows.len(), 20);
+        assert_eq!(first.rows[0].values, vec![QueryValue::VertexId(first_id)]);
+        assert_eq!(first.rows, second.rows);
+        if direction == "DESC" {
+            assert!(cold_reads > 0, "must read flushed SSTs");
+        }
+        assert_eq!(
+            repeat_reads, 0,
+            "{direction} repeated {repeat_reads} object reads after {cold_reads} cold reads"
+        );
+    }
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled before/after changing-write queue measurement"]
+async fn durable_changing_write_queue_benchmark() {
+    for relationships in [false, true] {
+        for concurrency in [1, 8] {
+            let store = ReadCountingObjectStore::new();
+            let shard = open_test_shard(
+                &format!("graph/changing-queue-{relationships}-{concurrency}"),
+                store.clone(),
+            )
+            .await;
+            shard
+                .merge_vertex_metadata_batch(
+                    "cell-a",
+                    (1..=5).map(|id| (id, VertexMetadata::default().with_label("Entity"))),
+                    None,
+                )
+                .await
+                .unwrap();
+            store.get_delay_ms.store(25, Ordering::Relaxed);
+            store.wal_put_delay_ms.store(25, Ordering::Relaxed);
+            let reads = store.reads();
+            let wal_puts = store.wal_puts.load(Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let mut samples = futures::stream::iter(1..=64_u64)
+                .map(|id| {
+                    let shard = &shard;
+                    async move {
+                        let request = std::time::Instant::now();
+                        if relationships {
+                            shard
+                                .import_relationships_batch(
+                                    "cell-a",
+                                    "RELATES",
+                                    (1..=5).map(|offset| RelationshipMutation {
+                                        cell_id: "cell-a".into(),
+                                        edge_type: "RELATES".into(),
+                                        src: offset,
+                                        dst: offset + 10,
+                                        relationship_id: id * 5 + offset,
+                                        metadata: EdgeMetadata::default().with_property(
+                                            "request",
+                                            VertexPropertyValue::Integer(id),
+                                        ),
+                                    }),
+                                    &format!("request-{id}"),
+                                )
+                                .await
+                                .unwrap();
+                        } else {
+                            assert_eq!(
+                                shard
+                                    .merge_vertex_metadata_batch(
+                                        "cell-a",
+                                        (1..=5).map(|vertex| (
+                                            vertex,
+                                            VertexMetadata::default().with_property(
+                                                "version",
+                                                VertexPropertyValue::Integer(id)
+                                            )
+                                        )),
+                                        None
+                                    )
+                                    .await
+                                    .unwrap(),
+                                5
+                            );
+                        }
+                        request.elapsed().as_micros()
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect::<Vec<_>>()
+                .await;
+            samples.sort_unstable();
+            eprintln!("changing-write relationships={relationships} concurrency={concurrency} requests=64 items_per_request=5 p50_us={} p95_us={} p99_us={} qps={:.2} object_reads={} wal_puts={}",
+                samples[31], samples[60], samples[63], 64.0 / started.elapsed().as_secs_f64(), store.reads() - reads, store.wal_puts.load(Ordering::Relaxed) - wal_puts);
+            store.get_delay_ms.store(0, Ordering::Relaxed);
+            shard.close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn durable_changing_write_loses_wal_race_without_acknowledgement() {
+    let store = ReadCountingObjectStore::new();
+    let first = Arc::new(open_test_shard("graph/wal-takeover-race", store.clone()).await);
+    let (started, release) = store.pause_next_wal();
+    let mut pending = Box::pin(first.merge_vertex_metadata_batch(
+        "cell-a",
+        [(
+            1,
+            VertexMetadata::default().with_property("version", VertexPropertyValue::Integer(1)),
+        )],
+        None,
+    ));
+    tokio::select! {
+        result = &mut pending => panic!("write returned before WAL upload: {result:?}"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(10), started) => { result.unwrap().unwrap(); }
+    }
+    let first_sequence = first.db.writer().unwrap().snapshot().await.unwrap().seq();
+    let dependent = {
+        let first = Arc::clone(&first);
+        tokio::spawn(async move {
+            first
+                .merge_vertex_metadata_batch(
+                    "cell-a",
+                    [(
+                        1,
+                        VertexMetadata::default()
+                            .with_property("dependent", VertexPropertyValue::Integer(1)),
+                    )],
+                    None,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while first.db.writer().unwrap().snapshot().await.unwrap().seq() == first_sequence {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Take the writer epoch while the old writer's conditional WAL PUT is
+    // suspended, not merely before it starts checking the local handle.
+    let second = open_test_shard("graph/wal-takeover-race", store.clone()).await;
+    second
+        .merge_vertex_metadata_batch(
+            "cell-a",
+            [(
+                1,
+                VertexMetadata::default().with_property("version", VertexPropertyValue::Integer(2)),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(error, GraphError::Slate(ref error) if matches!(error.kind(), ErrorKind::Closed(_))),
+        "{error:?}"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), dependent)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    let key = keys::vertex("cell-a", 1);
+    let bytes = second.read_remote(&key).await.unwrap().unwrap();
+    assert_eq!(
+        decode_vertex_metadata(&key, &bytes)
+            .unwrap()
+            .properties
+            .get("version"),
+        Some(&VertexPropertyValue::Integer(2))
+    );
+    second.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_pipeline_retains_dependent_updates_and_bounds_cancelled_writes() {
+    let store = ReadCountingObjectStore::new();
+    let shard = Arc::new(open_test_shard("graph/write-pipeline-bounded", store.clone()).await);
+    let before = shard.db.writer().unwrap().snapshot().await.unwrap().seq();
+    let (started, release) = store.pause_next_wal();
+    let spawn_patch = |id: u64| {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            shard
+                .merge_vertex_metadata_batch(
+                    "cell-a",
+                    [(
+                        1,
+                        VertexMetadata::default()
+                            .with_property(format!("p{id}"), VertexPropertyValue::Integer(id)),
+                    )],
+                    None,
+                )
+                .await
+        })
+    };
+    let mut pending = vec![spawn_patch(0)];
+    tokio::time::timeout(std::time::Duration::from_secs(10), started)
+        .await
+        .unwrap()
+        .unwrap();
+    for id in 1..16 {
+        pending.push(spawn_patch(id));
+    }
+    // All sixteen dependent local commits must progress while the first WAL
+    // upload is blocked. None may be returned or exposed to a normal reader.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while shard.db.writer().unwrap().snapshot().await.unwrap().seq() < before + 16 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(pending.iter().all(|task| !task.is_finished()));
+    let key = keys::vertex("cell-a", 1);
+    assert!(shard.read_remote(&key).await.unwrap().is_none());
+    assert_eq!(shard.write_pipeline_gate.available_permits(), 0);
+    for task in pending {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    assert_eq!(shard.write_pipeline_gate.available_permits(), 0);
+    let extra = spawn_patch(16);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!extra.is_finished());
+    assert_eq!(
+        shard.db.writer().unwrap().snapshot().await.unwrap().seq(),
+        before + 16
+    );
+    release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), extra)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    let bytes = shard.read_remote(&key).await.unwrap().unwrap();
+    let metadata = decode_vertex_metadata(&key, &bytes).unwrap();
+    for id in 0..17 {
+        assert_eq!(
+            metadata.properties.get(&format!("p{id}")),
+            Some(&VertexPropertyValue::Integer(id))
+        );
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while shard.write_pipeline_gate.available_permits() != 16 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn write_pipeline_noop_rejects_superseded_writer_with_and_without_busy_gate() {
+    for busy in [false, true] {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = format!("graph/write-pipeline-noop-fence-{busy}");
+        let first = open_test_shard(&path, Arc::clone(&store)).await;
+        let old =
+            VertexMetadata::default().with_property("version", VertexPropertyValue::Integer(1));
+        first
+            .merge_vertex_metadata_batch("cell-a", [(1, old.clone())], None)
+            .await
+            .unwrap();
+        let second = open_test_shard(&path, store).await;
+        second
+            .merge_vertex_metadata_batch(
+                "cell-a",
+                [(
+                    1,
+                    VertexMetadata::default()
+                        .with_property("version", VertexPropertyValue::Integer(2)),
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+        let held = if busy {
+            Some(
+                Arc::clone(&first.graph_write_gate)
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            first.merge_vertex_metadata_batch("cell-a", [(1, old)], None),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "a stale local no-op cannot acknowledge the requested value"
+        );
+        drop(held);
+        second.close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_pipeline_relationship_replay_waits_and_preserves_shared_topology() {
+    let store = ReadCountingObjectStore::new();
+    let shard = Arc::new(open_test_shard("graph/write-pipeline-replay", store.clone()).await);
+    let before = shard.db.writer().unwrap().snapshot().await.unwrap().seq();
+    let spawn_import = |id: u64| {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            shard
+                .import_relationships_batch(
+                    "cell-a",
+                    "RELATES",
+                    [RelationshipMutation {
+                        cell_id: "cell-a".into(),
+                        edge_type: "RELATES".into(),
+                        src: 1,
+                        dst: 2,
+                        relationship_id: id,
+                        metadata: EdgeMetadata::default(),
+                    }],
+                    &format!("request-{id}"),
+                )
+                .await
+        })
+    };
+    let (started, release) = store.pause_next_wal();
+    let first = spawn_import(1);
+    tokio::time::timeout(std::time::Duration::from_secs(10), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = spawn_import(2);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while shard.db.writer().unwrap().snapshot().await.unwrap().seq() < before + 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let replay = spawn_import(1);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!first.is_finished() && !second.is_finished() && !replay.is_finished());
+    assert!(shard
+        .read_remote(&keys::relationship("cell-a", "RELATES", 1, 2, 1))
+        .await
+        .unwrap()
+        .is_none());
+    release.send(()).unwrap();
+    let initial = first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    let repeated = replay.await.unwrap().unwrap();
+    assert_eq!(initial.end_epoch, repeated.end_epoch);
+    assert_eq!(shard.out_degree("cell-a", "RELATES", 1).await.unwrap(), 1);
+    for id in [1, 2] {
+        assert!(shard
+            .read_remote(&keys::relationship("cell-a", "RELATES", 1, 2, id))
+            .await
+            .unwrap()
+            .is_some());
+    }
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_pipeline_set_applies_after_pending_predecessor_before_durability() {
+    let store = ReadCountingObjectStore::new();
+    let shard = Arc::new(open_test_shard("graph/write-pipeline-legacy", store.clone()).await);
+    let (started, release) = store.pause_next_wal();
+    let pending = {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            shard
+                .merge_vertex_metadata_batch(
+                    "cell-a",
+                    [(1, VertexMetadata::default().with_label("Entity"))],
+                    None,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let before_set = shard.db.writer().unwrap().snapshot().await.unwrap().seq();
+    let legacy = {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            shard
+                .set_vertex_metadata(
+                    "cell-a",
+                    1,
+                    VertexMetadata::default().with_label("Replacement"),
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while shard.db.writer().unwrap().snapshot().await.unwrap().seq() == before_set {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!legacy.is_finished());
+    release.send(()).unwrap();
+    pending.await.unwrap().unwrap();
+    legacy.await.unwrap().unwrap();
+    let key = keys::vertex("cell-a", 1);
+    let metadata =
+        decode_vertex_metadata(&key, &shard.read_remote(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(metadata.labels, BTreeSet::from(["Replacement".into()]));
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_pipeline_set_batch_and_detach_share_pending_topology_without_early_ack() {
+    let store = ReadCountingObjectStore::new();
+    let shard = Arc::new(open_test_shard("graph/write-pipeline-set-detach", store.clone()).await);
+    shard
+        .set_vertex_metadata_batch(
+            "cell-a",
+            (1..=3).map(|id| (id, VertexMetadata::default().with_label("Entity"))),
+        )
+        .await
+        .unwrap();
+    shard
+        .write_edges_batch("cell-a", "EDGE", [(1, 2), (1, 3)], "seed")
+        .await
+        .unwrap();
+    let durable_before = shard.db.writer().unwrap().status().durable_seq;
+    let (started, release) = store.pause_next_wal();
+    let first = {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            shard
+                .set_vertex_metadata("cell-a", 1, VertexMetadata::default().with_label("Updated"))
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut pending = Vec::new();
+    for operation in 0..3 {
+        let before = shard.db.writer().unwrap().snapshot().await.unwrap().seq();
+        let shard_for_task = Arc::clone(&shard);
+        pending.push(tokio::spawn(async move {
+            if operation == 0 {
+                shard_for_task
+                    .set_vertex_metadata_batch(
+                        "cell-a",
+                        [(2, VertexMetadata::default().with_label("BatchUpdated"))],
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                shard_for_task
+                    .detach_delete_vertex("cell-a", operation + 1, &format!("delete-{operation}"))
+                    .await
+                    .map(|_| ())
+            }
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while shard.db.writer().unwrap().snapshot().await.unwrap().seq() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        shard.db.writer().unwrap().status().durable_seq,
+        durable_before
+    );
+    assert!(!first.is_finished());
+    assert!(pending.iter().all(|task| !task.is_finished()));
+    // Public reads still see the durable predecessor, not the unacknowledged deletes.
+    assert!(shard
+        .read_remote(&keys::vertex("cell-a", 2))
+        .await
+        .unwrap()
+        .is_some());
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    for task in pending {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(shard.out_degree("cell-a", "EDGE", 1).await.unwrap(), 0);
+    for id in [2, 3] {
+        assert!(shard
+            .read_remote(&keys::vertex("cell-a", id))
+            .await
+            .unwrap()
+            .is_none());
+    }
+    let key = keys::vertex("cell-a", 1);
+    let metadata =
+        decode_vertex_metadata(&key, &shard.read_remote(&key).await.unwrap().unwrap()).unwrap();
+    assert!(metadata.labels.contains("Updated"));
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_pipeline_maintenance_guard_checks_pending_transaction_snapshot() {
+    let store = ReadCountingObjectStore::new();
+    let shard = Arc::new(open_test_shard("graph/write-pipeline-maintenance", store.clone()).await);
+    let (started, release) = store.pause_next_wal();
+    let pending = {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            shard
+                .merge_vertex_metadata_batch(
+                    "cell-a",
+                    [(1, VertexMetadata::default().with_label("Entity"))],
+                    None,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let maintenance = {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            let key = keys::vertex("cell-a", 1);
+            let mut batch = GraphWriteBatch::new();
+            batch.put("cell/cell-a/test/maintenance", "incorrect-publication");
+            shard
+                .write_graph_batch_strict_guarded(
+                    "cell-a",
+                    "test_maintenance",
+                    vec![GraphWriteGuard::absent(&key)],
+                    batch,
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!maintenance.is_finished());
+    release.send(()).unwrap();
+    pending.await.unwrap().unwrap();
+    assert!(matches!(
+        maintenance.await.unwrap(),
+        Err(GraphError::ConditionalWriteConflict { .. })
+    ));
+    assert!(shard
+        .read_remote("cell/cell-a/test/maintenance")
+        .await
+        .unwrap()
+        .is_none());
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn write_pipeline_cancellation_does_not_release_pending_durability_admission() {
+    let store = ReadCountingObjectStore::new();
+    let shard = open_test_shard("graph/write-pipeline-cancel-token", store.clone()).await;
+    let token = QueryCancellationToken::new();
+    let (started, release) = store.pause_next_wal();
+    let mut pending = Box::pin(token.scope(shard.merge_vertex_metadata_batch(
+        "cell-a",
+        [(1, VertexMetadata::default().with_label("Entity"))],
+        None,
+    )));
+    tokio::select! {
+        result = &mut pending => panic!("write completed before WAL upload: {result:?}"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(10), started) => { result.unwrap().unwrap(); }
+    }
+    token.cancel();
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .unwrap(),
+        Err(GraphError::QueryTimeout {
+            operation: "query_cancelled",
+            ..
+        })
+    ));
+    assert_eq!(shard.write_pipeline_gate.available_permits(), 15);
+    assert!(shard
+        .read_remote(&keys::vertex("cell-a", 1))
+        .await
+        .unwrap()
+        .is_none());
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while shard.write_pipeline_gate.available_permits() != 16 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn fenced_writer_falls_back_to_reader_for_reads_and_index_discovery() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "graph/fenced-writer-read-fallback";
@@ -4508,6 +7216,7 @@ async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes(
     let root_namespace = NamespacePath::root(NamespaceId::new("production").unwrap());
     let graph_id = GraphId::new("hydradb").unwrap();
     let directory = ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap();
+    let indexer_wake = Arc::new(tokio::sync::Notify::new());
     let runtime = ScopedRoutedGraphCluster::new(
         "graph/native-scopes",
         root_namespace.clone(),
@@ -4520,7 +7229,8 @@ async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes(
         GraphMemoryConfig::default(),
         4,
     )
-    .unwrap();
+    .unwrap()
+    .with_indexer_change_wake(Arc::clone(&indexer_wake));
     let collection_a = GraphScope::new(
         root_namespace
             .child(NamespaceId::new("tenant-a").unwrap())
@@ -4591,11 +7301,313 @@ async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes(
 
     assert_eq!(
         scope_directory.list().await.unwrap(),
-        vec![collection_a, collection_b]
+        vec![collection_a.clone(), collection_b]
+    );
+
+    QueryCellClient::execute_batch(
+        &runtime,
+        QueryContext::new("cell-0", "scope-a-notification").in_scope(collection_a.clone()),
+        QueryBatchOperation::CreateEdges {
+            edge_type: "FOLLOWS".to_string(),
+            edges: vec![QueryBatchEdge { src: 2, dst: 4 }],
+        },
+    )
+    .await
+    .unwrap();
+    let mut changes = Vec::new();
+    for _ in 0..100 {
+        changes = scope_directory.list_changes().await.unwrap();
+        if !changes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].scope, collection_a);
+    tokio::time::timeout(std::time::Duration::from_secs(1), indexer_wake.notified())
+        .await
+        .expect("durable graph change should wake the indexer notifier");
+    scope_directory.clear_changes(&changes).await.unwrap();
+
+    QueryCellClient::execute_batch(
+        &runtime,
+        QueryContext::new("cell-0", "scope-a-metadata-only").in_scope(collection_a.clone()),
+        QueryBatchOperation::UpsertVertices {
+            vertices: vec![QueryBatchVertex {
+                vertex: 2,
+                metadata: VertexMetadata::default().with_label("Entity"),
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        scope_directory.list_changes().await.unwrap().is_empty(),
+        "metadata-only writes must not create topology-index work"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            indexer_wake.notified()
+        )
+        .await
+        .is_err(),
+        "metadata-only writes must not wake the topology indexer"
     );
 
     drop(cluster_a);
     drop(cluster_b);
+    runtime.close().await.unwrap();
+}
+
+/// A bounded delete's `RETURN count(r)` row must survive the scoped paging
+/// wrapper, which is the route Bolt takes.
+///
+/// `ScopedRoutedGraphCluster::execute_cypher_rows_page` runs the mutation
+/// itself rather than delegating, so it has its own chance to drop the row.
+/// Preparation has already put `deleted` in the RUN reply by the time this
+/// runs; a page with the column and no record would leave a cleanup loop
+/// unable to read its own progress, and it would loop forever.
+#[cfg(all(feature = "opencypher", feature = "query-transport"))]
+#[tokio::test]
+async fn scoped_paged_bounded_delete_returns_its_count_row() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let root_namespace = NamespacePath::root(NamespaceId::new("production").unwrap());
+    let graph_id = GraphId::new("hydradb").unwrap();
+    let directory = ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap();
+    let runtime = ScopedRoutedGraphCluster::new(
+        "graph/scoped-paged-bounded-delete",
+        root_namespace.clone(),
+        graph_id.clone(),
+        "node-a",
+        directory,
+        sole_writer_placement("node-a"),
+        Arc::clone(&object_store),
+        fast_fence_options(),
+        GraphMemoryConfig::default(),
+        4,
+    )
+    .unwrap();
+    let scope = GraphScope::new(
+        root_namespace
+            .child(NamespaceId::new("tenant-a").unwrap())
+            .unwrap()
+            .child(NamespaceId::new("collection-a").unwrap())
+            .unwrap(),
+        graph_id.clone(),
+    );
+    let cluster = runtime
+        .cluster_for_scope_write(&scope, "cell-0")
+        .await
+        .unwrap();
+    let shard = cluster.shard("cell-0").unwrap();
+    shard
+        .set_vertex_metadata(
+            "cell-0",
+            1,
+            VertexMetadata::default()
+                .with_label("Source")
+                .with_property(
+                    "source_id",
+                    VertexPropertyValue::String("src-1".to_string()),
+                ),
+        )
+        .await
+        .unwrap();
+    for actor in 0..3u64 {
+        shard
+            .set_vertex_metadata(
+                "cell-0",
+                10 + actor,
+                VertexMetadata::default().with_label("Actor"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .write_edges_batch(
+            "cell-0",
+            "ACTED_ON",
+            (0..3u64).map(|actor| (10 + actor, 1)),
+            "scoped-paged-delete-seed",
+        )
+        .await
+        .unwrap();
+
+    let page = QueryCellClient::execute_cypher_rows_page(
+        &runtime,
+        QueryContext::new("cell-0", "scoped-paged-bounded-delete")
+            .in_scope(scope)
+            .with_parameter(
+                "source_id",
+                VertexPropertyValue::String("src-1".to_string()),
+            ),
+        "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
+         WITH r LIMIT 2 \
+         DELETE r \
+         RETURN count(r) AS deleted",
+        None,
+        64,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page.columns, vec![QueryColumn::new("deleted")]);
+    assert_eq!(
+        page.rows,
+        vec![QueryRow::new(vec![QueryValue::Count(2)])],
+        "the scoped paging route must carry the count, not just declare the column"
+    );
+
+    drop(cluster);
+    runtime.close().await.unwrap();
+}
+
+#[cfg(all(feature = "opencypher", feature = "query-transport"))]
+#[tokio::test]
+async fn scoped_segment_backed_relationship_delete_does_not_notify_indexer() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let root_namespace = NamespacePath::root(NamespaceId::new("production").unwrap());
+    let graph_id = GraphId::new("hydradb").unwrap();
+    let directory = ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap();
+    let indexer_wake = Arc::new(tokio::sync::Notify::new());
+    let runtime = ScopedRoutedGraphCluster::new(
+        "graph/scoped-segment-backed-delete",
+        root_namespace.clone(),
+        graph_id.clone(),
+        "node-a",
+        directory,
+        sole_writer_placement("node-a"),
+        Arc::clone(&object_store),
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..fast_fence_options()
+        },
+        GraphMemoryConfig::default(),
+        4,
+    )
+    .unwrap()
+    .with_indexer_change_wake(Arc::clone(&indexer_wake));
+    let scope = GraphScope::new(
+        root_namespace
+            .child(NamespaceId::new("tenant-a").unwrap())
+            .unwrap()
+            .child(NamespaceId::new("collection-a").unwrap())
+            .unwrap(),
+        graph_id.clone(),
+    );
+    let cluster = runtime
+        .cluster_for_scope_write(&scope, "cell-0")
+        .await
+        .unwrap();
+    let shard = cluster.shard("cell-0").unwrap();
+    shard
+        .bulk_append_out_adjacency_segment_trusted(
+            "cell-0",
+            "RELATES",
+            1,
+            [2],
+            "scoped-segment-edge",
+        )
+        .await
+        .unwrap();
+    shard
+        .import_relationships_batch(
+            "cell-0",
+            "RELATES",
+            [RelationshipMutation {
+                cell_id: "cell-0".to_string(),
+                edge_type: "RELATES".to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: 100,
+                metadata: EdgeMetadata::default()
+                    .with_property("rank", VertexPropertyValue::Integer(1)),
+            }],
+            "scoped-segment-relationship",
+        )
+        .await
+        .unwrap();
+    let scope_directory = ObjectStoreGraphScopeDirectory::new(
+        "graph/scoped-segment-backed-delete",
+        root_namespace,
+        graph_id,
+        Arc::clone(&object_store),
+    );
+
+    QueryCellClient::execute_cypher_rows(
+        &runtime,
+        QueryContext::new("cell-0", "scoped-segment-delete").in_scope(scope.clone()),
+        "MATCH (u {id: 1})-[r:RELATES {rank: 1}]->(v {id: 2}) DELETE r",
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(scope_directory.list_changes().await.unwrap().is_empty());
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            indexer_wake.notified()
+        )
+        .await
+        .is_err(),
+        "segment-backed relationship deletion must not wake the topology indexer"
+    );
+    assert!(shard.edge_exists("cell-0", "RELATES", 1, 2).await.unwrap());
+
+    shard
+        .bulk_append_out_adjacency_segment_trusted(
+            "cell-0",
+            "RELATES",
+            3,
+            [4],
+            "scoped-segment-page-edge",
+        )
+        .await
+        .unwrap();
+    shard
+        .import_relationships_batch(
+            "cell-0",
+            "RELATES",
+            [RelationshipMutation {
+                cell_id: "cell-0".to_string(),
+                edge_type: "RELATES".to_string(),
+                src: 3,
+                dst: 4,
+                relationship_id: 101,
+                metadata: EdgeMetadata::default()
+                    .with_property("rank", VertexPropertyValue::Integer(2)),
+            }],
+            "scoped-segment-page-relationship",
+        )
+        .await
+        .unwrap();
+    QueryCellClient::execute_cypher_rows_page(
+        &runtime,
+        QueryContext::new("cell-0", "scoped-segment-page-delete").in_scope(scope),
+        "MATCH (u {id: 3})-[r:RELATES {rank: 2}]->(v {id: 4}) DELETE r",
+        None,
+        64,
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(scope_directory.list_changes().await.unwrap().is_empty());
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            indexer_wake.notified()
+        )
+        .await
+        .is_err(),
+        "paged segment-backed deletion must not wake the topology indexer"
+    );
+    assert!(shard.edge_exists("cell-0", "RELATES", 3, 4).await.unwrap());
+
+    drop(cluster);
     runtime.close().await.unwrap();
 }
 
@@ -4667,6 +7679,682 @@ async fn routed_reader_catches_up_to_a_remote_writer_storage_sequence() {
 
     reader.close().await.unwrap();
     writer.close().await.unwrap();
+}
+
+/// An `ObjectStore` that counts the reads made through it.
+///
+/// "This code path did no object-store I/O" is a claim about I/O, and elapsed
+/// time cannot make it: a poll loop served from a warm manifest cache is fast
+/// too. `ObjectStoreNodeDirectory`'s own tests take the same line — assert on
+/// the call counters, not on the shape of the code, so the assertion survives
+/// the code moving.
+pub(crate) struct ReadCountingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    reads: std::sync::atomic::AtomicU64,
+    compacted_reads: std::sync::atomic::AtomicU64,
+    max_compacted_range: std::sync::atomic::AtomicU64,
+    get_delay_ms: std::sync::atomic::AtomicU64,
+    wal_put_delay_ms: std::sync::atomic::AtomicU64,
+    wal_puts: std::sync::atomic::AtomicU64,
+    active_gets: std::sync::atomic::AtomicU64,
+    peak_gets: std::sync::atomic::AtomicU64,
+    next_wal_pause: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(feature = "query-transport")]
+    pub(crate) scope_puts: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "query-transport")]
+    pub(crate) fail_scope_put: std::sync::atomic::AtomicBool,
+    next_get_pause: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+}
+
+impl ReadCountingObjectStore {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(InMemory::new()),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            compacted_reads: std::sync::atomic::AtomicU64::new(0),
+            max_compacted_range: std::sync::atomic::AtomicU64::new(0),
+            get_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            wal_put_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            wal_puts: std::sync::atomic::AtomicU64::new(0),
+            active_gets: std::sync::atomic::AtomicU64::new(0),
+            peak_gets: std::sync::atomic::AtomicU64::new(0),
+            next_wal_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "query-transport")]
+            scope_puts: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "query-transport")]
+            fail_scope_put: std::sync::atomic::AtomicBool::new(false),
+            next_get_pause: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// GETs and LISTs served so far. Manifest refresh is both, so counting the
+    /// two together is what makes a zero mean "never went to the store".
+    pub(crate) fn reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(all(feature = "opencypher", feature = "query-transport"))]
+    pub(crate) fn compacted_reads(&self) -> u64 {
+        self.compacted_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(all(feature = "opencypher", feature = "query-transport"))]
+    pub(crate) fn delay_reads_and_reset_peak(&self, millis: u64) {
+        self.get_delay_ms.store(millis, Ordering::Relaxed);
+        self.peak_gets.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(all(feature = "opencypher", feature = "query-transport"))]
+    pub(crate) fn peak_reads(&self) -> u64 {
+        self.peak_gets.load(Ordering::Relaxed)
+    }
+
+    fn pause_next_wal(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.next_wal_pause.lock().unwrap() = Some((started_tx, release_rx));
+        (started_rx, release_tx)
+    }
+
+    pub(crate) fn pause_next_get(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.next_get_pause.lock().unwrap() = Some((started_tx, release_rx));
+        (started_rx, release_tx)
+    }
+
+    fn note_read(&self) {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Display for ReadCountingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReadCountingObjectStore({})", self.inner)
+    }
+}
+
+impl std::fmt::Debug for ReadCountingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReadCountingObjectStore({:?})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ReadCountingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        payload: slatedb::object_store::PutPayload,
+        opts: slatedb::object_store::PutOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::PutResult> {
+        if location.as_ref().contains("/wal/") {
+            self.wal_puts.fetch_add(1, Ordering::Relaxed);
+            let delay = self.wal_put_delay_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            let pause = self.next_wal_pause.lock().unwrap().take();
+            if let Some((started, release)) = pause {
+                let _ = started.send(());
+                let _ = release.await;
+            }
+        }
+        #[cfg(feature = "query-transport")]
+        if location.filename() == Some("__scope__") {
+            self.scope_puts.fetch_add(1, Ordering::Relaxed);
+            if self.fail_scope_put.swap(false, Ordering::AcqRel) {
+                return Err(slatedb::object_store::Error::Generic {
+                    store: "scope-registration-test",
+                    source: Box::new(std::io::Error::other("injected registration failure")),
+                });
+            }
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        opts: slatedb::object_store::PutMultipartOptions,
+    ) -> slatedb::object_store::Result<Box<dyn slatedb::object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::GetOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
+        if location.as_ref().contains("/compacted/") {
+            self.compacted_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.note_read();
+        let delay = self.get_delay_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            let active = self.active_gets.fetch_add(1, Ordering::Relaxed) + 1;
+            self.peak_gets.fetch_max(active, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            self.active_gets.fetch_sub(1, Ordering::Relaxed);
+        }
+        let pause = self.next_get_pause.lock().unwrap().take();
+        if let Some((started, release)) = pause {
+            let _ = started.send(());
+            let _ = release.await;
+        }
+        let result = self.inner.get_opts(location, options).await?;
+        if location.as_ref().contains("/compacted/") {
+            self.max_compacted_range
+                .fetch_max(result.range.end - result.range.start, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            slatedb::object_store::Result<slatedb::object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::path::Path>,
+    > {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::ObjectMeta>,
+    > {
+        self.note_read();
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> slatedb::object_store::Result<slatedb::object_store::ListResult> {
+        self.note_read();
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &slatedb::object_store::path::Path,
+        to: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::CopyOptions,
+    ) -> slatedb::object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// The premise the whole of `docs/plans/2026-08-21-cell-affine-read-routing.md`
+/// rests on: **the bookmark wait is not a property of the bookmark, it is a
+/// property of which node the read landed on.**
+///
+/// `wait_for_storage_sequence` opens with `durable_sequence()`, which on the
+/// cell's writer returns `writer.status().durable_seq` — its own commits, no
+/// I/O — and on every other node returns a `DbReader`'s sequence, which
+/// advances only when that reader's manifest is refreshed from the object
+/// store. A bookmark is minted from a commit on the writer, so on the writer
+/// the very first check already satisfies it and the 10ms poll loop is
+/// unreachable; anywhere else the fast exit cannot fire and the loop is the
+/// only way out, at one object-store round trip per turn for as long as
+/// propagation takes. That is the 17-38s `graph_client_prepare_duration` in
+/// `docs/2026-08-21-read-path-30s-timeout-findings.md`, and the reason
+/// co-locating reads with the writer removes it.
+///
+/// The two nodes hold the same fleet view, so rendezvous names exactly one
+/// owner and the other is a genuine non-writer rather than a second contender.
+/// The reader's background manifest poll is switched off for the duration
+/// (`reader_manifest_poll_interval`), so "the non-owner is behind" is a fact of
+/// the test rather than a race with a 10ms refresh that would make it pass for
+/// the wrong reason.
+#[tokio::test]
+async fn the_bookmark_wait_is_free_on_the_cell_writer_and_polls_on_every_other_node() {
+    const BASE: &str = "graph-bookmark-wait-affinity";
+    const CELL: &str = "cell-a";
+    const FLEET: [&str; 2] = ["node-a", "node-b"];
+
+    let counting = ReadCountingObjectStore::new();
+    let object_store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
+    let scope = GraphScope::default();
+    let owner_id = hydradb_placement::hash::owner(&scope.to_string(), CELL, &FLEET)
+        .expect("a non-empty fleet has an owner");
+    let peer_id = FLEET
+        .iter()
+        .copied()
+        .find(|node| *node != owner_id)
+        .expect("a two-node fleet has a non-owner");
+    let directory = ObjectStoreNodeDirectory::new([CELL], FLEET).unwrap();
+    let options = GraphOpenOptions {
+        reader_manifest_poll_interval: std::time::Duration::from_secs(120),
+        ..fast_fence_options()
+    };
+
+    let owner = RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+        BASE,
+        scope.clone(),
+        owner_id,
+        directory.clone(),
+        placement_over(owner_id, &FLEET),
+        Arc::clone(&object_store),
+        options.clone(),
+        GraphMemoryConfig::default(),
+    )
+    .await
+    .unwrap();
+    let peer = RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+        BASE,
+        scope,
+        peer_id,
+        directory,
+        placement_over(peer_id, &FLEET),
+        Arc::clone(&object_store),
+        options,
+        GraphMemoryConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    // Seed, then let the non-owner read the seed. The state under test is a
+    // node that was caught up and then fell behind — the ordinary one — not a
+    // node that has never opened a reader at all.
+    owner
+        .write_edge(typed_mutation(CELL, "FOLLOWS", 1, 2, "seed"))
+        .await
+        .unwrap();
+    let owner_shard = owner.shard(CELL).unwrap();
+    let peer_shard = peer.shard(CELL).unwrap();
+    peer_shard.refresh_storage_sequence(CELL).await.unwrap();
+
+    // The commit a client's bookmark would carry.
+    let bookmark = owner
+        .write_edge(typed_mutation(CELL, "FOLLOWS", 2, 3, "bookmarked"))
+        .await
+        .unwrap()
+        .epoch;
+
+    // The branch condition itself, on both nodes: `if current >= minimum` is
+    // what decides whether the loop runs at all.
+    assert!(
+        owner_shard.current_storage_sequence(CELL).await.unwrap() >= bookmark,
+        "the cell's writer is at or past its own commit by construction, so the fast exit fires"
+    );
+    assert!(
+        peer_shard.current_storage_sequence(CELL).await.unwrap() < bookmark,
+        "a non-writer's reader has not refreshed since the commit, so the fast exit cannot fire \
+         and the poll loop is the only way out"
+    );
+
+    let before = counting.reads();
+    let owner_sequence = owner_shard
+        .wait_for_storage_sequence(CELL, bookmark)
+        .await
+        .unwrap();
+    let owner_reads = counting.reads() - before;
+    assert!(owner_sequence >= bookmark);
+    assert_eq!(
+        owner_reads, 0,
+        "the cell's writer must answer the bookmark from its own commit status; any read here \
+         means the fast exit was lost and every co-located read pays a manifest round trip"
+    );
+
+    let before = counting.reads();
+    let peer_sequence = peer_shard
+        .wait_for_storage_sequence(CELL, bookmark)
+        .await
+        .unwrap();
+    let peer_reads = counting.reads() - before;
+    assert!(peer_sequence >= bookmark);
+    assert!(
+        peer_reads > 0,
+        "a non-writer can only catch up by refreshing its manifest from the object store"
+    );
+
+    owner.close().await.unwrap();
+    peer.close().await.unwrap();
+}
+
+/// The wait declines on its own budget, and does so with the error that names
+/// the problem instead of the one that hides it.
+///
+/// Before change 3 of `docs/plans/2026-08-21-cell-affine-read-routing.md` the
+/// deadline was `max_query_runtime_ms` — the entire query budget — so a read
+/// whose reader could never catch up spent all 30s here and was then killed by
+/// the client watchdog at 29,999ms with a phase-agnostic timeout, having
+/// executed nothing. `SnapshotAhead` lost that race every time, which is why
+/// staging showed 17-38s "prepare" averages and essentially no `SnapshotAhead`.
+///
+/// The query budget is left at the production 30s on purpose: the assertion is
+/// that the wait ends on `max_bookmark_wait_ms` and nowhere near
+/// `max_query_runtime_ms`, so both numbers have to be in the test for it to
+/// mean anything.
+#[tokio::test]
+async fn the_bookmark_wait_declines_on_its_own_budget_long_before_the_query_budget() {
+    const BOOKMARK_WAIT_MS: u64 = 50;
+    const QUERY_RUNTIME_MS: u64 = 30_000;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/bookmark-wait-budget";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    writer
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 1, 2, "seed"))
+        .await
+        .unwrap();
+
+    let reader = GraphShard::open_with_limits(
+        path,
+        Arc::clone(&object_store),
+        GraphLimits {
+            max_query_runtime_ms: Some(QUERY_RUNTIME_MS),
+            max_bookmark_wait_ms: BOOKMARK_WAIT_MS,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // A bookmark no refresh will ever satisfy — the shape of a read routed to a
+    // node that is not going to catch up, without having to arrange the lag.
+    let unreachable = writer.current_storage_sequence("cell-a").await.unwrap() + 1_000_000;
+    let started = std::time::Instant::now();
+    let error = reader
+        .wait_for_storage_sequence("cell-a", unreachable)
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(
+            error,
+            GraphError::SnapshotAhead {
+                ref cell_id,
+                read_epoch,
+                ..
+            } if cell_id == "cell-a" && read_epoch == unreachable
+        ),
+        "the wait must decline with the error that names the cell and the epoch: {error:?}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(BOOKMARK_WAIT_MS),
+        "the wait must actually serve its budget before declining, not fail on the first turn: \
+         {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(QUERY_RUNTIME_MS / 10),
+        "the wait must end on max_bookmark_wait_ms, nowhere near the query budget it used to \
+         borrow: {elapsed:?}"
+    );
+
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+/// The other direction, which is the one a regression would take: the wait must
+/// read `max_bookmark_wait_ms` and *only* that.
+///
+/// A query budget of 1ms beside a 250ms bookmark budget makes the two
+/// distinguishable by observation alone — the pre-change code would have
+/// declined after a single turn. It also pins the field as plumbed rather than
+/// merely present: a `max_bookmark_wait_ms` that never reached
+/// `wait_for_storage_sequence` would leave this returning in about a
+/// millisecond.
+#[tokio::test]
+async fn the_bookmark_wait_no_longer_borrows_the_query_budget() {
+    const BOOKMARK_WAIT_MS: u64 = 250;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/bookmark-wait-independent-of-query-budget";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    writer
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 1, 2, "seed"))
+        .await
+        .unwrap();
+
+    let reader = GraphShard::open_with_limits(
+        path,
+        Arc::clone(&object_store),
+        GraphLimits {
+            max_query_runtime_ms: Some(1),
+            max_bookmark_wait_ms: BOOKMARK_WAIT_MS,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let unreachable = writer.current_storage_sequence("cell-a").await.unwrap() + 1_000_000;
+    let started = std::time::Instant::now();
+    let error = reader
+        .wait_for_storage_sequence("cell-a", unreachable)
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(error, GraphError::SnapshotAhead { .. }),
+        "{error:?}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(BOOKMARK_WAIT_MS),
+        "a 1ms query budget must not shorten the bookmark wait: {elapsed:?}"
+    );
+
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+/// The counters that make the previous test's mechanism visible from a
+/// dashboard rather than from a debugger.
+///
+/// The test above proves the *behaviour*: the wait is free on the cell's writer
+/// and polls the object store everywhere else. This proves the **instrument** —
+/// that the same two outcomes arrive at `ClientQueryMetricsSnapshot` as two
+/// different counter readings, which is the whole of change 4 of
+/// `docs/plans/2026-08-21-cell-affine-read-routing.md`. A metric that cannot
+/// tell the owner from a non-owner would have left the next
+/// `docs/2026-08-21-read-path-30s-timeout-findings.md` investigation exactly as
+/// expensive as the last one.
+///
+/// It goes through `ClientQueryService::ensure_bookmark` rather than calling the
+/// shard, because the recording site is the client and the observation has to
+/// survive three hops to reach it — `GraphStore::durable_sequence_observed`,
+/// `GraphShard::wait_for_storage_sequence_observed`, and the
+/// `QueryCellClient::wait_for_storage_sequence_observed` whose *default*
+/// implementation reports nothing. A regression that dropped the override on the
+/// routed cluster would leave every assertion below reading zero.
+///
+/// The fleet, the `ReadCountingObjectStore` and the reader-poll suppression are
+/// the same harness as the test above, deliberately: two setups for one
+/// mechanism is two things that can drift.
+#[cfg(feature = "client-api")]
+#[tokio::test]
+async fn the_bookmark_wait_counters_separate_the_cell_writer_from_every_other_node() {
+    const BASE: &str = "graph-bookmark-wait-counters";
+    const CELL: &str = "cell-a";
+    const FLEET: [&str; 2] = ["node-a", "node-b"];
+
+    let counting = ReadCountingObjectStore::new();
+    let object_store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
+    let scope = GraphScope::default();
+    let owner_id = hydradb_placement::hash::owner(&scope.to_string(), CELL, &FLEET)
+        .expect("a non-empty fleet has an owner");
+    let peer_id = FLEET
+        .iter()
+        .copied()
+        .find(|node| *node != owner_id)
+        .expect("a two-node fleet has a non-owner");
+    let directory = ObjectStoreNodeDirectory::new([CELL], FLEET).unwrap();
+    let options = GraphOpenOptions {
+        reader_manifest_poll_interval: std::time::Duration::from_secs(120),
+        ..fast_fence_options()
+    };
+
+    let owner = Arc::new(
+        RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+            BASE,
+            scope.clone(),
+            owner_id,
+            directory.clone(),
+            placement_over(owner_id, &FLEET),
+            Arc::clone(&object_store),
+            options.clone(),
+            GraphMemoryConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let peer = Arc::new(
+        RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+            BASE,
+            scope.clone(),
+            peer_id,
+            directory,
+            placement_over(peer_id, &FLEET),
+            Arc::clone(&object_store),
+            options,
+            GraphMemoryConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    owner
+        .write_edge(typed_mutation(CELL, "FOLLOWS", 1, 2, "seed"))
+        .await
+        .unwrap();
+    peer.shard(CELL)
+        .unwrap()
+        .refresh_storage_sequence(CELL)
+        .await
+        .unwrap();
+    let epoch = owner
+        .write_edge(typed_mutation(CELL, "FOLLOWS", 2, 3, "bookmarked"))
+        .await
+        .unwrap()
+        .epoch;
+
+    let service = |cluster: &Arc<RoutedGraphCluster>| {
+        crate::ClientQueryService::new(
+            Arc::clone(cluster) as Arc<dyn crate::QueryCellClient>,
+            crate::ClientQueryServiceConfig::default(),
+        )
+        .expect("a query service over a routed cluster")
+    };
+    let owner_service = service(&owner);
+    let peer_service = service(&peer);
+    let bookmark = crate::ClientBookmark::new(
+        crate::ClientQueryTarget::new(scope, CELL).expect("a valid target"),
+        epoch,
+    );
+
+    owner_service.ensure_bookmark(&bookmark).await.unwrap();
+    let metrics = owner_service.metrics();
+    assert_eq!(
+        metrics.bookmark_waits, 1,
+        "the denominator counts every wait"
+    );
+    assert_eq!(
+        metrics.bookmark_wait_latency.count(),
+        1,
+        "the histogram and the denominator must measure one population, or the \
+         polled/total ratio is computed across two"
+    );
+    assert_eq!(
+        metrics.bookmark_waits_polled, 0,
+        "the cell's writer answers from its own commit status, so the poll loop \
+         is unreachable — this counter reading non-zero here is the regression \
+         cell-affine read routing exists to prevent"
+    );
+    assert_eq!(metrics.bookmark_waits_on_cell_writer, 1);
+    assert_eq!(metrics.bookmark_waits_off_cell_writer, 0);
+    assert_eq!(metrics.bookmark_waits_declined, 0);
+
+    peer_service.ensure_bookmark(&bookmark).await.unwrap();
+    let metrics = peer_service.metrics();
+    assert_eq!(metrics.bookmark_waits, 1);
+    assert_eq!(
+        metrics.bookmark_waits_polled, 1,
+        "a non-writer can only reach the bookmark through the poll loop, and \
+         that is the event the alert fires on"
+    );
+    assert_eq!(
+        metrics.bookmark_waits_on_cell_writer, 0,
+        "attributing this wait to the cell's writer would say the read was free \
+         when it was not"
+    );
+    assert_eq!(metrics.bookmark_waits_off_cell_writer, 1);
+    assert_eq!(metrics.bookmark_waits_declined, 0);
+
+    // The owner's counters are untouched by the peer's wait: these are
+    // per-process counters over one node's reads, which is what makes
+    // `off_cell_writer / bookmark_waits` readable as "this node is serving
+    // reads it does not own".
+    assert_eq!(owner_service.metrics().bookmark_waits, 1);
+
+    // A bookmark this fleet will never reach: the wait spends
+    // `max_bookmark_wait_ms` and declines, which is the outcome step 3 of the
+    // plan made reachable and which no error-class counter sees on this path —
+    // `ensure_bookmark` runs inside prepare, and a failed prepare never reaches
+    // `record_result_metrics`.
+    let unreachable = crate::ClientBookmark::new(bookmark.target.clone(), epoch + 1_000_000);
+    let error = peer_service
+        .ensure_bookmark(&unreachable)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, GraphError::SnapshotAhead { .. }),
+        "{error:?}"
+    );
+    let metrics = peer_service.metrics();
+    assert_eq!(metrics.bookmark_waits, 2);
+    assert_eq!(
+        metrics.bookmark_waits_declined, 1,
+        "a wait that ran out of its budget has to be countable where it happens"
+    );
+    assert_eq!(
+        metrics.bookmark_waits_polled, 2,
+        "a declined wait is a polled wait — the fast exit returns Ok, so \
+         SnapshotAhead is only reachable from inside the loop — and leaving it \
+         out of the numerator would subtract the worst waits from the ratio \
+         they are the point of"
+    );
+    assert_eq!(
+        metrics.bookmark_waits_off_cell_writer, 1,
+        "the owner/non-owner split is not inferred from a decline: a caller can \
+         present an epoch no node will ever reach, and then the cell's own \
+         writer polls and declines too"
+    );
+
+    drop(owner_service);
+    drop(peer_service);
+    owner.close().await.unwrap();
+    peer.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -5632,7 +9320,9 @@ async fn tcp_query_transport_guarded_batch_uses_a_distinct_wire_operation() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(result, GraphError::UnsupportedQuery { .. }));
+    // The version-one peer sends no failure reason, so its error arrives
+    // unclassified rather than guessed into a query-failure bucket.
+    assert!(matches!(result, GraphError::UnclassifiedQuery { .. }));
     assert_eq!(client.metrics().connections_created, 1);
     assert_eq!(client.metrics().client_retries, 0);
     version_one_server.await.unwrap();
@@ -6842,16 +10532,31 @@ async fn tcp_query_transport_stop_aborts_idle_connections() {
 #[cfg(feature = "query-transport")]
 #[tokio::test]
 async fn tcp_query_transport_applies_server_backpressure_under_load() {
-    struct SlowQueryClient;
+    struct SlowQueryClient {
+        blocker_started: tokio::sync::Notify,
+        release_blocker: tokio::sync::Semaphore,
+        active_started: tokio::sync::Notify,
+        hold_active: std::sync::atomic::AtomicBool,
+    }
 
     #[async_trait::async_trait]
     impl QueryCellClient for SlowQueryClient {
         async fn execute_cypher_rows(
             &self,
-            _context: QueryContext,
+            context: QueryContext,
             _query: &str,
         ) -> Result<QueryResultSet> {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if context.idempotency_key == "query-transport-queue-blocker" {
+                self.blocker_started.notify_one();
+                self.release_blocker.acquire().await.unwrap().forget();
+            } else if context.idempotency_key == "query-transport-cancel-active"
+                && self.hold_active.swap(false, Ordering::SeqCst)
+            {
+                self.active_started.notify_one();
+                context.cancellation_token.unwrap().cancelled().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
             Ok(QueryResultSet::new(
                 vec![QueryColumn::new("v.id")],
                 vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
@@ -6870,9 +10575,15 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
         }
     }
 
+    let query_client = Arc::new(SlowQueryClient {
+        blocker_started: tokio::sync::Notify::new(),
+        release_blocker: tokio::sync::Semaphore::new(0),
+        active_started: tokio::sync::Notify::new(),
+        hold_active: std::sync::atomic::AtomicBool::new(true),
+    });
     let server = TcpQueryServer::bind_with_config(
         "127.0.0.1:0".parse().unwrap(),
-        Arc::new(SlowQueryClient),
+        query_client.clone(),
         QueryTransportServerConfig::default()
             .with_required_bearer_token("secret")
             .insecure_allow_plaintext()
@@ -6913,7 +10624,13 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
             )
             .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        query_client.blocker_started.notified(),
+    )
+    .await
+    .unwrap();
+    let waits_before_queue = server.metrics().backpressure_waits;
     let queued_client = client.clone();
     let queued = tokio::spawn(async move {
         queued_client
@@ -6923,11 +10640,18 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
             )
             .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while server.metrics().backpressure_waits == waits_before_queue {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     client
         .cancel_query("query-transport-cancel-queued")
         .await
         .unwrap();
+    query_client.release_blocker.add_permits(1);
     let retry_after_queued_cancel = client
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "query-transport-cancel-queued"),
@@ -6951,7 +10675,12 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
             )
             .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        query_client.active_started.notified(),
+    )
+    .await
+    .unwrap();
     client
         .cancel_query("query-transport-cancel-active")
         .await
@@ -7289,6 +11018,14 @@ async fn query_property_histogram_stats_refresh_persists_selectivity_records() {
     let vertex_histogram_record =
         read_query_stats_record_for_test(&shard, &vertex_histogram_key).await;
     assert_eq!(vertex_histogram_record, vertex_histogram.stats);
+    let vertex_bloom = vertex_histogram_record.bloom.as_ref().unwrap();
+    assert!(vertex_bloom.may_contain_encoded(&common));
+    assert!(vertex_bloom.may_contain_encoded(&rare));
+    assert!(
+        !vertex_bloom.may_contain_encoded(&encode_vertex_property_value_key(
+            &VertexPropertyValue::String("absent".to_string())
+        ))
+    );
     let rare_key = keys::query_stats_vertex_property("reddit-home", "tier", &rare);
     let rare_record = read_query_stats_record_for_test(&shard, &rare_key).await;
     assert_eq!(rare_record.count, 1);
@@ -7309,6 +11046,14 @@ async fn query_property_histogram_stats_refresh_persists_selectivity_records() {
         keys::query_stats_edge_property_histogram("reddit-home", "FOLLOWS", "weight");
     let edge_histogram_record = read_query_stats_record_for_test(&shard, &edge_histogram_key).await;
     assert_eq!(edge_histogram_record, edge_histogram.stats);
+    let edge_bloom = edge_histogram_record.bloom.as_ref().unwrap();
+    assert!(edge_bloom.may_contain_encoded(&weight_7));
+    assert!(edge_bloom.may_contain_encoded(&weight_9));
+    assert!(
+        !edge_bloom.may_contain_encoded(&encode_vertex_property_value_key(
+            &VertexPropertyValue::Integer(11)
+        ))
+    );
     let weight_9_key =
         keys::query_stats_edge_property("reddit-home", "FOLLOWS", "weight", &weight_9);
     let weight_9_record = read_query_stats_record_for_test(&shard, &weight_9_key).await;
@@ -7940,11 +11685,302 @@ async fn import_vertex_metadata_batch_is_bounded_and_rejects_conflicts() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn relationship_property_delete_batches_durable_commits() {
+    const BATCH_SIZE: u64 = 64;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/relationship-property-delete-batched-commits",
+        object_store,
+    )
+    .await;
+    let relationships = (0..BATCH_SIZE).map(|index| RelationshipMutation {
+        cell_id: "reddit-home".to_string(),
+        edge_type: "RELATES".to_string(),
+        src: index * 2,
+        dst: index * 2 + 1,
+        relationship_id: 10_000 + index,
+        metadata: EdgeMetadata::default().with_property(
+            "chunk_id",
+            VertexPropertyValue::String(format!("chunk-{index}")),
+        ),
+    });
+    shard
+        .import_relationships_batch(
+            "reddit-home",
+            "RELATES",
+            relationships,
+            "relationship-property-delete-batched-import",
+        )
+        .await
+        .unwrap();
+    let before = shard.graph_operational_metrics();
+
+    let deleted = shard
+        .delete_relationships_by_property_values_batch(
+            &QueryContext::new("reddit-home", "relationship-property-delete-batched"),
+            "RELATES",
+            "chunk_id",
+            (0..BATCH_SIZE)
+                .map(|index| VertexPropertyValue::String(format!("chunk-{index}")))
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!((deleted.deleted, deleted.already_deleted), (BATCH_SIZE, 0));
+    assert!(
+        deleted.topology_sequence.is_some(),
+        "deleting the last relationship for each edge changes topology"
+    );
+    let after = shard.graph_operational_metrics();
+    assert_eq!(
+        after.write_commits.saturating_sub(before.write_commits),
+        1,
+        "property deletion must persist replay guards and delete all relationships in one commit"
+    );
+    for index in 0..BATCH_SIZE {
+        assert!(!shard
+            .edge_exists("reddit-home", "RELATES", index * 2, index * 2 + 1)
+            .await
+            .unwrap());
+    }
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn relationship_delete_guards_roll_back_with_failed_deletion() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/atomic-relationship-delete-guards", store).await;
+    let mutation = EdgeMutation {
+        cell_id: "reddit-home".to_string(),
+        edge_type: "RELATES".to_string(),
+        src: 1,
+        dst: 2,
+        idempotency_key: "guarded-delete".to_string(),
+    };
+    let guard = EdgeMutation {
+        idempotency_key: "structural-guard".to_string(),
+        ..mutation.clone()
+    };
+    let guard_key = keys::idempotency("reddit-home", "delete", &guard.idempotency_key);
+    let record_key = keys::relationship("reddit-home", "RELATES", 1, 2, 100);
+    let mut corrupt = WriteBatch::new();
+    corrupt.put(record_key.as_bytes(), b"invalid-relationship".as_slice());
+    shard.write_strict_for_test(corrupt).await.unwrap();
+    let before = shard.current_epoch("reddit-home").await.unwrap();
+    assert!(shard
+        .delete_relationship_mutations_batch_with_guards(
+            "reddit-home",
+            vec![(mutation, 100)],
+            vec![guard],
+        )
+        .await
+        .is_err());
+    assert!(
+        shard.read_remote(&guard_key).await.unwrap().is_none(),
+        "failed deletion must not leave a durable structural replay guard"
+    );
+    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), before);
+    assert!(shard.read_remote(&record_key).await.unwrap().is_some());
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn relationship_delete_batch_rejects_duplicate_replay_keys_atomically() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/duplicate-relationship-delete-key", store).await;
+    shard
+        .import_relationships_batch(
+            "reddit-home",
+            "RELATES",
+            (1..=2).map(|id| RelationshipMutation {
+                cell_id: "reddit-home".into(),
+                edge_type: "RELATES".into(),
+                src: 1,
+                dst: 2,
+                relationship_id: id,
+                metadata: EdgeMetadata::default(),
+            }),
+            "seed",
+        )
+        .await
+        .unwrap();
+    let before = shard.current_epoch("reddit-home").await.unwrap();
+    let mutation = EdgeMutation {
+        cell_id: "reddit-home".into(),
+        edge_type: "RELATES".into(),
+        src: 1,
+        dst: 2,
+        idempotency_key: "same-key".into(),
+    };
+    let error = shard
+        .delete_relationship_mutations_batch_with_topology(
+            "reddit-home",
+            vec![(mutation.clone(), 1), (mutation, 2)],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, GraphError::IdempotencyConflict { .. }));
+    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), before);
+    for id in 1..=2 {
+        assert!(shard
+            .read_remote(&keys::relationship("reddit-home", "RELATES", 1, 2, id))
+            .await
+            .unwrap()
+            .is_some());
+    }
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled before/after deletion queue measurement"]
+async fn relationship_property_delete_queue_benchmark() {
+    const REQUESTS: u64 = 64;
+    const BATCH: u64 = 16;
+    for concurrency in [1, 8] {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = Arc::new(
+            open_test_shard(&format!("graph/delete-queue-bench-{concurrency}"), store).await,
+        );
+        shard
+            .import_relationships_batch(
+                "reddit-home",
+                "RELATES",
+                (0..REQUESTS * BATCH).map(|id| RelationshipMutation {
+                    cell_id: "reddit-home".into(),
+                    edge_type: "RELATES".into(),
+                    src: id * 2,
+                    dst: id * 2 + 1,
+                    relationship_id: id + 1,
+                    metadata: EdgeMetadata::default().with_property(
+                        "chunk_id",
+                        VertexPropertyValue::String(format!("chunk-{}", id / BATCH)),
+                    ),
+                }),
+                "seed",
+            )
+            .await
+            .unwrap();
+        let before = shard.graph_operational_metrics().write_commits;
+        let started = std::time::Instant::now();
+        let mut samples = futures::stream::iter(0..REQUESTS)
+            .map(|id| {
+                let shard = Arc::clone(&shard);
+                async move {
+                    let began = std::time::Instant::now();
+                    let result = shard
+                        .delete_relationships_by_property_values_batch(
+                            &QueryContext::new("reddit-home", format!("delete-{id}")),
+                            "RELATES",
+                            "chunk_id",
+                            vec![VertexPropertyValue::String(format!("chunk-{id}"))],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(result.deleted, BATCH);
+                    began.elapsed().as_micros()
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        let elapsed = started.elapsed();
+        samples.sort_unstable();
+        eprintln!("delete-queue-bench concurrency={concurrency} requests={REQUESTS} batch={BATCH} elapsed_ms={} requests_per_sec={:.2} p50_us={} p95_us={} p99_us={} commits={}",
+            elapsed.as_millis(), REQUESTS as f64 / elapsed.as_secs_f64(), samples[samples.len()/2], samples[(samples.len()*95).div_ceil(100)-1], samples[(samples.len()*99).div_ceil(100)-1],
+            shard.graph_operational_metrics().write_commits - before);
+        for id in 0..REQUESTS * BATCH {
+            assert!(shard
+                .read_remote(&keys::relationship(
+                    "reddit-home",
+                    "RELATES",
+                    id * 2,
+                    id * 2 + 1,
+                    id + 1
+                ))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        shard.close().await.unwrap();
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn segment_backed_relationship_delete_does_not_report_topology_change() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/segment-backed-relationship-delete",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "RELATES";
+    let metadata = EdgeMetadata::default().with_property(
+        "chunk_id",
+        VertexPropertyValue::String("chunk-a".to_string()),
+    );
+
+    shard
+        .bulk_append_out_adjacency_segment_trusted(
+            cell_id,
+            edge_type,
+            1,
+            [2],
+            "segment-backed-relationship-edge",
+        )
+        .await
+        .unwrap();
+    shard
+        .import_relationships_batch(
+            cell_id,
+            edge_type,
+            [RelationshipMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: 100,
+                metadata,
+            }],
+            "segment-backed-relationship-import",
+        )
+        .await
+        .unwrap();
+
+    let deleted = shard
+        .delete_relationships_by_property_values_batch(
+            &QueryContext::new(cell_id, "segment-backed-relationship-delete"),
+            edge_type,
+            "chunk_id",
+            vec![VertexPropertyValue::String("chunk-a".to_string())],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!((deleted.deleted, deleted.already_deleted), (1, 0));
+    assert_eq!(deleted.topology_sequence, None);
+    assert!(shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn relationship_property_delete_retry_does_not_expand_to_recreated_structural_edge() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard(
         "graph/relationship-property-delete-stable-scope",
-        object_store,
+        Arc::clone(&object_store),
     )
     .await;
     let metadata = EdgeMetadata::default().with_property(
@@ -7973,18 +12009,23 @@ async fn relationship_property_delete_retry_does_not_expand_to_recreated_structu
         .unwrap();
 
     let context = QueryContext::new("reddit-home", "relationship-property-delete-stable-scope");
-    assert_eq!(
-        shard
-            .delete_relationships_by_property_values_batch(
-                &context,
-                "RELATES",
-                "chunk_id",
-                vec![VertexPropertyValue::String("chunk-a".to_string())],
-            )
-            .await
-            .unwrap(),
-        (1, 0)
-    );
+    let first_delete = shard
+        .delete_relationships_by_property_values_batch(
+            &context,
+            "RELATES",
+            "chunk_id",
+            vec![VertexPropertyValue::String("chunk-a".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!((first_delete.deleted, first_delete.already_deleted), (1, 0));
+    assert!(first_delete.topology_sequence.is_some());
+    shard.close().await.unwrap();
+    let shard = open_test_shard(
+        "graph/relationship-property-delete-stable-scope",
+        object_store,
+    )
+    .await;
 
     shard
         .write_edge(EdgeMutation {
@@ -8001,18 +12042,16 @@ async fn relationship_property_delete_retry_does_not_expand_to_recreated_structu
         .await
         .unwrap();
 
-    assert_eq!(
-        shard
-            .delete_relationships_by_property_values_batch(
-                &context,
-                "RELATES",
-                "chunk_id",
-                vec![VertexPropertyValue::String("chunk-a".to_string())],
-            )
-            .await
-            .unwrap(),
-        (0, 0)
-    );
+    let replay = shard
+        .delete_relationships_by_property_values_batch(
+            &context,
+            "RELATES",
+            "chunk_id",
+            vec![VertexPropertyValue::String("chunk-a".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, RelationshipDeleteBatchResult::default());
     let structural_retry = shard
         .delete_edge_mutations_batch(
             "reddit-home",
@@ -8163,6 +12202,1602 @@ async fn relationship_merge_batch_preserves_identity_and_updates_at_scale() {
             Some(&VertexPropertyValue::Integer(2))
         );
     }
+
+    shard.close().await.unwrap();
+}
+
+/// MERGE identity resolution must go through the unique `rmerge_idx` pointer:
+/// inserts write it, repeat MERGEs resolve by point get instead of the prefix
+/// scan, data from before the pointer existed heals on first touch, a stale
+/// pointer falls back to the scan and repairs itself, and deleting the
+/// relationship deletes the pointer.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn relationship_merge_identity_pointer_point_gets_and_heals() {
+    const EXTERNAL_ID: u64 = 50_000;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-identity-pointer", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (10_001, VertexMetadata::default().with_label("Chunk")),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let relationship = |rank| {
+        [RelationshipMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "PRESENT_IN".to_string(),
+            src: 1,
+            dst: 10_001,
+            relationship_id: EXTERNAL_ID,
+            metadata: EdgeMetadata::default()
+                .with_property("id", VertexPropertyValue::Integer(EXTERNAL_ID))
+                .with_property("rank", VertexPropertyValue::Integer(rank)),
+        }]
+    };
+    let merge = |mutations, idempotency_key: &'static str| {
+        shard.merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "PRESENT_IN",
+            mutations,
+            idempotency_key,
+            ("Entity", "Chunk"),
+            None,
+        )
+    };
+    let pointer_key = keys::relationship_merge_index(
+        "reddit-home",
+        "PRESENT_IN",
+        "id",
+        &encode_vertex_property_value_key(&VertexPropertyValue::Integer(EXTERNAL_ID)),
+        1,
+        10_001,
+    );
+
+    // The insert writes the pointer alongside the property index, and the
+    // lookup that preceded it is the one legitimate miss.
+    let inserted = merge(relationship(1), "identity-pointer-insert")
+        .await
+        .unwrap();
+    assert_eq!(inserted.relationships_inserted, 1);
+    let pointer = shard
+        .read_remote(&pointer_key)
+        .await
+        .unwrap()
+        .expect("relationship insert must write the identity pointer");
+    let internal_id = decode_u64(&pointer_key, &pointer).unwrap();
+    let metrics = shard.graph_operational_metrics();
+    assert_eq!(metrics.relationship_import_identity_pointer_hits, 0);
+    assert_eq!(metrics.relationship_import_identity_pointer_misses, 1);
+
+    // A repeat MERGE resolves by point get alone.
+    let unchanged = merge(relationship(1), "identity-pointer-unchanged")
+        .await
+        .unwrap();
+    assert_eq!(unchanged.relationships_inserted, 0);
+    assert_eq!(unchanged.relationships_already_existed, 1);
+    let metrics = shard.graph_operational_metrics();
+    assert_eq!(metrics.relationship_import_identity_pointer_hits, 1);
+    assert_eq!(metrics.relationship_import_identity_pointer_misses, 1);
+
+    // Data written before the pointer existed: delete the pointer to recreate
+    // that state. The next MERGE falls back to the prefix scan, resolves the
+    // same relationship, and heals the pointer — no backfill.
+    let txn = shard
+        .db
+        .writer()
+        .unwrap()
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    txn.delete(pointer_key.as_bytes()).unwrap();
+    commit_txn_strict(txn, true).await.unwrap();
+    let healed = merge(relationship(2), "identity-pointer-heal")
+        .await
+        .unwrap();
+    assert_eq!(healed.relationships_inserted, 0);
+    assert_eq!(healed.relationships_already_existed, 1);
+    let pointer = shard
+        .read_remote(&pointer_key)
+        .await
+        .unwrap()
+        .expect("a scan fallback must heal the identity pointer");
+    assert_eq!(decode_u64(&pointer_key, &pointer).unwrap(), internal_id);
+    let metrics = shard.graph_operational_metrics();
+    assert_eq!(metrics.relationship_import_identity_pointer_hits, 1);
+    assert_eq!(metrics.relationship_import_identity_pointer_misses, 2);
+
+    // A stale pointer naming a dead record is not trusted: the scan fallback
+    // resolves the live relationship and rewrites the pointer.
+    let txn = shard
+        .db
+        .writer()
+        .unwrap()
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    txn.put(pointer_key.as_bytes(), encode_u64(9_999).as_slice())
+        .unwrap();
+    commit_txn_strict(txn, true).await.unwrap();
+    let repaired = merge(relationship(3), "identity-pointer-stale")
+        .await
+        .unwrap();
+    assert_eq!(repaired.relationships_inserted, 0);
+    assert_eq!(repaired.relationships_already_existed, 1);
+    let pointer = shard
+        .read_remote(&pointer_key)
+        .await
+        .unwrap()
+        .expect("a stale pointer must be repaired, not deleted");
+    assert_eq!(decode_u64(&pointer_key, &pointer).unwrap(), internal_id);
+
+    // Deleting the relationship deletes the pointer with it — through the
+    // batch path, which is a separate call site from `delete_relationship`
+    // and maintains the indexes with its own hook invocation.
+    let (deleted, _already) = shard
+        .delete_relationship_mutations_batch(
+            "reddit-home",
+            vec![(
+                EdgeMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "PRESENT_IN".to_string(),
+                    src: 1,
+                    dst: 10_001,
+                    idempotency_key: "identity-pointer-batch-delete".to_string(),
+                },
+                internal_id,
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert!(
+        shard.read_remote(&pointer_key).await.unwrap().is_none(),
+        "batch relationship delete must delete the identity pointer"
+    );
+
+    // Re-create through the single-row delete path as well, so both delete
+    // call sites are covered rather than assumed equivalent.
+    merge(relationship(5), "identity-pointer-recreate")
+        .await
+        .unwrap();
+    let recreated_id = decode_u64(
+        &pointer_key,
+        &shard.read_remote(&pointer_key).await.unwrap().unwrap(),
+    )
+    .unwrap();
+    shard
+        .delete_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "PRESENT_IN".to_string(),
+                src: 1,
+                dst: 10_001,
+                idempotency_key: "identity-pointer-delete".to_string(),
+            },
+            recreated_id,
+        )
+        .await
+        .unwrap();
+    assert!(
+        shard.read_remote(&pointer_key).await.unwrap().is_none(),
+        "relationship delete must delete the identity pointer"
+    );
+    let report = shard
+        .verify_current_graph("reddit-home", "PRESENT_IN", 2, 8)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+
+    shard.close().await.unwrap();
+}
+
+/// `DETACH DELETE` reaches relationships through the structural-edge
+/// cascade rather than either relationship-delete entry point, so the
+/// pointer's removal there rests on a different hook invocation. A pointer
+/// left behind would outlive its relationship entirely.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn detach_delete_vertex_cascade_removes_identity_pointers() {
+    const EXTERNAL_ID: u64 = 50_000;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-pointer-detach", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (10_001, VertexMetadata::default().with_label("Chunk")),
+            ],
+        )
+        .await
+        .unwrap();
+    shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "PRESENT_IN",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "PRESENT_IN".to_string(),
+                src: 1,
+                dst: 10_001,
+                relationship_id: EXTERNAL_ID,
+                metadata: EdgeMetadata::default()
+                    .with_property("id", VertexPropertyValue::Integer(EXTERNAL_ID)),
+            }],
+            "pointer-detach-insert",
+            ("Entity", "Chunk"),
+            None,
+        )
+        .await
+        .unwrap();
+    let pointer_key = keys::relationship_merge_index(
+        "reddit-home",
+        "PRESENT_IN",
+        "id",
+        &encode_vertex_property_value_key(&VertexPropertyValue::Integer(EXTERNAL_ID)),
+        1,
+        10_001,
+    );
+    assert!(shard.read_remote(&pointer_key).await.unwrap().is_some());
+
+    shard
+        .detach_delete_vertex("reddit-home", 1, "pointer-detach-delete")
+        .await
+        .unwrap();
+    assert!(
+        shard.read_remote(&pointer_key).await.unwrap().is_none(),
+        "the detach-delete cascade must remove the identity pointer with its relationship"
+    );
+    let report = shard
+        .verify_current_graph("reddit-home", "PRESENT_IN", 2, 8)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+
+    shard.close().await.unwrap();
+}
+
+/// The pointer must survive the write paths that mutate a relationship it
+/// already points at, and must be cleared by the ones that could invalidate
+/// it. An updating MERGE is the sharp case: its own index hooks delete the
+/// pointer (they cannot know the identity is still unique), so only the
+/// deferred write restores it — without that, every property update would
+/// silently drop the pointer and the next MERGE would fall back to a scan.
+/// `set_relationship_metadata` is the opposite case: it must invalidate,
+/// because it can change the identity property itself.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn relationship_merge_identity_pointer_survives_updates_and_yields_to_set() {
+    const EXTERNAL_ID: u64 = 50_000;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-pointer-updates", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (10_001, VertexMetadata::default().with_label("Chunk")),
+            ],
+        )
+        .await
+        .unwrap();
+    let relationship = |rank: u64| {
+        [RelationshipMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "PRESENT_IN".to_string(),
+            src: 1,
+            dst: 10_001,
+            relationship_id: EXTERNAL_ID,
+            metadata: EdgeMetadata::default()
+                .with_property("id", VertexPropertyValue::Integer(EXTERNAL_ID))
+                .with_property("rank", VertexPropertyValue::Integer(rank)),
+        }]
+    };
+    let merge = |mutations, idempotency_key: &'static str| {
+        shard.merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "PRESENT_IN",
+            mutations,
+            idempotency_key,
+            ("Entity", "Chunk"),
+            None,
+        )
+    };
+    let pointer_key = keys::relationship_merge_index(
+        "reddit-home",
+        "PRESENT_IN",
+        "id",
+        &encode_vertex_property_value_key(&VertexPropertyValue::Integer(EXTERNAL_ID)),
+        1,
+        10_001,
+    );
+
+    merge(relationship(1), "pointer-update-insert")
+        .await
+        .unwrap();
+    let internal_id = decode_u64(
+        &pointer_key,
+        &shard.read_remote(&pointer_key).await.unwrap().unwrap(),
+    )
+    .unwrap();
+
+    // A MERGE that resolves by pointer *and* changes a property: the update
+    // loop's hooks delete the pointer, the deferred write must put it back.
+    let updated = merge(relationship(2), "pointer-update-changes-rank")
+        .await
+        .unwrap();
+    assert_eq!(updated.relationships_already_existed, 1);
+    let metrics = shard.graph_operational_metrics();
+    assert_eq!(metrics.relationship_import_identity_pointer_hits, 1);
+    assert_eq!(
+        decode_u64(
+            &pointer_key,
+            &shard
+                .read_remote(&pointer_key)
+                .await
+                .unwrap()
+                .expect("an updating MERGE must not drop the pointer it resolved by"),
+        )
+        .unwrap(),
+        internal_id
+    );
+
+    // Proof the restored pointer is usable, not merely present: the next
+    // MERGE resolves by point get, with no new scan fallback.
+    merge(relationship(3), "pointer-update-again")
+        .await
+        .unwrap();
+    let metrics = shard.graph_operational_metrics();
+    assert_eq!(metrics.relationship_import_identity_pointer_hits, 2);
+    assert_eq!(metrics.relationship_import_identity_pointer_misses, 1);
+
+    // `set_relationship_metadata` can rewrite the identity property itself,
+    // so it must invalidate rather than preserve. The relationship survives;
+    // only the accelerator key goes, and the next MERGE heals it.
+    assert!(shard
+        .set_relationship_metadata(
+            "reddit-home",
+            "PRESENT_IN",
+            1,
+            10_001,
+            internal_id,
+            EdgeMetadata::default()
+                .with_property("id", VertexPropertyValue::Integer(EXTERNAL_ID))
+                .with_property("rank", VertexPropertyValue::Integer(99)),
+        )
+        .await
+        .unwrap());
+    assert!(
+        shard.read_remote(&pointer_key).await.unwrap().is_none(),
+        "set_relationship_metadata must invalidate the identity pointer"
+    );
+    let healed = merge(relationship(4), "pointer-update-after-set")
+        .await
+        .unwrap();
+    assert_eq!(healed.relationships_already_existed, 1);
+    assert_eq!(
+        decode_u64(
+            &pointer_key,
+            &shard.read_remote(&pointer_key).await.unwrap().unwrap(),
+        )
+        .unwrap(),
+        internal_id,
+        "the next MERGE must heal the pointer the SET invalidated"
+    );
+    let report = shard
+        .verify_current_graph("reddit-home", "PRESENT_IN", 2, 8)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn relationship_merge_match_skips_unmatched_endpoints_and_replays_first_result() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-match-endpoints", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (2, VertexMetadata::default().with_label("Entity")),
+                (3, VertexMetadata::default().with_label("Chunk")),
+            ],
+        )
+        .await
+        .unwrap();
+    let relationship = |dst: VertexId, external_id: RelationshipId| RelationshipMutation {
+        cell_id: "reddit-home".to_string(),
+        edge_type: "ALIAS_OF".to_string(),
+        src: 1,
+        dst,
+        relationship_id: external_id,
+        metadata: EdgeMetadata::default()
+            .with_property("id", VertexPropertyValue::Integer(external_id)),
+    };
+    let requested = vec![
+        relationship(2, 100),
+        relationship(99, 101),
+        relationship(3, 102),
+    ];
+
+    let inserted = shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "ALIAS_OF",
+            requested.clone(),
+            "match-endpoints",
+            ("Entity", "Entity"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(inserted.relationships_inserted, 1);
+    assert!(shard
+        .edge_exists("reddit-home", "ALIAS_OF", 1, 2)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "ALIAS_OF", 1, 99)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "ALIAS_OF", 1, 3)
+        .await
+        .unwrap());
+
+    shard
+        .detach_delete_vertex("reddit-home", 2, "delete-matched-endpoint")
+        .await
+        .unwrap();
+    let replayed = shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "ALIAS_OF",
+            requested,
+            "match-endpoints",
+            ("Entity", "Entity"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.relationships_inserted,
+        inserted.relationships_inserted
+    );
+    assert_eq!(replayed.start_epoch, inserted.start_epoch);
+    assert_eq!(replayed.end_epoch, inserted.end_epoch);
+
+    shard.close().await.unwrap();
+}
+
+/// The pointer is a cache of a proof, never an authority. A pointer whose
+/// value does not decode, or whose live target carries a different identity,
+/// must not fail the batch and must not be believed — the scan resolves the
+/// row and its answer replaces the pointer.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn relationship_merge_identity_pointer_distrusts_bad_pointers() {
+    const EXTERNAL_ID: u64 = 50_000;
+    const OTHER_ID: u64 = 60_000;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-pointer-distrust", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (10_001, VertexMetadata::default().with_label("Chunk")),
+            ],
+        )
+        .await
+        .unwrap();
+    let relationship = |external_id: u64, rank: u64| {
+        [RelationshipMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "PRESENT_IN".to_string(),
+            src: 1,
+            dst: 10_001,
+            relationship_id: external_id,
+            metadata: EdgeMetadata::default()
+                .with_property("id", VertexPropertyValue::Integer(external_id))
+                .with_property("rank", VertexPropertyValue::Integer(rank)),
+        }]
+    };
+    let merge = |mutations, idempotency_key: &'static str| {
+        shard.merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "PRESENT_IN",
+            mutations,
+            idempotency_key,
+            ("Entity", "Chunk"),
+            None,
+        )
+    };
+    let pointer_key_for = |external_id: u64| {
+        keys::relationship_merge_index(
+            "reddit-home",
+            "PRESENT_IN",
+            "id",
+            &encode_vertex_property_value_key(&VertexPropertyValue::Integer(external_id)),
+            1,
+            10_001,
+        )
+    };
+
+    let inserted = merge(relationship(EXTERNAL_ID, 1), "pointer-distrust-insert")
+        .await
+        .unwrap();
+    assert_eq!(inserted.relationships_inserted, 1);
+    let pointer_key = pointer_key_for(EXTERNAL_ID);
+    let internal_id = decode_u64(
+        &pointer_key,
+        &shard.read_remote(&pointer_key).await.unwrap().unwrap(),
+    )
+    .unwrap();
+
+    // An undecodable pointer value falls back to the scan and is repaired,
+    // instead of surfacing CorruptValue and wedging the identity.
+    let txn = shard
+        .db
+        .writer()
+        .unwrap()
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    txn.put(pointer_key.as_bytes(), b"junk".as_slice()).unwrap();
+    commit_txn_strict(txn, true).await.unwrap();
+    let healed = merge(relationship(EXTERNAL_ID, 2), "pointer-distrust-corrupt")
+        .await
+        .unwrap();
+    assert_eq!(healed.relationships_inserted, 0);
+    assert_eq!(healed.relationships_already_existed, 1);
+    assert_eq!(
+        decode_u64(
+            &pointer_key,
+            &shard.read_remote(&pointer_key).await.unwrap().unwrap(),
+        )
+        .unwrap(),
+        internal_id,
+        "a corrupt pointer must be repaired from the scan's answer"
+    );
+
+    // A pointer whose live target carries a *different* identity must not be
+    // believed: MERGE on OTHER_ID must not touch the EXTERNAL_ID row.
+    let txn = shard
+        .db
+        .writer()
+        .unwrap()
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    txn.put(
+        pointer_key_for(OTHER_ID).as_bytes(),
+        encode_u64(internal_id).as_slice(),
+    )
+    .unwrap();
+    commit_txn_strict(txn, true).await.unwrap();
+    let separated = merge(relationship(OTHER_ID, 9), "pointer-distrust-wrong-target")
+        .await
+        .unwrap();
+    assert_eq!(
+        separated.relationships_inserted, 1,
+        "a wrong-target pointer must not turn a distinct identity into a match"
+    );
+    let original_key = keys::relationship("reddit-home", "PRESENT_IN", 1, 10_001, internal_id);
+    let original = decode_relationship_record(
+        &original_key,
+        &shard.read_remote(&original_key).await.unwrap().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        original.metadata.properties.get("id"),
+        Some(&VertexPropertyValue::Integer(EXTERNAL_ID)),
+        "the original relationship must be untouched by the misdirected MERGE"
+    );
+    let other_pointer = shard
+        .read_remote(&pointer_key_for(OTHER_ID))
+        .await
+        .unwrap()
+        .expect("the wrong-target pointer must be replaced, not left behind");
+    assert_ne!(
+        decode_u64(&pointer_key_for(OTHER_ID), &other_pointer).unwrap(),
+        internal_id
+    );
+
+    shard.close().await.unwrap();
+}
+
+/// Rewriting a relationship's identity with `SET` must strand no pointer.
+///
+/// `set_relationship_metadata` is the one path that can change the value the
+/// pointer is keyed by, so it has to invalidate *both* identities: the old
+/// one (whose pointer would otherwise name a row that no longer carries it)
+/// and the new one (whose pointer, if any, predates this row). The index
+/// hooks do exactly that, because the delete hook runs with the previous
+/// metadata and the put hook with the new record.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn setting_a_new_relationship_identity_strands_no_pointer() {
+    const OLD_ID: u64 = 50_000;
+    const NEW_ID: u64 = 60_000;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-pointer-reidentify", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (2, VertexMetadata::default().with_label("Entity")),
+            ],
+        )
+        .await
+        .unwrap();
+    shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "RELATES",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "RELATES".to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: OLD_ID,
+                metadata: EdgeMetadata::default()
+                    .with_property("id", VertexPropertyValue::Integer(OLD_ID)),
+            }],
+            "reidentify-insert",
+            ("Entity", "Entity"),
+            None,
+        )
+        .await
+        .unwrap();
+    let pointer_for = |identity: u64| {
+        keys::relationship_merge_index(
+            "reddit-home",
+            "RELATES",
+            "id",
+            &encode_vertex_property_value_key(&VertexPropertyValue::Integer(identity)),
+            1,
+            2,
+        )
+    };
+    let internal_id = decode_u64(
+        &pointer_for(OLD_ID),
+        &shard
+            .read_remote(&pointer_for(OLD_ID))
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Rewrite the identity property itself.
+    assert!(shard
+        .set_relationship_metadata(
+            "reddit-home",
+            "RELATES",
+            1,
+            2,
+            internal_id,
+            EdgeMetadata::default().with_property("id", VertexPropertyValue::Integer(NEW_ID)),
+        )
+        .await
+        .unwrap());
+    assert!(
+        shard
+            .read_remote(&pointer_for(OLD_ID))
+            .await
+            .unwrap()
+            .is_none(),
+        "the old identity's pointer must not survive a SET that rewrote it"
+    );
+    assert!(
+        shard
+            .read_remote(&pointer_for(NEW_ID))
+            .await
+            .unwrap()
+            .is_none(),
+        "the new identity must not inherit a pointer it never earned"
+    );
+
+    // The row still resolves correctly under its new identity, by scan, and
+    // earns a pointer for it.
+    let merged = shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "RELATES",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "RELATES".to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: NEW_ID,
+                metadata: EdgeMetadata::default()
+                    .with_property("id", VertexPropertyValue::Integer(NEW_ID)),
+            }],
+            "reidentify-remerge",
+            ("Entity", "Entity"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.relationships_already_existed, 1,
+        "the re-identified row must be matched by its new identity, not duplicated"
+    );
+    assert_eq!(
+        decode_u64(
+            &pointer_for(NEW_ID),
+            &shard
+                .read_remote(&pointer_for(NEW_ID))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap(),
+        internal_id
+    );
+    let report = shard
+        .verify_current_graph("reddit-home", "RELATES", 2, 8)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+
+    shard.close().await.unwrap();
+}
+
+/// Many parallel relationships between the same pair, each with its own
+/// identity, all keep their own pointer and all resolve by point get.
+///
+/// The pointer key carries the encoded identity value, so it is one pointer
+/// *per identity*, not one per `(src, dst)`. A node pair with 200 distinct
+/// relationships therefore gets 200 pointers and 200 point gets — the
+/// multigraph shape is fully accelerated. Only a *duplicated* identity value
+/// gives up its pointer, and only that value; its siblings are unaffected.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn parallel_relationships_with_distinct_identities_each_keep_a_pointer() {
+    const PARALLEL: u64 = 25;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-pointer-distinct", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (2, VertexMetadata::default().with_label("Entity")),
+            ],
+        )
+        .await
+        .unwrap();
+    // Every row is a distinct relationship between the same node pair.
+    let rows = |rank: u64| {
+        (0..PARALLEL).map(move |index| RelationshipMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "RELATES".to_string(),
+            src: 1,
+            dst: 2,
+            relationship_id: 900 + index,
+            metadata: EdgeMetadata::default()
+                .with_property("id", VertexPropertyValue::Integer(900 + index))
+                .with_property("rank", VertexPropertyValue::Integer(rank)),
+        })
+    };
+    let merge = |rank, idempotency_key: &'static str| {
+        shard.merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "RELATES",
+            rows(rank),
+            idempotency_key,
+            ("Entity", "Entity"),
+            None,
+        )
+    };
+
+    let inserted = merge(1, "distinct-identities-insert").await.unwrap();
+    assert_eq!(inserted.relationships_inserted, PARALLEL);
+
+    // One pointer per identity, all present.
+    for index in 0..PARALLEL {
+        let pointer_key = keys::relationship_merge_index(
+            "reddit-home",
+            "RELATES",
+            "id",
+            &encode_vertex_property_value_key(&VertexPropertyValue::Integer(900 + index)),
+            1,
+            2,
+        );
+        assert!(
+            shard.read_remote(&pointer_key).await.unwrap().is_some(),
+            "identity {} between the same pair must keep its own pointer",
+            900 + index
+        );
+    }
+
+    // And every one of them resolves by point get, with no scan fallback.
+    let before = shard.graph_operational_metrics();
+    let before_scans = shard.graph_storage_metrics().scan_requests;
+    let updated = merge(2, "distinct-identities-remerge").await.unwrap();
+    assert_eq!(updated.relationships_already_existed, PARALLEL);
+    let after = shard.graph_operational_metrics();
+    assert_eq!(
+        after.relationship_import_identity_pointer_hits
+            - before.relationship_import_identity_pointer_hits,
+        PARALLEL,
+        "every distinct identity must resolve by pointer"
+    );
+    assert_eq!(
+        after.relationship_import_identity_pointer_misses
+            - before.relationship_import_identity_pointer_misses,
+        0
+    );
+    assert_eq!(
+        shard.graph_storage_metrics().scan_requests,
+        before_scans,
+        "a fully pointered multigraph edge must issue no prefix scans"
+    );
+    let report = shard
+        .verify_current_graph("reddit-home", "RELATES", 2, 8)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    assert_eq!(report.relationship_merge_indexes, PARALLEL);
+
+    shard.close().await.unwrap();
+}
+
+/// The verifier must catch every way a *present* pointer can violate its
+/// invariant — dangling target, ambiguous identity, wrong target — while
+/// treating a missing pointer as normal (heal-on-read earns them lazily).
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn graph_verifier_flags_bad_merge_pointers() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/verify-merge-pointers", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (2, VertexMetadata::default().with_label("Entity")),
+            ],
+        )
+        .await
+        .unwrap();
+    shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "RELATES",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "RELATES".to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: 500,
+                metadata: EdgeMetadata::default()
+                    .with_property("id", VertexPropertyValue::Integer(500)),
+            }],
+            "verify-pointers-merge",
+            ("Entity", "Entity"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // A healthy pointer, earned by the MERGE above, verifies clean.
+    let report = shard
+        .verify_current_graph("reddit-home", "RELATES", 2, 8)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    assert_eq!(report.relationship_merge_indexes, 1);
+
+    // Plant the two violations a present pointer can commit against a live
+    // scope: naming a relationship that does not exist, and naming the wrong
+    // relationship for its identity.
+    let encoded = |id: u64| encode_vertex_property_value_key(&VertexPropertyValue::Integer(id));
+    let txn = shard
+        .db
+        .writer()
+        .unwrap()
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    txn.put(
+        keys::relationship_merge_index("reddit-home", "RELATES", "id", &encoded(999), 1, 2)
+            .as_bytes(),
+        encode_u64(777).as_slice(),
+    )
+    .unwrap();
+    txn.put(
+        keys::relationship_merge_index("reddit-home", "RELATES", "id", &encoded(500), 1, 2)
+            .as_bytes(),
+        encode_u64(777).as_slice(),
+    )
+    .unwrap();
+    commit_txn_strict(txn, true).await.unwrap();
+
+    let report = shard
+        .verify_current_graph("reddit-home", "RELATES", 2, 8)
+        .await
+        .unwrap();
+    assert!(!report.is_clean());
+    assert!(
+        report
+            .mismatch_samples
+            .iter()
+            .any(|sample| sample.contains("relationship_merge_index:dangling")),
+        "{:?}",
+        report.mismatch_samples
+    );
+    assert!(
+        report
+            .mismatch_samples
+            .iter()
+            .any(|sample| sample.contains("relationship_merge_index:wrong-target")),
+        "{:?}",
+        report.mismatch_samples
+    );
+
+    shard.close().await.unwrap();
+}
+
+/// Parallel relationships may legitimately share an identity value, and MERGE
+/// updates every one of them. The pointer must never shadow that: plain
+/// imports invalidate it, an ambiguous MERGE matches all rows through the
+/// scan and leaves no pointer behind.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn relationship_merge_identity_pointer_yields_to_parallel_relationships() {
+    const SHARED_ID: u64 = 777;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-pointer-multigraph", object_store).await;
+    shard
+        .import_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (1, VertexMetadata::default().with_label("Entity")),
+                (2, VertexMetadata::default().with_label("Entity")),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Two parallel relationships share the identity value, written through
+    // the plain import path (no MERGE involved).
+    let parallel = |relationship_id, weight| RelationshipMutation {
+        cell_id: "reddit-home".to_string(),
+        edge_type: "RELATES".to_string(),
+        src: 1,
+        dst: 2,
+        relationship_id,
+        metadata: EdgeMetadata::default()
+            .with_property("id", VertexPropertyValue::Integer(SHARED_ID))
+            .with_property("weight", VertexPropertyValue::Integer(weight)),
+    };
+    let imported = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "RELATES",
+            [parallel(200, 1), parallel(201, 2)],
+            "pointer-multigraph-import",
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported.relationships_inserted, 2);
+    let pointer_key = keys::relationship_merge_index(
+        "reddit-home",
+        "RELATES",
+        "id",
+        &encode_vertex_property_value_key(&VertexPropertyValue::Integer(SHARED_ID)),
+        1,
+        2,
+    );
+    assert!(
+        shard.read_remote(&pointer_key).await.unwrap().is_none(),
+        "a plain import must not leave an identity pointer behind"
+    );
+
+    // MERGE on the shared identity must update both rows via the scan.
+    let merged = shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "RELATES",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "RELATES".to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: SHARED_ID,
+                metadata: EdgeMetadata::default()
+                    .with_property("id", VertexPropertyValue::Integer(SHARED_ID))
+                    .with_property("replayed", VertexPropertyValue::Bool(true)),
+            }],
+            "pointer-multigraph-merge",
+            ("Entity", "Entity"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(merged.relationships_already_existed, 2);
+    for relationship_id in [200, 201] {
+        let key = keys::relationship("reddit-home", "RELATES", 1, 2, relationship_id);
+        let record =
+            decode_relationship_record(&key, &shard.read_remote(&key).await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(
+            record.metadata.properties.get("replayed"),
+            Some(&VertexPropertyValue::Bool(true)),
+            "MERGE must update every parallel relationship sharing the identity"
+        );
+    }
+    assert!(
+        shard.read_remote(&pointer_key).await.unwrap().is_none(),
+        "an ambiguous identity must keep no pointer"
+    );
+
+    // And if a pointer for the shared identity ever appears anyway, the
+    // verifier must call it out as the invariant violation it is.
+    let txn = shard
+        .db
+        .writer()
+        .unwrap()
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    txn.put(pointer_key.as_bytes(), encode_u64(200).as_slice())
+        .unwrap();
+    commit_txn_strict(txn, true).await.unwrap();
+    let report = shard
+        .verify_current_graph("reddit-home", "RELATES", 2, 8)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .mismatch_samples
+            .iter()
+            .any(|sample| sample.contains("relationship_merge_index:ambiguous-identity")),
+        "{:?}",
+        report.mismatch_samples
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+fn bench_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Sorted-sample percentile in microseconds.
+#[cfg(feature = "opencypher")]
+fn bench_percentile(sorted_micros: &[u128], percentile: f64) -> u128 {
+    if sorted_micros.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted_micros.len() as f64 - 1.0) * percentile).round() as usize;
+    sorted_micros[rank.min(sorted_micros.len() - 1)]
+}
+
+/// The concurrency ramp from the original PRO-1541 measurement: N clients
+/// writing into **one scope**, sweeping 1 → 4 → 8, reporting throughput and
+/// batch p50.
+///
+/// That ramp found a per-scope wall — +700% clients bought +13% throughput
+/// and 7x the latency — because a scope has a single writer lane, so
+/// concurrent clients queue rather than parallelise. You cannot scale out of
+/// per-row cost; the only way through the wall is to make each row cheaper.
+/// Identity resolution is per-row cost, so this is the ramp that says whether
+/// the pointer moves the wall.
+///
+/// Clients write disjoint row ranges of the same scope so they contend on the
+/// writer lane without conflicting on rows. Every level re-MERGEs already
+/// resolved rows, which is the steady state the wall was measured in. Per
+/// phase attribution is printed beside the ramp so a flat result can be
+/// attributed rather than merely reported. Run with `--ignored --nocapture`;
+/// set `HYDRADB_BENCH_OBJECT_ENV` to measure against real object storage,
+/// which is the only place these numbers mean anything.
+#[cfg(feature = "opencypher")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "benchmark harness; run with --ignored --nocapture"]
+async fn bench_merge_client_concurrency_ramp() {
+    let tenants = bench_env_u64("HYDRADB_BENCH_CLIENTS", 8);
+    let rows_per_tenant = bench_env_u64("HYDRADB_BENCH_ROWS", 1_000);
+    let batch_size = bench_env_u64("HYDRADB_BENCH_BATCH", 250);
+    let levels: Vec<u64> = std::env::var("HYDRADB_BENCH_LEVELS")
+        .unwrap_or_else(|_| "1,4,8".to_string())
+        .split(',')
+        .filter_map(|value| value.trim().parse().ok())
+        .filter(|level| *level > 0 && *level <= tenants)
+        .collect();
+    let batches = rows_per_tenant / batch_size;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let (object_store, store_label): (Arc<dyn ObjectStore>, String) =
+        match std::env::var("HYDRADB_BENCH_OBJECT_ENV") {
+            Ok(env_file) => (
+                object_store_from_env(Some(env_file.clone())).unwrap(),
+                format!("env:{env_file}"),
+            ),
+            Err(_) => (
+                Arc::new(LocalFileSystem::new_with_prefix(tempdir.path()).unwrap()),
+                "local".to_string(),
+            ),
+        };
+    let db_path = std::env::var("HYDRADB_BENCH_DB_PATH")
+        .unwrap_or_else(|_| "graph/bench-multi-tenant".to_string());
+    // `graph-node` deploys `GraphBackpressurePolicy::default()`, whose
+    // `max_concurrent_graph_writes` is 1: every relationship write on a node
+    // serialises through one permit no matter how many tenants are active.
+    // Default to that, because it is what production does, but allow raising
+    // it so the parallel-writer regime can be measured too.
+    let write_permits =
+        usize::try_from(bench_env_u64("HYDRADB_BENCH_WRITE_PERMITS", 1)).unwrap_or(1);
+    let options = GraphOpenOptions {
+        backpressure_policy: GraphBackpressurePolicy {
+            max_concurrent_graph_writes: write_permits,
+            ..GraphBackpressurePolicy::default()
+        },
+        ..GraphOpenOptions::default()
+    };
+    println!(
+        "store {store_label}  path {db_path}\n\
+         {tenants} clients x {rows_per_tenant} rows ({batches} batches of {batch_size}), \
+         sweep {levels:?}, write permits {write_permits}"
+    );
+    let shard =
+        GraphShard::open_standalone_writer_with_options(db_path.as_str(), object_store, options)
+            .await
+            .unwrap();
+
+    // One scope, as in the original ramp: every client shares the cell, so
+    // they queue on its single writer lane. Each client owns a disjoint row
+    // range, so the contention measured is the lane, not row conflicts.
+    let cell = "bench-scope".to_string();
+    let cell_of = |_client: u64| cell.clone();
+    let row_of = |client: u64, row: u64| client * rows_per_tenant + row;
+    let relationship = |client: u64, row: u64| {
+        let row = row_of(client, row);
+        let external_id = 1_000_000 + row;
+        RelationshipMutation {
+            cell_id: cell.clone(),
+            edge_type: "PRESENT_IN".to_string(),
+            src: (row % 2_000) + 1,
+            dst: (row % 2_000) + 100_001,
+            relationship_id: external_id,
+            metadata: EdgeMetadata::default()
+                .with_property("id", VertexPropertyValue::Integer(external_id))
+                .with_property("rank", VertexPropertyValue::Integer(row % 7)),
+        }
+    };
+    {
+        let vertices = (0..2_000_u64).flat_map(|index| {
+            [
+                (index + 1, VertexMetadata::default().with_label("Entity")),
+                (
+                    index + 100_001,
+                    VertexMetadata::default().with_label("Chunk"),
+                ),
+            ]
+        });
+        shard
+            .import_vertex_metadata_batch(&cell, vertices)
+            .await
+            .unwrap();
+    }
+    let flush_memtable = || {
+        let shard = &shard;
+        async move {
+            shard
+                .db
+                .writer()
+                .unwrap()
+                .flush_with_options(slatedb::config::FlushOptions {
+                    flush_type: slatedb::config::FlushType::MemTable,
+                })
+                .await
+                .unwrap();
+        }
+    };
+    // One tenant's pass over its own rows, returning per-batch latencies.
+    let tenant_pass = |tenant: u64, tag: String| {
+        let shard = &shard;
+        async move {
+            let mut latencies = Vec::with_capacity(batches as usize);
+            for batch in 0..batches {
+                let rows = (batch * batch_size..(batch + 1) * batch_size)
+                    .map(|row| relationship(tenant, row));
+                let started = std::time::Instant::now();
+                shard
+                    .merge_relationships_batch_between_labeled_vertices(
+                        &cell_of(tenant),
+                        "PRESENT_IN",
+                        rows,
+                        &format!("bench-{tag}-{tenant}-{batch}"),
+                        ("Entity", "Chunk"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                latencies.push(started.elapsed().as_micros());
+            }
+            latencies
+        }
+    };
+
+    // Insert in rounds so every tenant contributes to each flush: this is the
+    // multi-tenant version of ingest outrunning compaction, and it is applied
+    // identically regardless of which build is measuring.
+    let insert_started = std::time::Instant::now();
+    for batch in 0..batches {
+        let round = (0..tenants).map(|tenant| {
+            let shard = &shard;
+            async move {
+                let rows = (batch * batch_size..(batch + 1) * batch_size)
+                    .map(|row| relationship(tenant, row));
+                shard
+                    .merge_relationships_batch_between_labeled_vertices(
+                        &cell_of(tenant),
+                        "PRESENT_IN",
+                        rows,
+                        &format!("bench-insert-{tenant}-{batch}"),
+                        ("Entity", "Chunk"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        futures::future::join_all(round).await;
+        flush_memtable().await;
+    }
+    println!(
+        "insert   {tenants} clients  wall {:>7.2?}  l0_sst_count {}",
+        insert_started.elapsed(),
+        shard.graph_storage_metrics().l0_sst_count
+    );
+
+    // Equalise cache and pointer state before measuring: on the pointer build
+    // this pass heals, on main it is simply another scan pass. Discarded.
+    futures::future::join_all(
+        (0..tenants).map(|tenant| tenant_pass(tenant, format!("warm{tenant}"))),
+    )
+    .await;
+    flush_memtable().await;
+
+    println!(
+        "{:<7} {:>10} {:>10} {:>10} {:>10} {:>8} {:>9} {:>9} {:>9} {:>9}",
+        "clients",
+        "wall",
+        "rows/s",
+        "b_p50",
+        "b_p99",
+        "ssts/scan",
+        "identity",
+        "endpoint",
+        "commit",
+        "other"
+    );
+    for (index, level) in levels.iter().enumerate() {
+        let before_scans = shard.graph_storage_metrics().scan_requests;
+        let before_positives = shard.graph_storage_metrics().sst_filter_prefix_positives;
+        let before_metrics = shard.graph_operational_metrics();
+        let before_hits = before_metrics.relationship_import_identity_pointer_hits;
+        let before_misses = before_metrics.relationship_import_identity_pointer_misses;
+
+        let started = std::time::Instant::now();
+        let per_tenant = futures::future::join_all(
+            (0..*level).map(|tenant| tenant_pass(tenant, format!("sweep{index}"))),
+        )
+        .await;
+        let wall = started.elapsed();
+
+        let mut latencies: Vec<u128> = per_tenant.into_iter().flatten().collect();
+        latencies.sort_unstable();
+        let rows = level * rows_per_tenant;
+        let scans = shard.graph_storage_metrics().scan_requests - before_scans;
+        let positives =
+            shard.graph_storage_metrics().sst_filter_prefix_positives - before_positives;
+        let after = shard.graph_operational_metrics();
+        let hits = after.relationship_import_identity_pointer_hits - before_hits;
+        let misses = after.relationship_import_identity_pointer_misses - before_misses;
+        // Per-batch phase attribution, so a result that shows no improvement
+        // can be explained rather than merely reported: if identity
+        // resolution is a small share of the batch, the bottleneck is
+        // somewhere else and this index cannot be the lever.
+        let profiled = (after.relationship_import_batches_profiled
+            - before_metrics.relationship_import_batches_profiled)
+            .max(1);
+        let phase = |after_us: u64, before_us: u64| (after_us - before_us) / profiled / 1_000;
+        let identity = phase(
+            after.relationship_import_identity_scan_us,
+            before_metrics.relationship_import_identity_scan_us,
+        );
+        let endpoint = phase(
+            after.relationship_import_endpoint_check_us,
+            before_metrics.relationship_import_endpoint_check_us,
+        );
+        let commit = phase(
+            after.relationship_import_commit_us,
+            before_metrics.relationship_import_commit_us,
+        );
+        let other = phase(
+            after.relationship_import_record_read_us
+                + after.relationship_import_structural_check_us
+                + after.relationship_import_counter_read_us,
+            before_metrics.relationship_import_record_read_us
+                + before_metrics.relationship_import_structural_check_us
+                + before_metrics.relationship_import_counter_read_us,
+        );
+        println!(
+            "{level:<7} {:>10.2?} {:>10.0} {:>8}ms {:>8}ms {:>8.1} {identity:>7}ms {endpoint:>7}ms \
+             {commit:>7}ms {other:>7}ms   scans {scans} pointer {hits}/{misses}",
+            wall,
+            rows as f64 / wall.as_secs_f64(),
+            bench_percentile(&latencies, 0.50) / 1_000,
+            bench_percentile(&latencies, 0.99) / 1_000,
+            positives as f64 / scans.max(1) as f64,
+        );
+    }
+
+    shard.close().await.unwrap();
+}
+
+/// Benchmark, not a correctness test — run explicitly with
+/// `--ignored --nocapture`. Local by default; set `HYDRADB_BENCH_OBJECT_ENV`
+/// to a SlateDB object-store env file to run it against real S3, which is
+/// where the result matters: a prefix scan's cost is one round trip per SST it
+/// opens, and on object storage those round trips are milliseconds rather than
+/// page-cache hits.
+///
+/// One build, one dataset, one SST layout, three regimes over identical MERGE
+/// batches:
+///
+///   insert   — first MERGE of every row (allocates, writes pointers)
+///   scan     — pointers deleted first, so every row resolves identity
+///              through the `rprop_idx` prefix scan (the pre-pointer world)
+///   pointer  — pointers healed by the scan pass, so every row resolves by
+///              one `rmerge_idx` point get
+///
+/// The scan and pointer passes are the before/after of PRO-1541 with every
+/// confound removed: same rows, same files, same transaction shape. Memtables
+/// are flushed after every insert batch so identity resolution works against
+/// a multi-SST layout, which is the production condition (ingest outrunning
+/// compaction) that makes prefix scans expensive.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+#[ignore = "benchmark harness; run with --ignored --nocapture"]
+async fn bench_merge_identity_pointer_vs_prefix_scan() {
+    let total: u64 = bench_env_u64("HYDRADB_BENCH_ROWS", 10_000);
+    let batch_size: u64 = bench_env_u64("HYDRADB_BENCH_BATCH", 500);
+    let sources: u64 = bench_env_u64("HYDRADB_BENCH_SOURCES", 2_000);
+    let (total, batch_size, sources) = (total, batch_size, sources);
+    let batches = total / batch_size;
+
+    // `HYDRADB_BENCH_OBJECT_ENV` points at a SlateDB object-store env file
+    // (`CLOUD_PROVIDER=aws` + bucket/region/credentials), which is how this
+    // runs against real S3. Without it the harness stays local.
+    let tempdir = tempfile::tempdir().unwrap();
+    let (object_store, store_label): (Arc<dyn ObjectStore>, String) =
+        match std::env::var("HYDRADB_BENCH_OBJECT_ENV") {
+            Ok(env_file) => (
+                object_store_from_env(Some(env_file.clone())).unwrap(),
+                format!("env:{env_file}"),
+            ),
+            Err(_) => (
+                Arc::new(LocalFileSystem::new_with_prefix(tempdir.path()).unwrap()),
+                "local".to_string(),
+            ),
+        };
+    let db_path = std::env::var("HYDRADB_BENCH_DB_PATH")
+        .unwrap_or_else(|_| "graph/bench-identity-pointer".to_string());
+    println!(
+        "store {store_label}  path {db_path}  rows {total} in {batches} batches of {batch_size}"
+    );
+    let shard = open_test_shard(&db_path, object_store).await;
+
+    let vertices = (0..sources).flat_map(|index| {
+        [
+            (index + 1, VertexMetadata::default().with_label("Entity")),
+            (
+                index + 100_001,
+                VertexMetadata::default().with_label("Chunk"),
+            ),
+        ]
+    });
+    shard
+        .import_vertex_metadata_batch("bench-home", vertices)
+        .await
+        .unwrap();
+
+    let relationship = |row: u64| {
+        let external_id = 1_000_000 + row;
+        RelationshipMutation {
+            cell_id: "bench-home".to_string(),
+            edge_type: "PRESENT_IN".to_string(),
+            src: (row % sources) + 1,
+            dst: (row % sources) + 100_001,
+            relationship_id: external_id,
+            metadata: EdgeMetadata::default()
+                .with_property("id", VertexPropertyValue::Integer(external_id))
+                .with_property("rank", VertexPropertyValue::Integer(row % 7)),
+        }
+    };
+    let pointer_key_for = |row: u64| {
+        keys::relationship_merge_index(
+            "bench-home",
+            "PRESENT_IN",
+            "id",
+            &encode_vertex_property_value_key(&VertexPropertyValue::Integer(1_000_000 + row)),
+            (row % sources) + 1,
+            (row % sources) + 100_001,
+        )
+    };
+    let flush_memtable = || {
+        let shard = &shard;
+        async move {
+            shard
+                .db
+                .writer()
+                .unwrap()
+                .flush_with_options(slatedb::config::FlushOptions {
+                    flush_type: slatedb::config::FlushType::MemTable,
+                })
+                .await
+                .unwrap();
+        }
+    };
+    let merge_all = |tag: &'static str| {
+        let shard = &shard;
+        async move {
+            for batch in 0..(batches) {
+                let rows = (batch * batch_size..(batch + 1) * batch_size).map(relationship);
+                shard
+                    .merge_relationships_batch_between_labeled_vertices(
+                        "bench-home",
+                        "PRESENT_IN",
+                        rows,
+                        &format!("bench-{tag}-{batch}"),
+                        ("Entity", "Chunk"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    struct Sample {
+        identity_scan_us: u64,
+        record_read_us: u64,
+        batches: u64,
+        hits: u64,
+        misses: u64,
+        scan_requests: u64,
+        prefix_positives: u64,
+        point_negatives: u64,
+        point_checks: u64,
+    }
+    let sample = || Sample {
+        identity_scan_us: shard
+            .graph_operational_metrics()
+            .relationship_import_identity_scan_us,
+        record_read_us: shard
+            .graph_operational_metrics()
+            .relationship_import_record_read_us,
+        batches: shard
+            .graph_operational_metrics()
+            .relationship_import_batches_profiled,
+        hits: shard
+            .graph_operational_metrics()
+            .relationship_import_identity_pointer_hits,
+        misses: shard
+            .graph_operational_metrics()
+            .relationship_import_identity_pointer_misses,
+        scan_requests: shard.graph_storage_metrics().scan_requests,
+        prefix_positives: shard.graph_storage_metrics().sst_filter_prefix_positives,
+        point_negatives: shard.graph_storage_metrics().sst_filter_point_negatives,
+        point_checks: shard.graph_storage_metrics().sst_filter_point_negatives
+            + shard.graph_storage_metrics().sst_filter_point_positives,
+    };
+    let report = |regime: &str, started: std::time::Instant, before: &Sample, after: &Sample| {
+        let batches = (after.batches - before.batches).max(1);
+        let scans = after.scan_requests - before.scan_requests;
+        let wall = started.elapsed();
+        println!(
+            "{regime:<8} wall {:>7.2?}  identity {:>7} us/batch  record_read {:>6} us/batch  \
+             pointer {}/{}  scans {:>6}  ssts/scan {:>5.1}  point-skip {:>5.1}%",
+            wall,
+            (after.identity_scan_us - before.identity_scan_us) / batches,
+            (after.record_read_us - before.record_read_us) / batches,
+            after.hits - before.hits,
+            after.misses - before.misses,
+            scans,
+            (after.prefix_positives - before.prefix_positives) as f64 / scans.max(1) as f64,
+            (after.point_negatives - before.point_negatives) as f64 * 100.0
+                / ((after.point_checks - before.point_checks).max(1)) as f64,
+        );
+    };
+
+    // Insert pass: one flush per batch piles the data into many small SSTs,
+    // the layout that makes prefix scans expensive in production.
+    let before = sample();
+    let started = std::time::Instant::now();
+    for batch in 0..(batches) {
+        let rows = (batch * batch_size..(batch + 1) * batch_size).map(relationship);
+        shard
+            .merge_relationships_batch_between_labeled_vertices(
+                "bench-home",
+                "PRESENT_IN",
+                rows,
+                &format!("bench-insert-{batch}"),
+                ("Entity", "Chunk"),
+                None,
+            )
+            .await
+            .unwrap();
+        flush_memtable().await;
+    }
+    let after = sample();
+    println!(
+        "layout: l0_sst_count {}",
+        shard.graph_storage_metrics().l0_sst_count
+    );
+    report("insert", started, &before, &after);
+
+    // Pre-pointer world: delete every pointer, flush so the deletes and the
+    // rest of the data are all in SSTs, then re-MERGE. Every row misses and
+    // falls back to the prefix scan — and heals its pointer.
+    for chunk in 0..(batches) {
+        let txn = shard
+            .db
+            .writer()
+            .unwrap()
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        for row in chunk * batch_size..(chunk + 1) * batch_size {
+            txn.delete(pointer_key_for(row).as_bytes()).unwrap();
+        }
+        commit_txn_strict(txn, true).await.unwrap();
+    }
+    flush_memtable().await;
+    let before = sample();
+    let started = std::time::Instant::now();
+    merge_all("scan").await;
+    let after = sample();
+    report("scan", started, &before, &after);
+
+    // Pointer world: the scan pass healed every pointer; flush them into SSTs
+    // so the gets run against the same storage the scans did.
+    flush_memtable().await;
+    let before = sample();
+    let started = std::time::Instant::now();
+    merge_all("pointer").await;
+    let after = sample();
+    report("pointer", started, &before, &after);
+    assert_eq!(after.hits - before.hits, total);
+    assert_eq!(after.misses - before.misses, 0);
+    assert_eq!(after.scan_requests, before.scan_requests);
 
     shard.close().await.unwrap();
 }
@@ -8961,7 +14596,8 @@ async fn delete_vertex_requires_detach_and_detach_cascades_incident_edges() {
         err,
         GraphError::UnsupportedQuery {
             dialect: "Graph",
-            feature
+            feature,
+            reason: QueryFailureReason::Mutation,
         } if feature.contains("requires DETACH")
     ));
     assert!(shard
@@ -9025,6 +14661,995 @@ async fn delete_vertex_requires_detach_and_detach_cascades_incident_edges() {
         .unwrap();
     assert!(!tombstone_only.vertex_deleted);
     assert_eq!(tombstone_only.incident_edges_deleted, 0);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn detach_delete_vertex_uses_incident_edge_indexes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/delete-vertex-indexed-incident-edges",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default().with_label("User"),
+        )
+        .await
+        .unwrap();
+    for index in 0..32_u64 {
+        shard
+            .write_edge(typed_mutation(
+                "reddit-home",
+                "NOISE",
+                100 + index * 2,
+                101 + index * 2,
+                &format!("delete-index-noise-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "FOLLOWS",
+            1,
+            2,
+            "delete-index-outgoing",
+        ))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "LIKES",
+            3,
+            1,
+            "delete-index-incoming",
+        ))
+        .await
+        .unwrap();
+
+    let deleted = shard
+        .detach_delete_vertex("reddit-home", 1, "delete-index-vertex")
+        .await
+        .unwrap();
+    assert!(deleted.vertex_deleted);
+    assert_eq!(deleted.incident_edges_deleted, 2);
+    assert!(!shard
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "LIKES", 3, 1)
+        .await
+        .unwrap());
+    assert!(shard
+        .edge_exists("reddit-home", "NOISE", 100, 101)
+        .await
+        .unwrap());
+
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn detach_delete_vertex_bounds_edge_type_discovery() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/delete-vertex-edge-type-limit",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default().with_label("User"),
+        )
+        .await
+        .unwrap();
+    for (index, edge_type) in ["FOLLOWS", "LIKES", "MENTIONS"].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                "reddit-home",
+                edge_type,
+                100 + index as u64 * 2,
+                101 + index as u64 * 2,
+                &format!("delete-edge-type-limit-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let error = shard
+        .detach_delete_vertex("reddit-home", 1, "delete-edge-type-limited-vertex")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphError::AdmissionRejected {
+            operation: "delete_vertex_scan_incident_edges",
+            actual: 3,
+            limit: 2,
+        }
+    ));
+    assert!(shard
+        .read_remote(&keys::vertex("reddit-home", 1))
+        .await
+        .unwrap()
+        .is_some());
+
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn detach_delete_vertex_preserves_outbound_only_segment_support() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/delete-vertex-outbound-only-segments",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default().with_label("User"),
+        )
+        .await
+        .unwrap();
+    shard
+        .bulk_append_out_adjacency_segment_trusted(
+            "reddit-home",
+            "FOLLOWS",
+            2,
+            [1, 3],
+            "delete-outbound-segment",
+        )
+        .await
+        .unwrap();
+
+    let deleted = shard
+        .detach_delete_vertex("reddit-home", 1, "delete-outbound-vertex")
+        .await
+        .unwrap();
+    assert!(deleted.vertex_deleted);
+    assert_eq!(deleted.incident_edges_deleted, 1);
+    assert!(!shard
+        .edge_exists("reddit-home", "FOLLOWS", 2, 1)
+        .await
+        .unwrap());
+    assert!(shard
+        .edge_exists("reddit-home", "FOLLOWS", 2, 3)
+        .await
+        .unwrap());
+
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn detach_delete_vertices_batch_is_atomic_for_outbound_only_segments() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/delete-vertices-batch-outbound-only",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for vertex_id in [1, 2, 9, 10] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default().with_label("Entity"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .bulk_append_out_adjacency_segment_trusted(
+            "reddit-home",
+            "FOLLOWS",
+            9,
+            [1, 2, 10],
+            "delete-outbound-batch-segment",
+        )
+        .await
+        .unwrap();
+    let deletions = vec![
+        (1, "delete-outbound-batch-1".to_string()),
+        (2, "delete-outbound-batch-2".to_string()),
+    ];
+    let before = shard.graph_operational_metrics();
+
+    let deleted = shard
+        .delete_vertex_mutations_batch("reddit-home", deletions.clone(), true)
+        .await
+        .unwrap();
+
+    let after = shard.graph_operational_metrics();
+    assert_eq!(
+        after.write_commits.saturating_sub(before.write_commits),
+        1,
+        "an outbound-only detach batch should use one durable commit"
+    );
+    assert_eq!(deleted.len(), 2);
+    assert!(deleted.iter().all(|result| result.vertex_deleted));
+    assert_eq!(
+        deleted
+            .iter()
+            .map(|result| result.incident_edges_deleted)
+            .sum::<u64>(),
+        2
+    );
+    assert!(!shard
+        .edge_exists("reddit-home", "FOLLOWS", 9, 1)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "FOLLOWS", 9, 2)
+        .await
+        .unwrap());
+    assert!(shard
+        .edge_exists("reddit-home", "FOLLOWS", 9, 10)
+        .await
+        .unwrap());
+
+    let replay = shard
+        .delete_vertex_mutations_batch("reddit-home", deletions, true)
+        .await
+        .unwrap();
+    assert_eq!(replay, deleted);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn delete_isolated_vertices_batch_skips_connected_candidates_and_replays() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/delete-isolated-vertices-batch", object_store).await;
+    for vertex_id in [1, 2, 3, 9, 10] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default().with_label("Entity"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "PRESENT_IN",
+            2,
+            9,
+            "delete-isolated-outbound-edge",
+        ))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "RELATES",
+            10,
+            3,
+            "delete-isolated-inbound-edge",
+        ))
+        .await
+        .unwrap();
+    let deletions = vec![
+        (
+            1,
+            "delete-isolated-1".to_string(),
+            VertexMetadata::default(),
+        ),
+        (
+            2,
+            "delete-isolated-2".to_string(),
+            VertexMetadata::default(),
+        ),
+        (
+            3,
+            "delete-isolated-3".to_string(),
+            VertexMetadata::default(),
+        ),
+    ];
+
+    let deleted = shard
+        .delete_isolated_vertex_mutations_batch("reddit-home", deletions.clone())
+        .await
+        .unwrap();
+    assert!(deleted[0].vertex_deleted);
+    assert!(!deleted[1].vertex_deleted);
+    assert!(!deleted[2].vertex_deleted);
+    assert!(shard
+        .read_remote(&keys::vertex("reddit-home", 1))
+        .await
+        .unwrap()
+        .is_none());
+    for vertex_id in [2, 3] {
+        assert!(shard
+            .read_remote(&keys::vertex("reddit-home", vertex_id))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    assert_eq!(
+        shard
+            .delete_isolated_vertex_mutations_batch("reddit-home", deletions.clone())
+            .await
+            .unwrap(),
+        deleted
+    );
+    shard
+        .delete_edge(typed_mutation(
+            "reddit-home",
+            "PRESENT_IN",
+            2,
+            9,
+            "delete-isolated-remove-outbound",
+        ))
+        .await
+        .unwrap();
+    shard
+        .delete_edge(typed_mutation(
+            "reddit-home",
+            "RELATES",
+            10,
+            3,
+            "delete-isolated-remove-inbound",
+        ))
+        .await
+        .unwrap();
+
+    let replay_after_edges_were_removed = shard
+        .delete_isolated_vertex_mutations_batch("reddit-home", deletions)
+        .await
+        .unwrap();
+    assert_eq!(replay_after_edges_were_removed, deleted);
+    for vertex_id in [2, 3] {
+        assert!(shard
+            .read_remote(&keys::vertex("reddit-home", vertex_id))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    let fresh_request = shard
+        .delete_isolated_vertex_mutations_batch(
+            "reddit-home",
+            vec![
+                (
+                    2,
+                    "delete-isolated-2-after-disconnect".to_string(),
+                    VertexMetadata::default(),
+                ),
+                (
+                    3,
+                    "delete-isolated-3-after-disconnect".to_string(),
+                    VertexMetadata::default(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(fresh_request.iter().all(|result| result.vertex_deleted));
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn source_cleanup_only_needs_one_surviving_edge_per_connected_candidate() {
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/source-cleanup-supernode-witness",
+        Arc::new(InMemory::new()),
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 16,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for vertex in [1, 2, 3, 100, 200] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default().with_label("Entity"),
+            )
+            .await
+            .unwrap();
+    }
+    for (edge_type, edges) in [
+        ("HAS_CHUNK", vec![(200, 100)]),
+        ("PRESENT_IN", vec![(1, 200), (2, 200), (3, 200)]),
+        (
+            "RELATES",
+            (10_000..11_000)
+                .map(|dst| (2, dst))
+                .chain((20_000..21_000).map(|src| (src, 3)))
+                .collect(),
+        ),
+    ] {
+        shard
+            .bulk_import_edges(
+                "reddit-home",
+                edge_type,
+                edges,
+                &format!("seed-{edge_type}"),
+            )
+            .await
+            .unwrap();
+    }
+    let deletions = [100, 200, 1, 2, 3]
+        .into_iter()
+        .map(|vertex| {
+            (
+                vertex,
+                format!("cleanup-{vertex}"),
+                vertex >= 100,
+                VertexMetadata::default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let before = shard.graph_operational_metrics();
+    let deleted = shard
+        .delete_vertices_and_isolated_candidates_batch("reddit-home", deletions.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted
+            .iter()
+            .map(|result| result.vertex_deleted)
+            .collect::<Vec<_>>(),
+        vec![true, true, true, false, false],
+    );
+    assert_eq!(
+        shard.graph_operational_metrics().write_commits - before.write_commits,
+        1,
+    );
+    assert_eq!(
+        shard.out_degree("reddit-home", "RELATES", 2).await.unwrap(),
+        1_000
+    );
+    let degree_key = keys::degree_in("reddit-home", "RELATES", 3);
+    assert_eq!(
+        decode_u64(
+            &degree_key,
+            &shard.read_remote(&degree_key).await.unwrap().unwrap()
+        )
+        .unwrap(),
+        1_000,
+    );
+    assert_eq!(
+        shard
+            .delete_vertices_and_isolated_candidates_batch("reddit-home", deletions)
+            .await
+            .unwrap(),
+        deleted,
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn source_cleanup_detaches_owned_vertices_and_deletes_new_orphans_atomically() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/source-cleanup-vertices-batch", object_store).await;
+    for vertex_id in [1, 2, 3, 100, 200] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default().with_label("Entity"),
+            )
+            .await
+            .unwrap();
+    }
+    for (edge_type, src, dst, key) in [
+        ("HAS_CHUNK", 200, 100, "source-cleanup-has-chunk"),
+        ("PRESENT_IN", 1, 200, "source-cleanup-orphan-present-in"),
+        ("PRESENT_IN", 2, 200, "source-cleanup-shared-present-in"),
+        ("RELATES", 2, 3, "source-cleanup-shared-relates"),
+    ] {
+        shard
+            .write_edge(typed_mutation("reddit-home", edge_type, src, dst, key))
+            .await
+            .unwrap();
+    }
+    let deletions = vec![
+        (
+            100,
+            "source-cleanup-source".to_string(),
+            true,
+            VertexMetadata::default(),
+        ),
+        (
+            200,
+            "source-cleanup-chunk".to_string(),
+            true,
+            VertexMetadata::default(),
+        ),
+        (
+            1,
+            "source-cleanup-orphan".to_string(),
+            false,
+            VertexMetadata::default(),
+        ),
+        (
+            2,
+            "source-cleanup-shared".to_string(),
+            false,
+            VertexMetadata::default(),
+        ),
+    ];
+    let before = shard.graph_operational_metrics();
+
+    let deleted = shard
+        .delete_vertices_and_isolated_candidates_batch("reddit-home", deletions.clone())
+        .await
+        .unwrap();
+
+    let after = shard.graph_operational_metrics();
+    assert_eq!(after.write_commits.saturating_sub(before.write_commits), 1);
+    assert!(deleted[0].vertex_deleted);
+    assert!(deleted[1].vertex_deleted);
+    assert!(deleted[2].vertex_deleted);
+    assert!(!deleted[3].vertex_deleted);
+    for vertex_id in [1, 100, 200] {
+        assert!(shard
+            .read_remote(&keys::vertex("reddit-home", vertex_id))
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert!(shard
+        .read_remote(&keys::vertex("reddit-home", 2))
+        .await
+        .unwrap()
+        .is_some());
+    assert!(shard
+        .edge_exists("reddit-home", "RELATES", 2, 3)
+        .await
+        .unwrap());
+    assert_eq!(
+        shard
+            .delete_vertices_and_isolated_candidates_batch("reddit-home", deletions)
+            .await
+            .unwrap(),
+        deleted
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn source_cleanup_prefetch_budget_is_shared_and_failure_is_atomic() {
+    let mut shard =
+        open_test_shard("graph/cleanup-prefetch-atomic", Arc::new(InMemory::new())).await;
+    shard
+        .set_vertex_metadata_batch(
+            "cell-a",
+            (1..=3).map(|id| (id, VertexMetadata::default().with_label("Entity"))),
+        )
+        .await
+        .unwrap();
+    shard
+        .import_relationships_batch(
+            "cell-a",
+            "RELATES",
+            (0..4).map(|id| RelationshipMutation {
+                cell_id: "cell-a".into(),
+                edge_type: "RELATES".into(),
+                src: 1,
+                dst: 2 + id / 2,
+                relationship_id: 100 + id,
+                metadata: EdgeMetadata::default(),
+            }),
+            "seed",
+        )
+        .await
+        .unwrap();
+    shard.limits.max_query_intermediate_rows = 3;
+    let deletions = vec![(1, "cleanup".into(), true, VertexMetadata::default())];
+    let before = shard.graph_operational_metrics().write_commits;
+    let error = shard
+        .delete_vertices_and_isolated_candidates_batch("cell-a", deletions.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            GraphError::AdmissionRejected {
+                operation: "delete_vertex_relationship_records",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(shard.graph_operational_metrics().write_commits, before);
+    assert_eq!(shard.out_degree("cell-a", "RELATES", 1).await.unwrap(), 2);
+    let key = keys::vertex("cell-a", 1);
+    assert!(
+        !decode_vertex_metadata(&key, &shard.read_remote(&key).await.unwrap().unwrap())
+            .unwrap()
+            .labels
+            .is_empty()
+    );
+    shard.limits.max_query_intermediate_rows = 8;
+    let result = shard
+        .delete_vertices_and_isolated_candidates_batch("cell-a", deletions.clone())
+        .await
+        .unwrap();
+    assert!(result[0].vertex_deleted);
+    assert_eq!(result[0].relationships_deleted, 4);
+    assert_eq!(result[0].incident_edges_deleted, 2);
+    assert_eq!(
+        shard
+            .delete_vertices_and_isolated_candidates_batch("cell-a", deletions)
+            .await
+            .unwrap(),
+        result
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn outbound_only_vertex_delete_batch_rolls_back_on_late_conflict() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/delete-vertices-batch-outbound-only-conflict",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for vertex_id in [1, 2, 99] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default().with_label("Entity"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .delete_vertex("reddit-home", 99, "delete-outbound-batch-conflict")
+        .await
+        .unwrap();
+    let before = shard.graph_operational_metrics();
+
+    let error = shard
+        .delete_vertex_mutations_batch(
+            "reddit-home",
+            vec![
+                (1, "delete-outbound-batch-before-conflict".to_string()),
+                (2, "delete-outbound-batch-conflict".to_string()),
+            ],
+            true,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, GraphError::IdempotencyConflict { .. }));
+    let after = shard.graph_operational_metrics();
+    assert_eq!(
+        after.write_commits.saturating_sub(before.write_commits),
+        0,
+        "a rejected outbound-only batch must not commit an earlier deletion"
+    );
+    for vertex_id in [1, 2] {
+        assert!(shard
+            .read_remote(&keys::vertex("reddit-home", vertex_id))
+            .await
+            .unwrap()
+            .is_some());
+    }
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn detach_delete_vertices_batch_commits_once_and_replays() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/delete-vertices-batch", object_store).await;
+    for vertex_id in [1, 2, 3, 9, 10] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("id", VertexPropertyValue::Integer(vertex_id)),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "PRESENT_IN",
+            1,
+            2,
+            "delete-vertices-batch-shared-edge",
+        ))
+        .await
+        .unwrap();
+    shard
+        .import_relationships_batch(
+            "reddit-home",
+            "RELATES",
+            [
+                RelationshipMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "RELATES".to_string(),
+                    src: 2,
+                    dst: 3,
+                    relationship_id: 101,
+                    metadata: EdgeMetadata::default().with_property(
+                        "chunk_id",
+                        VertexPropertyValue::String("chunk-a".to_string()),
+                    ),
+                },
+                RelationshipMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "RELATES".to_string(),
+                    src: 2,
+                    dst: 3,
+                    relationship_id: 102,
+                    metadata: EdgeMetadata::default().with_property(
+                        "chunk_id",
+                        VertexPropertyValue::String("chunk-b".to_string()),
+                    ),
+                },
+            ],
+            "delete-vertices-batch-parallel-relationships",
+        )
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "UNCHANGED",
+            9,
+            10,
+            "delete-vertices-batch-unrelated",
+        ))
+        .await
+        .unwrap();
+    let deletions = vec![
+        (1, "delete-vertices-batch-1".to_string()),
+        (2, "delete-vertices-batch-2".to_string()),
+        (3, "delete-vertices-batch-3".to_string()),
+    ];
+    let before = shard.graph_operational_metrics();
+
+    let deleted = shard
+        .delete_vertex_mutations_batch("reddit-home", deletions.clone(), true)
+        .await
+        .unwrap();
+
+    let after = shard.graph_operational_metrics();
+    assert_eq!(
+        after.write_commits.saturating_sub(before.write_commits),
+        1,
+        "the complete detach batch should use one durable commit"
+    );
+    assert_eq!(deleted.len(), 3);
+    assert!(deleted.iter().all(|result| result.vertex_deleted));
+    assert_eq!(
+        deleted
+            .iter()
+            .map(|result| result.incident_edges_deleted)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(
+        deleted
+            .iter()
+            .map(|result| result.relationships_deleted)
+            .sum::<u64>(),
+        2
+    );
+    for vertex_id in [1, 2, 3] {
+        assert!(shard
+            .read_remote(&keys::vertex("reddit-home", vertex_id))
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert!(!shard
+        .edge_exists("reddit-home", "PRESENT_IN", 1, 2)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "RELATES", 2, 3)
+        .await
+        .unwrap());
+    assert!(shard
+        .edge_exists("reddit-home", "UNCHANGED", 9, 10)
+        .await
+        .unwrap());
+
+    let replay = shard
+        .delete_vertex_mutations_batch("reddit-home", deletions, true)
+        .await
+        .unwrap();
+    assert_eq!(replay, deleted);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_detach_delete_vertex_batches_serialize_per_cell() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/delete-vertices-batch-concurrent", object_store).await;
+    for vertex_id in 1..=4 {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default().with_label("Entity"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "LINKS",
+            1,
+            2,
+            "delete-vertices-concurrent-a",
+        ))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "LINKS",
+            3,
+            4,
+            "delete-vertices-concurrent-b",
+        ))
+        .await
+        .unwrap();
+    let before = shard.graph_operational_metrics();
+
+    let (first, second) = tokio::join!(
+        shard.delete_vertex_mutations_batch(
+            "reddit-home",
+            vec![
+                (1, "delete-vertices-concurrent-1".to_string()),
+                (2, "delete-vertices-concurrent-2".to_string()),
+            ],
+            true,
+        ),
+        shard.delete_vertex_mutations_batch(
+            "reddit-home",
+            vec![
+                (3, "delete-vertices-concurrent-3".to_string()),
+                (4, "delete-vertices-concurrent-4".to_string()),
+            ],
+            true,
+        ),
+    );
+
+    assert_eq!(first.unwrap().len(), 2);
+    assert_eq!(second.unwrap().len(), 2);
+    let after = shard.graph_operational_metrics();
+    assert_eq!(
+        after.write_commits.saturating_sub(before.write_commits),
+        2,
+        "concurrent batches should serialize into one commit each"
+    );
+    for vertex_id in 1..=4 {
+        assert!(shard
+            .read_remote(&keys::vertex("reddit-home", vertex_id))
+            .await
+            .unwrap()
+            .is_none());
+    }
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn vertex_delete_batch_rejects_incident_edges_atomically() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/delete-vertices-batch-atomic-reject", object_store).await;
+    for vertex_id in 1..=3 {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default().with_label("Entity"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "LINKS",
+            2,
+            3,
+            "delete-vertices-batch-atomic-edge",
+        ))
+        .await
+        .unwrap();
+
+    let error = shard
+        .delete_vertex_mutations_batch(
+            "reddit-home",
+            vec![
+                (1, "delete-vertices-batch-atomic-1".to_string()),
+                (2, "delete-vertices-batch-atomic-2".to_string()),
+            ],
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        GraphError::UnsupportedQuery { feature, .. }
+            if feature.contains("requires DETACH")
+    ));
+    for vertex_id in 1..=3 {
+        assert!(shard
+            .read_remote(&keys::vertex("reddit-home", vertex_id))
+            .await
+            .unwrap()
+            .is_some());
+    }
+    assert!(shard
+        .edge_exists("reddit-home", "LINKS", 2, 3)
+        .await
+        .unwrap());
+    for key in [
+        "delete-vertices-batch-atomic-1",
+        "delete-vertices-batch-atomic-2",
+    ] {
+        assert!(shard
+            .read_remote(&keys::idempotency("reddit-home", "vertex-delete", key))
+            .await
+            .unwrap()
+            .is_none());
+    }
     shard.close().await.unwrap();
 }
 
@@ -9579,6 +16204,7 @@ async fn cypher_create_set_and_delete_target_individual_relationships() {
         QueryOutput::Mutation(QueryMutationResult {
             matched_rows: 1,
             deleted_edges: 1,
+            topology_sequence: Some(5),
             ..QueryMutationResult::default()
         })
     );
@@ -10523,6 +17149,44 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
         )
     );
 
+    let budgeted_row = QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(12)]);
+    let max_result_bytes = budgeted_row.estimated_resident_bytes() as u64;
+    let windowed_within_result_budget = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-engine-windowed-result-budget")
+                .with_result_window(2, Some(1))
+                .with_max_result_bytes(max_result_bytes),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) \
+             RETURN u.id AS src, v.id AS dst ORDER BY dst",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        windowed_within_result_budget,
+        QueryResultSet::new(
+            vec![QueryColumn::new("src"), QueryColumn::new("dst")],
+            vec![budgeted_row],
+        )
+    );
+
+    let result_budget_error = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-engine-result-budget-error")
+                .with_result_window(2, Some(1))
+                .with_max_result_bytes(max_result_bytes - 1),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) \
+             RETURN u.id AS src, v.id AS dst ORDER BY dst",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        result_budget_error,
+        GraphError::AdmissionRejected {
+            operation: "client_cursor_buffer_bytes",
+            ..
+        }
+    ));
+
     let scanned = shard
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "cypher-row-engine-scan"),
@@ -10607,6 +17271,642 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_ordered_type_lookup_uses_selective_equality_before_hydration() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/ordered-selective-type", store).await;
+    for vertex in 1..=512 {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property(
+                        "type",
+                        VertexPropertyValue::String(
+                            if vertex <= 2 { "rare" } else { "common" }.into(),
+                        ),
+                    )
+                    .with_property("tenant_id", VertexPropertyValue::String("tenant-a".into()))
+                    .with_property(
+                        "created_at",
+                        VertexPropertyValue::String(format!("2026-{vertex:04}")),
+                    )
+                    .with_property(
+                        "entity_id",
+                        VertexPropertyValue::String(format!("entity-{vertex:04}")),
+                    ),
+            )
+            .await
+            .unwrap();
+    }
+    let before = shard.graph_operational_metrics().query_property_fetches;
+    let started = std::time::Instant::now();
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "ordered-selective-type"),
+            "MATCH (e:Entity {tenant_id: 'tenant-a'}) \
+         WHERE (e.type = 'rare' OR e.type = 'absent') AND e.created_at STARTS WITH '' \
+         RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 5000",
+        )
+        .await
+        .unwrap();
+    let fetches = shard.graph_operational_metrics().query_property_fetches - before;
+    eprintln!(
+        "ordered-selective-type: elapsed_us={} property_fetches={fetches}",
+        started.elapsed().as_micros()
+    );
+    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(
+        rows.rows[0].values,
+        vec![QueryValue::Property(VertexPropertyValue::String(
+            "entity-0002".into()
+        ))]
+    );
+    assert!(fetches <= 2, "selective lookup hydrated {fetches} vertices");
+    for query in [
+        "MATCH (e:Entity {tenant_id: 'tenant-a', type: 'rare'}) \
+         WHERE e.created_at STARTS WITH '' \
+         RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 5000",
+        "MATCH (e:Entity {tenant_id: 'tenant-a'}) \
+         WHERE e.type = 'rare' AND e.created_at STARTS WITH '' \
+         RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 5000",
+    ] {
+        let before = shard.graph_operational_metrics().query_property_fetches;
+        let actual = shard
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", "ordered-inline-type"),
+                query,
+            )
+            .await
+            .unwrap();
+        assert_eq!(actual, rows);
+        let fetches = shard.graph_operational_metrics().query_property_fetches - before;
+        assert!(fetches <= 2, "inline equality hydrated {fetches} vertices");
+    }
+    let broad = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "ordered-broad-type-fallback"),
+            "MATCH (e:Entity {tenant_id: 'tenant-a'}) \
+         WHERE (e.type = 'common' OR e.type = 'absent') AND e.created_at STARTS WITH '' \
+         RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        broad.rows[0].values,
+        vec![QueryValue::Property(VertexPropertyValue::String(
+            "entity-0512".into()
+        ))]
+    );
+    assert_eq!(
+        broad.rows.len(),
+        2,
+        "an incomplete probe must not truncate the ordered result"
+    );
+    let empty = shard.execute_cypher_rows(
+        QueryContext::new("reddit-home", "ordered-empty-type"),
+        "MATCH (e:Entity) WHERE (e.type = 'missing' OR e.type = 'absent') AND e.created_at STARTS WITH '' \
+         RETURN e.entity_id ORDER BY e.created_at DESC LIMIT 2",
+    ).await.unwrap();
+    assert!(empty.rows.is_empty());
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_ordered_large_type_lookup_streams_bounded_top_k() {
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/ordered-large-selective-type",
+        Arc::new(InMemory::new()),
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_intermediate_rows: 300,
+                max_query_index_candidates: 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for start in (1..=4096).step_by(256) {
+        shard
+            .set_vertex_metadata_batch(
+                "reddit-home",
+                (start..start + 256).map(|vertex| {
+                    let mut metadata = VertexMetadata::default()
+                        .with_property(
+                            "type",
+                            VertexPropertyValue::String(
+                                if vertex <= 600 { "rare" } else { "common" }.into(),
+                            ),
+                        )
+                        .with_property(
+                            "tenant_id",
+                            VertexPropertyValue::String(
+                                if vertex % 3 == 0 { "other" } else { "tenant-a" }.into(),
+                            ),
+                        )
+                        .with_property(
+                            "created_at",
+                            VertexPropertyValue::String(
+                                if vertex <= 600 { "2026-01" } else { "2026-02" }.into(),
+                            ),
+                        )
+                        .with_property(
+                            "entity_id",
+                            VertexPropertyValue::String(format!("entity-{:04}", 4097 - vertex)),
+                        );
+                    if vertex % 5 != 0 {
+                        metadata = metadata.with_label("Entity");
+                    }
+                    (vertex, metadata)
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    // The old 256-entry probe abandoned the type index, then exceeded the
+    // candidate cap scanning newer, nonmatching timestamps before any rare row.
+    for direction in ["ASC", "DESC"] {
+        let before = shard.graph_operational_metrics().query_property_fetches;
+        let started = std::time::Instant::now();
+        let rows = shard.execute_cypher_rows(
+            QueryContext::new("reddit-home", format!("large-type-{direction}")),
+            &format!("MATCH (e:Entity {{tenant_id: 'tenant-a'}}) \
+                WHERE (e.type = 'rare' OR e.type = 'absent') AND e.created_at STARTS WITH '' \
+                RETURN e.entity_id ORDER BY e.created_at {direction}, e.entity_id SKIP 14 LIMIT 256"),
+        ).await.unwrap();
+        let fetches = shard.graph_operational_metrics().query_property_fetches - before;
+        eprintln!(
+            "large-type-{direction}: elapsed_us={} property_fetches={fetches}",
+            started.elapsed().as_micros()
+        );
+        let expected = (1..=600)
+            .rev()
+            .filter(|vertex| vertex % 3 != 0 && vertex % 5 != 0)
+            .skip(14)
+            .take(256)
+            .map(|vertex| {
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                    format!("entity-{:04}", 4097 - vertex),
+                ))])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.rows, expected);
+        assert_eq!(
+            fetches,
+            if direction == "DESC" { 616 } else { 600 },
+            "at most one 16-row selectivity sample before the complete type seed"
+        );
+    }
+    let sparse = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "large-window-sparse-result"),
+            "MATCH (e:Entity {tenant_id: 'tenant-a'}) \
+         WHERE (e.type = 'rare' OR e.type = 'absent') AND e.created_at STARTS WITH '' \
+           AND e.entity_id = 'entity-4096' \
+         RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 5000",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sparse.rows.len(),
+        1,
+        "bound retained rows, not the requested LIMIT"
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+#[ignore = "controlled executor latency benchmark"]
+async fn latency_filtered_read_benchmark() {
+    for (matching, ties) in [
+        (15_000_u64, true),
+        (25_000, true),
+        (15_000, false),
+        (25_000, false),
+    ] {
+        let shard = open_test_shard(
+            &format!("graph/latency-filtered-{matching}"),
+            Arc::new(InMemory::new()),
+        )
+        .await;
+        for start in (1..=40_000).step_by(1000) {
+            shard
+                .set_vertex_metadata_batch(
+                    "cell-a",
+                    (start..start + 1000).map(|id| {
+                        (
+                            id,
+                            VertexMetadata::default()
+                                .with_label("Entity")
+                                .with_property(
+                                    "type",
+                                    VertexPropertyValue::String(
+                                        if id <= matching { "rare" } else { "other" }.into(),
+                                    ),
+                                )
+                                .with_property(
+                                    "tenant_id",
+                                    VertexPropertyValue::String("tenant-a".into()),
+                                )
+                                .with_property(
+                                    "sub_tenant_id",
+                                    VertexPropertyValue::String("sub-a".into()),
+                                )
+                                .with_property(
+                                    "created_at",
+                                    VertexPropertyValue::String(format!(
+                                        "{}{:06}",
+                                        if id <= matching {
+                                            "2026-01-"
+                                        } else {
+                                            "2026-02-"
+                                        },
+                                        if ties { 0 } else { id }
+                                    )),
+                                )
+                                .with_property(
+                                    "entity_id",
+                                    VertexPropertyValue::String(format!(
+                                        "entity-{:06}",
+                                        40_001 - id
+                                    )),
+                                )
+                                .with_property(
+                                    "name",
+                                    VertexPropertyValue::String(format!("name-{id}")),
+                                ),
+                        )
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        for sample in 0..3 {
+            let before = shard.graph_operational_metrics().query_property_fetches;
+            let started = std::time::Instant::now();
+            let result = shard.execute_cypher_rows(QueryContext::new("cell-a", format!("filtered-{sample}")),
+                "MATCH (e:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+                 WHERE (e.type = 'rare' OR e.type = 'absent') AND e.created_at STARTS WITH '' \
+                 RETURN e.entity_id, e.name, e.type ORDER BY e.created_at DESC, e.entity_id LIMIT 5000"
+            ).await.unwrap();
+            eprintln!("filtered-read total=40000 matching={matching} ties={ties} limit=5000 sample={sample} elapsed_us={} property_fetches={}",
+                started.elapsed().as_micros(), shard.graph_operational_metrics().query_property_fetches - before);
+            assert_eq!(result.rows.len(), 5000);
+            for (offset, row) in result.rows.iter().enumerate() {
+                assert_eq!(
+                    row.values[0],
+                    QueryValue::Property(VertexPropertyValue::String(format!(
+                        "entity-{:06}",
+                        40_001 - matching + offset as u64
+                    )))
+                );
+            }
+        }
+        shard.close().await.unwrap();
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn ordered_type_index_intersection_hydrates_only_the_result_window() {
+    let shard = open_test_shard("graph/ordered-type-intersection", Arc::new(InMemory::new())).await;
+    shard
+        .set_vertex_metadata_batch(
+            "cell-a",
+            (1..=512_u64).map(|id| {
+                (
+                    id,
+                    VertexMetadata::default()
+                        .with_label("Entity")
+                        .with_property(
+                            "type",
+                            VertexPropertyValue::String(
+                                if id <= 320 { "rare" } else { "other" }.into(),
+                            ),
+                        )
+                        .with_property(
+                            "created_at",
+                            VertexPropertyValue::String(format!("2026-{id:06}")),
+                        )
+                        .with_property("entity_id", VertexPropertyValue::Integer(id)),
+                )
+            }),
+        )
+        .await
+        .unwrap();
+    let before = shard.graph_operational_metrics().query_property_fetches;
+    let result = shard.execute_cypher_rows(QueryContext::new("cell-a", "intersection"),
+        "MATCH (e:Entity) WHERE (e.type = 'rare' OR e.type = 'absent') AND e.created_at STARTS WITH '' \
+         RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 30").await.unwrap();
+    assert_eq!(
+        result.rows,
+        (291..=320)
+            .rev()
+            .map(|id| QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(id))]))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        shard.graph_operational_metrics().query_property_fetches - before,
+        46
+    );
+    let before = shard.graph_operational_metrics().query_property_fetches;
+    let dense = shard.execute_cypher_rows(QueryContext::new("cell-a", "intersection-dense"),
+        "MATCH (e:Entity) WHERE (e.type = 'rare' OR e.type = 'absent') AND e.created_at STARTS WITH '' \
+         RETURN e.entity_id ORDER BY e.created_at ASC, e.entity_id LIMIT 30").await.unwrap();
+    assert_eq!(dense.rows.len(), 30);
+    assert_eq!(
+        shard.graph_operational_metrics().query_property_fetches - before,
+        30,
+        "a dense page must finish without hydrating the complete equality union"
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_incident_reads_overlap_without_speculating_past_witness() {
+    let store = ReadCountingObjectStore::new();
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/parallel-empty-incident-prefixes",
+        store.clone(),
+        GraphOpenOptions {
+            cache: GraphCacheConfig {
+                slatedb_cache_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    shard
+        .set_vertex_metadata("cell-a", 1, VertexMetadata::default().with_label("Entity"))
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "cell-a",
+            9000,
+            VertexMetadata::default().with_label("Entity"),
+        )
+        .await
+        .unwrap();
+    for index in 0..8 {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "cell-a".into(),
+                edge_type: format!("OTHER{index}"),
+                src: 9000,
+                dst: 9001,
+                idempotency_key: format!("other-{index}"),
+            })
+            .await
+            .unwrap();
+    }
+    shard
+        .db
+        .writer()
+        .unwrap()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    store.get_delay_ms.store(5, Ordering::Relaxed);
+    store.peak_gets.store(0, Ordering::Relaxed);
+    let deleted = shard
+        .delete_vertices_and_isolated_candidates_batch(
+            "cell-a",
+            vec![(1, "cleanup".into(), true, VertexMetadata::default())],
+        )
+        .await
+        .unwrap();
+    let peak = store.peak_gets.load(Ordering::Relaxed);
+    assert!(deleted[0].vertex_deleted);
+    assert_eq!(deleted[0].relationships_deleted, 0);
+    assert!(
+        peak > 1 && peak <= 16,
+        "incident I/O concurrency was {peak}"
+    );
+    store.peak_gets.store(0, Ordering::Relaxed);
+    let retained = shard
+        .delete_vertices_and_isolated_candidates_batch(
+            "cell-a",
+            vec![(9000, "witness".into(), false, VertexMetadata::default())],
+        )
+        .await
+        .unwrap();
+    assert!(!retained[0].vertex_deleted);
+    assert_eq!(
+        store.peak_gets.load(Ordering::Relaxed),
+        1,
+        "one isolation candidate must not issue speculative prefix reads"
+    );
+    store.get_delay_ms.store(0, Ordering::Relaxed);
+    assert_eq!(shard.out_degree("cell-a", "OTHER0", 9000).await.unwrap(), 1);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled cleanup gate-holder latency benchmark"]
+async fn latency_cleanup_gate_benchmark() {
+    for edge_count in [5_u64, 64] {
+        let store = ReadCountingObjectStore::new();
+        let shard = Arc::new(
+            GraphShard::open_standalone_writer_with_options(
+                format!("graph/latency-cleanup-{edge_count}"),
+                store.clone(),
+                GraphOpenOptions {
+                    cache: GraphCacheConfig {
+                        slatedb_cache_bytes: 0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        shard
+            .set_vertex_metadata_batch(
+                "cell-a",
+                (1..=edge_count + 1).map(|id| (id, VertexMetadata::default().with_label("Entity"))),
+            )
+            .await
+            .unwrap();
+        shard
+            .import_relationships_batch(
+                "cell-a",
+                "RELATES",
+                (2..=edge_count + 1).map(|dst| RelationshipMutation {
+                    cell_id: "cell-a".into(),
+                    edge_type: "RELATES".into(),
+                    src: 1,
+                    dst,
+                    relationship_id: dst,
+                    metadata: EdgeMetadata::default()
+                        .with_property("name", VertexPropertyValue::String(format!("rel-{dst}"))),
+                }),
+                "seed",
+            )
+            .await
+            .unwrap();
+        // Sparse scopes still retain edge-type markers unrelated to the source
+        // being removed. Empty incident-prefix seeks must not serialize I/O.
+        for index in 0..8 {
+            shard
+                .write_edge(EdgeMutation {
+                    cell_id: "cell-a".into(),
+                    edge_type: format!("OTHER{index}"),
+                    src: 9000,
+                    dst: 9001,
+                    idempotency_key: format!("other-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+        shard
+            .db
+            .writer()
+            .unwrap()
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        store.get_delay_ms.store(5, Ordering::Relaxed);
+        let (started_get, release) = store.pause_next_get();
+        let before = store.reads();
+        let deleting = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let result = shard
+                    .delete_vertices_and_isolated_candidates_batch(
+                        "cell-a",
+                        vec![(1, "cleanup".into(), true, VertexMetadata::default())],
+                    )
+                    .await
+                    .unwrap();
+                (started.elapsed(), result)
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), started_get)
+            .await
+            .unwrap()
+            .unwrap();
+        let queued = (0..8)
+            .map(|i| {
+                let shard = Arc::clone(&shard);
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    shard
+                        .merge_vertex_metadata_batch(
+                            "cell-a",
+                            [(1000 + i, VertexMetadata::default().with_label("Queued"))],
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    started.elapsed().as_micros()
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        let (elapsed, deleted) = deleting.await.unwrap();
+        let mut samples = Vec::new();
+        for task in queued {
+            samples.push(task.await.unwrap());
+        }
+        samples.sort_unstable();
+        eprintln!("cleanup-gate edges={edge_count} get_delay_ms=5 cleanup_us={} queued_write_p50_us={} queued_write_max_us={} object_reads={}", elapsed.as_micros(), samples[3], samples[7], store.reads() - before);
+        assert!(deleted[0].vertex_deleted);
+        assert_eq!(deleted[0].relationships_deleted, edge_count);
+        store.get_delay_ms.store(0, Ordering::Relaxed);
+        assert_eq!(shard.out_degree("cell-a", "RELATES", 1).await.unwrap(), 0);
+        shard.close().await.unwrap();
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_ordered_timestamp_ties_retain_only_bounded_top_rows() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/ordered-bounded-ties",
+        store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_intermediate_rows: 8,
+                max_query_index_candidates: 128,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for vertex in 1..=64 {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property(
+                        "created_at",
+                        VertexPropertyValue::String("2026-09-08".into()),
+                    )
+                    .with_property(
+                        "entity_id",
+                        VertexPropertyValue::String(format!("entity-{:04}", 65 - vertex)),
+                    ),
+            )
+            .await
+            .unwrap();
+    }
+    for direction in ["ASC", "DESC"] {
+        let rows = shard.execute_cypher_rows(
+            QueryContext::new("reddit-home", format!("bounded-ties-{direction}")),
+            &format!("MATCH (e:Entity) WHERE e.created_at STARTS WITH '' RETURN e.entity_id ORDER BY e.created_at {direction}, e.entity_id SKIP 2 LIMIT 3"),
+        ).await.unwrap();
+        assert_eq!(
+            rows.rows
+                .iter()
+                .map(|row| row.values.clone())
+                .collect::<Vec<_>>(),
+            (3..=5)
+                .map(
+                    |id| vec![QueryValue::Property(VertexPropertyValue::String(format!(
+                        "entity-{id:04}"
+                    )))]
+                )
+                .collect::<Vec<_>>()
+        );
+    }
+    let sparse = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "large-limit-small-result"),
+            "MATCH (e:Entity) WHERE e.created_at STARTS WITH '' AND e.entity_id = 'entity-0001' \
+         RETURN e.entity_id ORDER BY e.created_at DESC LIMIT 1000",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sparse.rows.len(),
+        1,
+        "the requested limit is not the number of retained rows"
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_ordered_string_index_applies_limit_before_tenant_wide_hydration() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -10638,6 +17938,14 @@ async fn cypher_ordered_string_index_applies_limit_before_tenant_wide_hydration(
                     .with_label("Entity")
                     .with_property("tenant_id", VertexPropertyValue::String("tenant-a".into()))
                     .with_property("sub_tenant_id", VertexPropertyValue::String("sub-a".into()))
+                    .with_property(
+                        "type",
+                        VertexPropertyValue::String(if vertex_id % 2 == 0 {
+                            "ORGANIZATION".into()
+                        } else {
+                            "PERSON".into()
+                        }),
+                    )
                     .with_property("created_at", VertexPropertyValue::String(created_at))
                     .with_property(
                         "entity_id",
@@ -10652,7 +17960,8 @@ async fn cypher_ordered_string_index_applies_limit_before_tenant_wide_hydration(
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "cypher-ordered-string-limit"),
             "MATCH (e:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
-             WHERE e.created_at STARTS WITH '' \
+             WHERE (e.type = 'PERSON' OR e.type = 'ORGANIZATION') \
+               AND e.created_at STARTS WITH '' \
              RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 2",
         )
         .await
@@ -10676,7 +17985,8 @@ async fn cypher_ordered_string_index_applies_limit_before_tenant_wide_hydration(
         .explain_opencypher_rows(
             QueryContext::new("reddit-home", "cypher-ordered-string-limit-explain"),
             "MATCH (e:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
-             WHERE e.created_at STARTS WITH '' \
+             WHERE (e.type = 'PERSON' OR e.type = 'ORGANIZATION') \
+               AND e.created_at STARTS WITH '' \
              RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 2",
         )
         .await
@@ -10690,6 +18000,293 @@ async fn cypher_ordered_string_index_applies_limit_before_tenant_wide_hydration(
     assert!(plan.groups[0].patterns[0]
         .optimizer_passes
         .contains(&RowQueryOptimizerPass::OrderedLimitPushdown));
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_ordered_string_keyset_seeks_to_predicate_lower_bound() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-ordered-string-keyset-seek",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_index_candidates: 64,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for vertex_id in 1..=100 {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property(
+                        "created_at",
+                        VertexPropertyValue::String(format!("2026-08-08T00:00:{vertex_id:03}Z")),
+                    )
+                    .with_property(
+                        "entity_id",
+                        VertexPropertyValue::String(format!("entity-{vertex_id:03}")),
+                    ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-ordered-string-keyset-seek"),
+            "MATCH (e:Entity) \
+             WHERE (e.created_at > '2026-08-08T00:00:090Z' \
+                OR (e.created_at = '2026-08-08T00:00:090Z' AND e.entity_id > 'entity-090')) \
+               AND e.created_at STARTS WITH '' \
+             RETURN e.entity_id ORDER BY e.created_at, e.entity_id LIMIT 3",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("e.entity_id")],
+            vec![91, 92, 93]
+                .into_iter()
+                .map(|vertex_id| {
+                    QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                        format!("entity-{vertex_id:03}"),
+                    ))])
+                })
+                .collect(),
+        )
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn production_ingestion_lookup_shapes_execute_on_indexed_row_engine() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/production-ingestion-lookups", object_store).await;
+    let scoped = |metadata: VertexMetadata| {
+        metadata
+            .with_property("tenant_id", VertexPropertyValue::String("tenant-a".into()))
+            .with_property("sub_tenant_id", VertexPropertyValue::String("sub-a".into()))
+    };
+    shard
+        .set_vertex_metadata_batch(
+            "cell-a",
+            vec![
+                (
+                    1,
+                    scoped(VertexMetadata::default().with_label("Entity"))
+                        .with_property("entity_id", VertexPropertyValue::String("entity-a".into())),
+                ),
+                (
+                    2,
+                    scoped(VertexMetadata::default().with_label("Entity"))
+                        .with_property("entity_id", VertexPropertyValue::String("entity-b".into())),
+                ),
+                (
+                    10,
+                    scoped(VertexMetadata::default().with_label("Chunk"))
+                        .with_property("chunk_id", VertexPropertyValue::String("chunk-a".into())),
+                ),
+                (
+                    11,
+                    scoped(VertexMetadata::default().with_label("Chunk"))
+                        .with_property("chunk_id", VertexPropertyValue::String("chunk-b".into())),
+                ),
+                (
+                    20,
+                    scoped(VertexMetadata::default().with_label("Source"))
+                        .with_property("source_id", VertexPropertyValue::String("source-a".into())),
+                ),
+                (
+                    30,
+                    scoped(VertexMetadata::default().with_label("Actor"))
+                        .with_property("actor_id", VertexPropertyValue::String("actor-a".into()))
+                        .with_property(
+                            "email",
+                            VertexPropertyValue::String("actor-a@example.com".into()),
+                        )
+                        .with_property(
+                            "created_at",
+                            VertexPropertyValue::String("2026-08-08T00:00:001Z".into()),
+                        ),
+                ),
+                (
+                    31,
+                    scoped(VertexMetadata::default().with_label("Actor"))
+                        .with_property("actor_id", VertexPropertyValue::String("actor-b".into()))
+                        .with_property(
+                            "email",
+                            VertexPropertyValue::String("actor-b@example.com".into()),
+                        )
+                        .with_property(
+                            "created_at",
+                            VertexPropertyValue::String("2026-08-08T00:00:002Z".into()),
+                        )
+                        .with_property("is_canonical", VertexPropertyValue::Bool(true)),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for (index, (edge_type, src, dst)) in [
+        ("PRESENT_IN", 1, 10),
+        ("PRESENT_IN", 2, 11),
+        ("HAS_CHUNK", 10, 20),
+        ("HAS_CHUNK", 11, 20),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "cell-a".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("production-ingestion-lookup-{index}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let snippets = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "production-ingestion-snippets").with_parameters(
+                BTreeMap::from([
+                    (
+                        "entity_id_0".to_string(),
+                        VertexPropertyValue::String("entity-a".into()),
+                    ),
+                    (
+                        "entity_id_1".to_string(),
+                        VertexPropertyValue::String("entity-b".into()),
+                    ),
+                ]),
+            ),
+            "MATCH (e:Entity {entity_id: $entity_id_0})-[:PRESENT_IN]->(c:Chunk)-[:HAS_CHUNK]->(s:Source) \
+             RETURN e.entity_id AS entity_id, c.chunk_id AS chunk_id, s.source_id AS source_id LIMIT 1 \
+             UNION ALL \
+             MATCH (e:Entity {entity_id: $entity_id_1})-[:PRESENT_IN]->(c:Chunk)-[:HAS_CHUNK]->(s:Source) \
+             RETURN e.entity_id AS entity_id, c.chunk_id AS chunk_id, s.source_id AS source_id LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(snippets.rows.len(), 2);
+    assert_eq!(
+        snippets.rows[0].values,
+        vec![
+            QueryValue::Property(VertexPropertyValue::String("entity-a".into())),
+            QueryValue::Property(VertexPropertyValue::String("chunk-a".into())),
+            QueryValue::Property(VertexPropertyValue::String("source-a".into())),
+        ]
+    );
+
+    let cleanup = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "production-ingestion-cleanup-discovery")
+                .with_parameters(BTreeMap::from([(
+                    "source_id".to_string(),
+                    VertexPropertyValue::String("source-a".into()),
+                )])),
+            "MATCH (s:Source {source_id: $source_id, tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             RETURN s.id AS vertex_id, s.id AS source_vertex_id, s.id AS delete_vertex_id, s.source_id AS object_id \
+             UNION ALL \
+             MATCH (s:Source {source_id: $source_id, tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             MATCH (c:Chunk)-[:HAS_CHUNK]->(s) \
+             RETURN c.id AS vertex_id, s.id AS source_vertex_id, c.id AS delete_vertex_id, c.chunk_id AS object_id \
+             UNION ALL \
+             MATCH (e:Entity)-[:PRESENT_IN]->(c:Chunk)-[:HAS_CHUNK]->(s:Source {source_id: $source_id, tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             RETURN e.id AS vertex_id, s.id AS source_vertex_id, c.id AS delete_vertex_id, e.entity_id AS object_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleanup.rows.len(), 5);
+    assert!(cleanup.rows.iter().any(|row| {
+        row.values
+            == vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(20),
+                QueryValue::VertexId(10),
+                QueryValue::Property(VertexPropertyValue::String("entity-a".into())),
+            ]
+    }));
+
+    let existing_entity_plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("cell-a", "production-existing-entity-page-explain"),
+            "MATCH (e:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             WHERE e.created_at STARTS WITH '' \
+             RETURN e.name AS name, e.type AS type \
+             ORDER BY e.created_at DESC, e.entity_id LIMIT 500",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        existing_entity_plan.groups[0].patterns[0].access,
+        RowQueryAccess::VertexPropertyIndex {
+            property: "created_at".to_string(),
+        }
+    );
+    assert!(existing_entity_plan.groups[0].patterns[0]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::OrderedLimitPushdown));
+
+    let actor_page_query = "MATCH (a:Actor {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+         WHERE (a.created_at > $after_created_at \
+                OR (a.created_at = $after_created_at AND a.actor_id > $after_actor_id)) \
+           AND a.created_at STARTS WITH '' \
+         RETURN a.actor_id AS actor_id, a.email AS email, \
+                a.created_at AS created_at, a.is_canonical AS is_canonical \
+         ORDER BY a.created_at, a.actor_id LIMIT $page_size";
+    let actor_context = || {
+        QueryContext::new("cell-a", "production-actor-page").with_parameters(BTreeMap::from([
+            (
+                "after_created_at".to_string(),
+                VertexPropertyValue::String(String::new()),
+            ),
+            (
+                "after_actor_id".to_string(),
+                VertexPropertyValue::String(String::new()),
+            ),
+            ("page_size".to_string(), VertexPropertyValue::Integer(10)),
+        ]))
+    };
+    let actor_page_plan = shard
+        .explain_opencypher_rows(actor_context(), actor_page_query)
+        .await
+        .unwrap();
+    assert_eq!(
+        actor_page_plan.groups[0].patterns[0].access,
+        RowQueryAccess::VertexPropertyIndex {
+            property: "created_at".to_string(),
+        }
+    );
+    assert!(actor_page_plan.groups[0].patterns[0]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::OrderedLimitPushdown));
+
+    let actor_page = shard
+        .execute_cypher_rows(actor_context(), actor_page_query)
+        .await
+        .unwrap();
+    assert_eq!(actor_page.rows.len(), 2);
+    assert_eq!(
+        actor_page.rows[0].values[0],
+        QueryValue::Property(VertexPropertyValue::String("actor-a".into()))
+    );
     shard.close().await.unwrap();
 }
 
@@ -11240,6 +18837,7 @@ async fn cypher_executes_set_remove_delete_and_merge_mutations() {
         QueryOutput::Mutation(QueryMutationResult {
             matched_rows: 1,
             deleted_edges: 1,
+            topology_sequence: Some(4),
             ..QueryMutationResult::default()
         })
     );
@@ -11282,6 +18880,7 @@ async fn cypher_detach_delete_node_cascades_edges_and_metadata() {
         .await
         .unwrap();
 
+    let before_delete = shard.current_storage_sequence("reddit-home").await.unwrap();
     let deleted = shard
         .execute_cypher(
             QueryContext::new("reddit-home", "cypher-detach-delete"),
@@ -11295,8 +18894,13 @@ async fn cypher_detach_delete_node_cascades_edges_and_metadata() {
             matched_rows: 1,
             deleted_edges: 2,
             updated_vertices: 1,
+            topology_sequence: Some(before_delete + 1),
             ..QueryMutationResult::default()
         })
+    );
+    assert_eq!(
+        shard.current_storage_sequence("reddit-home").await.unwrap(),
+        before_delete + 1
     );
     assert!(!shard
         .edge_exists("reddit-home", "FOLLOWS", 1, 2)
@@ -11633,6 +19237,7 @@ async fn cypher_relationship_properties_case() {
         QueryOutput::Mutation(QueryMutationResult {
             matched_rows: 1,
             deleted_edges: 1,
+            topology_sequence: Some(6),
             ..QueryMutationResult::default()
         })
     );
@@ -12742,6 +20347,7 @@ async fn cypher_expand_into_checks_bound_edge_without_neighbor_scan() {
             vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
         )
     );
+
     shard.close().await.unwrap();
 }
 
@@ -12961,6 +20567,760 @@ async fn cypher_edge_match_uses_edge_property_index_before_endpoint_expansion() 
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn multi_inline_node_properties_get_deterministic_probe_slices() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-selective-inline-node-property-anchor",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                // Ten inline properties receive one candidate each. The nine
+                // broad probes must not spend the selective probe's slice.
+                max_query_index_candidates: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for index in 0_u64..128 {
+        let mut metadata = VertexMetadata::default().with_label("Entity");
+        for property in [
+            "a_common", "b_common", "c_common", "d_common", "e_common", "f_common", "g_common",
+            "h_common", "i_common",
+        ] {
+            metadata =
+                metadata.with_property(property, VertexPropertyValue::String("shared".to_string()));
+        }
+        shard
+            .set_vertex_metadata(
+                "scope",
+                100 + index,
+                metadata.with_property(
+                    "z_unique",
+                    VertexPropertyValue::String(format!("unique-{index}")),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "selective-inline-node-property-read"),
+            "MATCH (e:Entity {a_common: 'shared', b_common: 'shared', c_common: 'shared', \
+             d_common: 'shared', e_common: 'shared', f_common: 'shared', g_common: 'shared', \
+             h_common: 'shared', i_common: 'shared', z_unique: 'unique-17'}) RETURN e.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("e.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(117)])],
+        )
+    );
+    shard.close().await.unwrap();
+}
+
+/// A single equality in WHERE is also a bounded runtime seed. Persisted
+/// estimates can lag a hot tenant and choose its broad inline property; the
+/// WHERE seek must get its own probe allowance instead of letting that broad
+/// scan consume the query's complete candidate budget first.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn where_equality_recovers_from_a_stale_broad_inline_index() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-selective-where-node-property-anchor",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_index_candidates: 8,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for index in 0_u64..32 {
+        shard
+            .set_vertex_metadata(
+                "scope",
+                100 + index,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property(
+                        "sub_tenant_id",
+                        VertexPropertyValue::String("shared".to_string()),
+                    )
+                    .with_property(
+                        "z_unique",
+                        VertexPropertyValue::String(format!("unique-{index}")),
+                    ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "selective-where-node-property-read"),
+            "MATCH (e:Entity {sub_tenant_id: 'shared'}) \
+             WHERE e.z_unique = 'unique-17' RETURN e.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("e.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(117)])],
+        )
+    );
+
+    // A repeated property cannot be pushed into the pattern, because the
+    // inline value is already there. The complete empty seek still proves the
+    // result without scanning all 32 broad inline matches and being rejected.
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "contradictory-where-node-property-read"),
+            "MATCH (e:Entity {sub_tenant_id: 'shared'}) \
+             WHERE e.sub_tenant_id = 'absent' RETURN e.id",
+        )
+        .await
+        .unwrap();
+    assert!(rows.rows.is_empty());
+    shard.close().await.unwrap();
+}
+
+/// Equality alternatives consume a bounded seek allowance independently from
+/// returned index candidates. Batched identity lookups commonly contain many
+/// absent values; those empty prefixes must not spend the candidate budget and
+/// force a fallback to a tenant-wide inline property index.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn batched_where_equalities_do_not_charge_empty_seeks_as_candidates() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-batched-selective-where-anchor",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_index_candidates: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for index in 0_u64..96 {
+        shard
+            .set_vertex_metadata(
+                "scope",
+                100 + index,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property(
+                        "sub_tenant_id",
+                        VertexPropertyValue::String("shared".to_string()),
+                    )
+                    .with_property(
+                        "identity",
+                        VertexPropertyValue::String(format!("identity-{index}")),
+                    ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut parameters = BTreeMap::new();
+    let predicate = (0_u64..64)
+        .map(|index| {
+            let value = if index == 63 {
+                "identity-17".to_string()
+            } else {
+                format!("absent-{index}")
+            };
+            parameters.insert(
+                format!("candidate_{index}"),
+                VertexPropertyValue::String(value),
+            );
+            format!("e.identity = $candidate_{index}")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let query =
+        format!("MATCH (e:Entity {{sub_tenant_id: 'shared'}}) WHERE {predicate} RETURN e.id");
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "batched-selective-where-anchor-read")
+                .with_parameters(parameters),
+            &query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("e.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(117)])],
+        )
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn inline_relationship_property_anchors_before_broad_endpoint_filters() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-inline-relationship-property-anchor",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_index_candidates: 8,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut vertices = Vec::new();
+    let mut relationships = Vec::new();
+    for index in 0_u64..32 {
+        let src = 100 + index;
+        let dst = 200 + index;
+        let scoped_entity = |name: String| {
+            VertexMetadata::default()
+                .with_label("Entity")
+                .with_property("tenant_id", VertexPropertyValue::String("tenant-a".into()))
+                .with_property("sub_tenant_id", VertexPropertyValue::String("sub-a".into()))
+                .with_property("name", VertexPropertyValue::String(name))
+        };
+        vertices.push((src, scoped_entity(format!("source-{index}"))));
+        vertices.push((dst, scoped_entity(format!("target-{index}"))));
+        relationships.push(RelationshipMutation {
+            cell_id: "scope".to_string(),
+            edge_type: "RELATES".to_string(),
+            src,
+            dst,
+            relationship_id: 1_000 + index,
+            metadata: EdgeMetadata::default().with_property(
+                "chunk_id",
+                VertexPropertyValue::String(format!("chunk-{index}")),
+            ),
+        });
+    }
+    shard
+        .set_vertex_metadata_batch("scope", vertices)
+        .await
+        .unwrap();
+    shard
+        .import_relationships_batch(
+            "scope",
+            "RELATES",
+            relationships,
+            "inline-relationship-property-anchor-import",
+        )
+        .await
+        .unwrap();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "inline-relationship-property-anchor-read"),
+            "MATCH (src:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             -[r:RELATES {chunk_id: 'chunk-17'}]-> \
+             (tgt:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             RETURN src.name AS source_name, tgt.name AS target_name, \
+                    r.chunk_id AS chunk_id LIMIT 50",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("source_name"),
+                QueryColumn::new("target_name"),
+                QueryColumn::new("chunk_id"),
+            ],
+            vec![QueryRow::new(vec![
+                QueryValue::Property(VertexPropertyValue::String("source-17".into())),
+                QueryValue::Property(VertexPropertyValue::String("target-17".into())),
+                QueryValue::Property(VertexPropertyValue::String("chunk-17".into())),
+            ])],
+        )
+    );
+
+    let mut parameters = BTreeMap::new();
+    let union_query = (0_u64..10)
+        .map(|index| {
+            parameters.insert(
+                format!("batch_value_{index}"),
+                VertexPropertyValue::String(format!("chunk-{}", 10 + index)),
+            );
+            format!(
+                "MATCH (src:Entity {{tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}}) \
+                 -[r:RELATES {{chunk_id: $batch_value_{index}}}]-> \
+                 (tgt:Entity {{tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}}) \
+                 RETURN src.name AS source_name, tgt.name AS target_name, \
+                        r.chunk_id AS chunk_id LIMIT 50"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let union_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "inline-relationship-property-union-read")
+                .with_parameters(parameters),
+            &union_query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(union_rows.rows.len(), 10);
+    assert_eq!(
+        union_rows.rows[0].values,
+        vec![
+            QueryValue::Property(VertexPropertyValue::String("source-10".into())),
+            QueryValue::Property(VertexPropertyValue::String("target-10".into())),
+            QueryValue::Property(VertexPropertyValue::String("chunk-10".into())),
+        ]
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn inline_relationship_properties_choose_the_selective_index_anchor() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-selective-inline-relationship-property-anchor",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_index_candidates: 8,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let relationship = |index: u64| RelationshipMutation {
+        cell_id: "scope".to_string(),
+        edge_type: "RELATES".to_string(),
+        src: 100 + index,
+        dst: 200 + index,
+        relationship_id: 1_000 + index,
+        metadata: EdgeMetadata::default()
+            .with_property(
+                "a_common",
+                VertexPropertyValue::String("shared".to_string()),
+            )
+            .with_property(
+                "b_common_without_stats",
+                VertexPropertyValue::String("shared".to_string()),
+            )
+            .with_property(
+                "c_common_without_stats",
+                VertexPropertyValue::String("shared".to_string()),
+            )
+            .with_property(
+                "d_common_without_stats",
+                VertexPropertyValue::String("shared".to_string()),
+            )
+            .with_property(
+                "e_common_without_stats",
+                VertexPropertyValue::String("shared".to_string()),
+            )
+            .with_property(
+                "y_unique_without_stats",
+                VertexPropertyValue::String(format!("unstated-{index}")),
+            )
+            .with_property(
+                "z_unique",
+                VertexPropertyValue::String(format!("unique-{index}")),
+            ),
+    };
+
+    shard
+        .import_relationships_batch(
+            "scope",
+            "RELATES",
+            (0_u64..8).map(relationship).collect::<Vec<_>>(),
+            "selective-inline-anchor-initial",
+        )
+        .await
+        .unwrap();
+    shard
+        .refresh_edge_property_query_stats(
+            "scope",
+            "RELATES",
+            "a_common",
+            &VertexPropertyValue::String("shared".to_string()),
+        )
+        .await
+        .unwrap();
+    shard
+        .refresh_edge_property_query_stats(
+            "scope",
+            "RELATES",
+            "z_unique",
+            &VertexPropertyValue::String("unique-3".to_string()),
+        )
+        .await
+        .unwrap();
+
+    // Keep the published estimates deliberately stale-but-usable, matching a
+    // live graph between indexer refreshes. The alphabetically first property
+    // now exceeds the query budget; only z_unique remains a valid seed.
+    shard
+        .import_relationships_batch(
+            "scope",
+            "RELATES",
+            (8_u64..32).map(relationship).collect::<Vec<_>>(),
+            "selective-inline-anchor-growth",
+        )
+        .await
+        .unwrap();
+
+    let query = "MATCH (src)-[r:RELATES {a_common: 'shared', z_unique: 'unique-3'}]->(dst) \
+         RETURN src.id AS source_id, dst.id AS target_id";
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("scope", "selective-inline-anchor-explain"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.groups[0].patterns[0].access,
+        RowQueryAccess::EdgePropertyIndex {
+            edge_type: "RELATES".to_string(),
+            property: "z_unique".to_string(),
+        }
+    );
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "selective-inline-anchor-read"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("source_id"), QueryColumn::new("target_id")],
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(103),
+                QueryValue::VertexId(203),
+            ])],
+        )
+    );
+
+    let common_key =
+        encode_vertex_property_value_key(&VertexPropertyValue::String("shared".to_string()));
+    let unique_key =
+        encode_vertex_property_value_key(&VertexPropertyValue::String("unstated-3".to_string()));
+    assert!(shard
+        .query_stats_record(&keys::query_stats_edge_property(
+            "scope",
+            "RELATES",
+            "b_common_without_stats",
+            &common_key,
+        ))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(shard
+        .query_stats_record(&keys::query_stats_edge_property(
+            "scope",
+            "RELATES",
+            "y_unique_without_stats",
+            &unique_key,
+        ))
+        .await
+        .unwrap()
+        .is_none());
+
+    let rows_without_stats = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "selective-inline-anchor-without-stats"),
+            "MATCH (src)-[r:RELATES {b_common_without_stats: 'shared', \
+                                    c_common_without_stats: 'shared', \
+                                    d_common_without_stats: 'shared', \
+                                    e_common_without_stats: 'shared', \
+                                    y_unique_without_stats: 'unstated-3'}]->(dst) \
+             RETURN src.id AS source_id, dst.id AS target_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_without_stats, rows);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn ordered_relationship_property_limit_avoids_full_edge_scan() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-ordered-relationship-property-index",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut relationships = Vec::new();
+    for index in 0_u64..32 {
+        let src = 100 + index;
+        let dst = 200 + index;
+        shard
+            .set_vertex_metadata(
+                "scope",
+                src,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property(
+                        "name",
+                        VertexPropertyValue::String(format!("source-{index}")),
+                    ),
+            )
+            .await
+            .unwrap();
+        shard
+            .set_vertex_metadata(
+                "scope",
+                dst,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property(
+                        "name",
+                        VertexPropertyValue::String(format!("target-{index}")),
+                    ),
+            )
+            .await
+            .unwrap();
+        relationships.push(RelationshipMutation {
+            cell_id: "scope".to_string(),
+            edge_type: "RELATES".to_string(),
+            src,
+            dst,
+            relationship_id: 1_000 + index,
+            metadata: EdgeMetadata::default()
+                .with_property("timestamp", VertexPropertyValue::Integer(index))
+                .with_property(
+                    "chunk_id",
+                    VertexPropertyValue::String(format!("chunk-{index}")),
+                ),
+        });
+    }
+    shard
+        .import_relationships_batch(
+            "scope",
+            "RELATES",
+            relationships,
+            "ordered-relationship-property-import",
+        )
+        .await
+        .unwrap();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "ordered-relationship-property-read"),
+            "MATCH (src:Entity)-[r:RELATES]->(tgt:Entity) \
+             WHERE r.timestamp >= 0 \
+             RETURN src.name AS source_name, tgt.name AS target_name, \
+                    r.timestamp AS timestamp \
+             ORDER BY r.timestamp DESC LIMIT 3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("source_name"),
+                QueryColumn::new("target_name"),
+                QueryColumn::new("timestamp"),
+            ],
+            vec![31_u64, 30, 29]
+                .into_iter()
+                .map(|index| {
+                    QueryRow::new(vec![
+                        QueryValue::Property(VertexPropertyValue::String(format!(
+                            "source-{index}"
+                        ))),
+                        QueryValue::Property(VertexPropertyValue::String(format!(
+                            "target-{index}"
+                        ))),
+                        QueryValue::Property(VertexPropertyValue::Integer(index)),
+                    ])
+                })
+                .collect(),
+        )
+    );
+
+    let scores = [
+        VertexPropertyValue::SignedInteger(-2),
+        VertexPropertyValue::Float(QueryFloat(-1.5)),
+        VertexPropertyValue::Integer(0),
+        VertexPropertyValue::Float(QueryFloat(0.5)),
+        VertexPropertyValue::Integer(1),
+        VertexPropertyValue::Float(QueryFloat(2.25)),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, score)| RelationshipMutation {
+        cell_id: "scope".to_string(),
+        edge_type: "SCORED".to_string(),
+        src: 100 + index as u64,
+        dst: 200 + index as u64,
+        relationship_id: 3_000 + index as u64,
+        metadata: EdgeMetadata::default().with_property("score", score),
+    });
+    shard
+        .import_relationships_batch(
+            "scope",
+            "SCORED",
+            scores,
+            "ordered-mixed-numeric-property-import",
+        )
+        .await
+        .unwrap();
+
+    let mixed_numeric = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "ordered-mixed-numeric-property-read"),
+            "MATCH (src:Entity)-[r:SCORED]->(tgt:Entity) \
+             WHERE r.score >= -10 \
+             RETURN r.score AS score \
+             ORDER BY r.score ASC SKIP 1 LIMIT 3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed_numeric,
+        QueryResultSet::new(
+            vec![QueryColumn::new("score")],
+            vec![
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Float(
+                    QueryFloat(-1.5),
+                ))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(0))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Float(
+                    QueryFloat(0.5),
+                ))]),
+            ],
+        )
+    );
+
+    let aliases = (0_u64..4).map(|index| RelationshipMutation {
+        cell_id: "scope".to_string(),
+        edge_type: "ALIAS_OF".to_string(),
+        src: 100 + index,
+        dst: 200 + index,
+        relationship_id: 2_000 + index,
+        metadata: EdgeMetadata::default().with_property(
+            "created_at",
+            VertexPropertyValue::String(format!("2026-09-0{}T00:00:00Z", index + 1)),
+        ),
+    });
+    shard
+        .import_relationships_batch(
+            "scope",
+            "ALIAS_OF",
+            aliases,
+            "ordered-alias-created-at-import",
+        )
+        .await
+        .unwrap();
+    let aliases = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "ordered-alias-created-at-read"),
+            "MATCH (src:Entity)-[r:ALIAS_OF]->(tgt:Entity) \
+             WHERE r.created_at STARTS WITH '' \
+             RETURN r.created_at AS created_at \
+             ORDER BY r.created_at DESC LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        aliases,
+        QueryResultSet::new(
+            vec![QueryColumn::new("created_at")],
+            vec![
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                    "2026-09-04T00:00:00Z".to_string(),
+                ))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                    "2026-09-03T00:00:00Z".to_string(),
+                ))]),
+            ],
+        )
+    );
+
+    let combined = shard
+        .execute_cypher_rows(
+            QueryContext::new("scope", "ordered-relation-union-read"),
+            "MATCH (src:Entity)-[r:RELATES]->(tgt:Entity) \
+             WHERE r.timestamp >= 0 \
+             RETURN src.name AS source_name, r.timestamp AS timestamp, \
+                    r.created_at AS created_at \
+             ORDER BY r.timestamp DESC LIMIT 2 \
+             UNION ALL \
+             MATCH (src:Entity)-[r:ALIAS_OF]->(tgt:Entity) \
+             WHERE r.created_at STARTS WITH '' \
+             RETURN src.name AS source_name, r.timestamp AS timestamp, \
+                    r.created_at AS created_at \
+             ORDER BY r.created_at DESC LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(combined.rows.len(), 4);
+    assert_eq!(
+        combined.rows[0].values[1],
+        QueryValue::Property(VertexPropertyValue::Integer(31))
+    );
+    assert_eq!(
+        combined.rows[1].values[1],
+        QueryValue::Property(VertexPropertyValue::Integer(30))
+    );
+    assert_eq!(
+        combined.rows[2].values[2],
+        QueryValue::Property(VertexPropertyValue::String(
+            "2026-09-04T00:00:00Z".to_string()
+        ))
+    );
+    assert_eq!(
+        combined.rows[3].values[2],
+        QueryValue::Property(VertexPropertyValue::String(
+            "2026-09-03T00:00:00Z".to_string()
+        ))
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_relationship_where_disjunction_uses_edge_property_index() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -13060,7 +21420,11 @@ async fn cypher_relationship_where_disjunction_uses_edge_property_index() {
         plan.groups[0].patterns[0].access,
         RowQueryAccess::EdgePropertyIndex {
             edge_type: "RELATES".to_string(),
-            property: "chunk_id".to_string(),
+            // The six-value chunk predicate estimates six candidates, while
+            // the current marker has two. Cost-based selection should use the
+            // narrower equality and leave the complete WHERE predicate to
+            // preserve the same result set.
+            property: "superseded_by".to_string(),
         }
     );
     assert!(!plan.groups[0].patterns[0]
@@ -15879,4 +24243,730 @@ async fn xlog_purge_forces_one_bootstrap_then_recovers() {
     );
     let check = shard.build_graph_index(cell_id, edge_type).await.unwrap();
     assert_eq!(incremental.generation, check.generation);
+}
+
+/// The two spellings of the same filter must plan the same access path.
+///
+/// `MATCH (s:Source {app_external_id: 'x'})` puts the constraint in the
+/// pattern, where `best_row_node_access` can see it. `MATCH (s:Source) WHERE
+/// s.app_external_id = 'x'` puts it in `RowMatchGroup.predicate`, which that
+/// function never reads — so before `push_down_vertex_equality_predicate` the
+/// second form scanned every `:Source` vertex and filtered afterwards. On
+/// production-sized data that is roughly three orders of magnitude;
+/// `examples/where_vs_inline_bench.rs` measures it.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_where_equality_plans_the_same_access_path_as_an_inline_property() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/where-equality-pushdown", object_store).await;
+
+    for vertex_id in 1..=6_u64 {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("Source")
+                    .with_property(
+                        "app_external_id",
+                        VertexPropertyValue::String(format!("ext-{vertex_id}")),
+                    )
+                    .with_property("tier", VertexPropertyValue::String("common".to_string())),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Real statistics, as the indexer refreshes them in production. Without
+    // them every property estimates at the hard-coded default of 8, so the
+    // optimizer cannot tell a unique key from a four-way one and any
+    // "picks the selective property" assertion below would be passing on a
+    // tie-break rather than on selectivity.
+    for property in ["app_external_id", "tier"] {
+        shard
+            .refresh_vertex_property_histogram_query_stats("cell-a", property)
+            .await
+            .unwrap();
+    }
+    shard
+        .refresh_vertex_label_query_stats("cell-a", "Source")
+        .await
+        .unwrap();
+
+    let indexed = RowQueryAccess::VertexPropertyIndex {
+        property: "app_external_id".to_string(),
+    };
+    let label_scan = RowQueryAccess::VertexLabelScan {
+        label: "Source".to_string(),
+    };
+
+    let access_for = |query: &'static str| {
+        let shard = &shard;
+        async move {
+            let plan = shard
+                .explain_opencypher_rows(
+                    QueryContext::new("cell-a", "where-equality-pushdown-explain"),
+                    query,
+                )
+                .await
+                .unwrap();
+            plan.groups[0].clone()
+        }
+    };
+
+    // The control: the constraint was always visible in this form.
+    assert_eq!(
+        access_for("MATCH (s:Source {app_external_id: 'ext-3'}) RETURN s.tier AS tier")
+            .await
+            .patterns[0]
+            .access,
+        indexed
+    );
+
+    for query in [
+        "MATCH (s:Source) WHERE s.app_external_id = 'ext-3' RETURN s.tier AS tier",
+        // Reversed operands mean the same thing and must plan the same way.
+        "MATCH (s:Source) WHERE 'ext-3' = s.app_external_id RETURN s.tier AS tier",
+        // An AND chain: the equality anchors, the rest stays a filter.
+        "MATCH (s:Source) WHERE s.app_external_id = 'ext-3' AND s.tier <> 'rare' \
+         RETURN s.tier AS tier",
+    ] {
+        let group = access_for(query).await;
+        assert_eq!(group.patterns[0].access, indexed, "{query}");
+        assert!(
+            group
+                .optimizer_passes
+                .contains(&RowQueryOptimizerPass::EqualityPredicatePushdown),
+            "{query} should record the pushdown pass"
+        );
+    }
+
+    // Predicates the index cannot answer must keep the scan. Each of these
+    // matches rows the seek would never read, and the surviving predicate
+    // cannot put back what was not fetched.
+    for query in [
+        // OR across two properties.
+        "MATCH (s:Source) WHERE s.app_external_id = 'ext-3' OR s.tier = 'common' \
+         RETURN s.tier AS tier",
+        // OR over one property is a two-value constraint, and a node pattern
+        // holds one value per property.
+        "MATCH (s:Source) WHERE s.app_external_id = 'ext-3' OR s.app_external_id = 'ext-4' \
+         RETURN s.tier AS tier",
+        "MATCH (s:Source) WHERE NOT s.app_external_id = 'ext-3' RETURN s.tier AS tier",
+        "MATCH (s:Source) WHERE s.app_external_id > 'ext-3' RETURN s.tier AS tier",
+    ] {
+        let group = access_for(query).await;
+        assert_eq!(group.patterns[0].access, label_scan, "{query}");
+        assert!(
+            !group
+                .optimizer_passes
+                .contains(&RowQueryOptimizerPass::EqualityPredicatePushdown),
+            "{query} must not record a pushdown"
+        );
+    }
+
+    // An AND chain proves every one of its terms, so the plan must not depend
+    // on which was written first, and a term this pass cannot use must not
+    // hide one it can. Taking only the first constraint failed all three.
+    for query in [
+        // The selective term second. Reported by review; taking the first
+        // pushed `tier` and left a four-row index scan where a one-row seek
+        // was available.
+        "MATCH (s:Source) WHERE s.tier = 'common' AND s.app_external_id = 'ext-3' \
+         RETURN s.tier AS tier",
+        // The same two terms the other way round, which used to be the only
+        // spelling that planned well.
+        "MATCH (s:Source) WHERE s.app_external_id = 'ext-3' AND s.tier = 'common' \
+         RETURN s.tier AS tier",
+        // The masking case, and the one that actually cost a scan: the OR
+        // folds to a two-value constraint this pass cannot anchor on, and
+        // taking only the first meant the indexable term beside it was never
+        // looked at.
+        "MATCH (s:Source) WHERE (s.tier = 'common' OR s.tier = 'rare') \
+         AND s.app_external_id = 'ext-3' RETURN s.tier AS tier",
+    ] {
+        let group = access_for(query).await;
+        assert_eq!(group.patterns[0].access, indexed, "{query}");
+        assert_eq!(
+            group.patterns[0].estimated_cardinality, 1,
+            "{query} must anchor on the selective property, not merely on one of them"
+        );
+    }
+
+    // `id` is not a property: `node_id_expression_binding` routes every `x.id`
+    // to `RowExpression::NodeId`, so no property constraint is ever built for
+    // it and there is nothing to push. The pass guards the name as well,
+    // because `RowNodePattern.id` is its own field and the index search skips
+    // it — but that guard is about the pattern's invariant, not about this
+    // query.
+    assert_eq!(
+        access_for("MATCH (s:Source) WHERE s.id = 3 RETURN s.tier AS tier")
+            .await
+            .patterns[0]
+            .access,
+        label_scan
+    );
+
+    shard.close().await.unwrap();
+}
+
+/// The pushdown rewrites the pattern, so it has to return exactly what the
+/// predicate would have selected — including through an OPTIONAL boundary,
+/// across numeric spellings, and when the binding is an edge endpoint.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_where_equality_pushdown_returns_what_the_predicate_selected() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/where-equality-pushdown-rows", object_store).await;
+
+    for vertex_id in 1..=3_u64 {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("Source")
+                    .with_property(
+                        "app_external_id",
+                        VertexPropertyValue::String(format!("ext-{vertex_id}")),
+                    )
+                    .with_property("score", VertexPropertyValue::Integer(vertex_id)),
+            )
+            .await
+            .unwrap();
+    }
+    for vertex_id in 11..=13_u64 {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                vertex_id,
+                VertexMetadata::default().with_label("Doc").with_property(
+                    "name",
+                    VertexPropertyValue::String(format!("doc-{vertex_id}")),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    for (src, dst) in [(1_u64, 11_u64), (2, 12), (3, 13)] {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "HAS",
+                src,
+                dst,
+                &format!("has-{src}-{dst}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let rows_for = |query: &'static str| {
+        let shard = &shard;
+        async move {
+            shard
+                .execute_cypher_rows(
+                    QueryContext::new("cell-a", "where-equality-pushdown-rows"),
+                    query,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // Same rows as the inline form, and the same rows the scan produced before.
+    let pushed = rows_for(
+        "MATCH (s:Source) WHERE s.app_external_id = 'ext-2' RETURN s.app_external_id AS v",
+    )
+    .await;
+    let inline =
+        rows_for("MATCH (s:Source {app_external_id: 'ext-2'}) RETURN s.app_external_id AS v").await;
+    assert_eq!(pushed.rows, inline.rows);
+    assert_eq!(pushed.rows.len(), 1);
+
+    // An integer property matched against a float literal: the seek probes
+    // every encoding in `equivalent_property_index_keys`, so it finds what the
+    // comparison would have accepted.
+    let cross_type = rows_for("MATCH (s:Source) WHERE s.score = 2.0 RETURN s.score AS v").await;
+    assert_eq!(cross_type.rows.len(), 1);
+
+    // The WHERE on an OPTIONAL MATCH belongs to that clause, so pushing it into
+    // the pattern must still yield the null row rather than dropping it.
+    let optional_pushed = rows_for(
+        "MATCH (a:Source {app_external_id: 'ext-1'}) \
+         OPTIONAL MATCH (s:Source) WHERE s.app_external_id = 'absent' \
+         RETURN a.app_external_id AS a, s.app_external_id AS s",
+    )
+    .await;
+    let optional_inline = rows_for(
+        "MATCH (a:Source {app_external_id: 'ext-1'}) \
+         OPTIONAL MATCH (s:Source {app_external_id: 'absent'}) \
+         RETURN a.app_external_id AS a, s.app_external_id AS s",
+    )
+    .await;
+    assert_eq!(optional_pushed.rows, optional_inline.rows);
+    assert_eq!(optional_pushed.rows.len(), 1);
+
+    // The binding as an edge endpoint — the shape worth anchoring, since it is
+    // the difference between seeking one source and expanding from all of them.
+    let expanded = rows_for(
+        "MATCH (s:Source)-[:HAS]->(d) WHERE s.app_external_id = 'ext-2' RETURN d.name AS v",
+    )
+    .await;
+    let expanded_inline =
+        rows_for("MATCH (s:Source {app_external_id: 'ext-2'})-[:HAS]->(d) RETURN d.name AS v")
+            .await;
+    assert_eq!(expanded.rows, expanded_inline.rows);
+    assert_eq!(expanded.rows.len(), 1);
+
+    // The AND-chain shapes, at the row level. The pushed term anchors the
+    // pattern; every other term is still a filter, so an OR beside it must
+    // keep excluding what it excluded before.
+    let and_chain = rows_for(
+        "MATCH (s:Source) WHERE (s.app_external_id = 'ext-1' OR s.app_external_id = 'ext-9') \
+         AND s.score = 1 RETURN s.app_external_id AS v",
+    )
+    .await;
+    assert_eq!(and_chain.rows.len(), 1, "the OR must still exclude ext-3");
+    let and_chain_empty = rows_for(
+        "MATCH (s:Source) WHERE (s.app_external_id = 'ext-1' OR s.app_external_id = 'ext-9') \
+         AND s.score = 3 RETURN s.app_external_id AS v",
+    )
+    .await;
+    assert!(
+        and_chain_empty.rows.is_empty(),
+        "score = 3 anchors ext-3, which the OR rejects"
+    );
+
+    // Without a label there was nothing to scan, so this form planned
+    // `AllVertexScan` and then failed the node-only MATCH check. The pushdown
+    // gives the pattern a property, which is what that check wanted.
+    let unlabelled =
+        rows_for("MATCH (s) WHERE s.app_external_id = 'ext-2' RETURN s.app_external_id AS v").await;
+    assert_eq!(unlabelled.rows.len(), 1);
+
+    shard.close().await.unwrap();
+}
+
+/// The plan-shape counters have to move with the plan, and exactly once.
+///
+/// Naming a counter in both export tables is checked by the binary's own
+/// tests; what those cannot see is whether anything increments it, or whether
+/// something increments it several times. The denominator is the part that
+/// breaks quietly: `optimize_row_patterns_with_stats` re-plans each group once
+/// per input row inside the match loop, so counting there would scale
+/// `query_plans_total` with result size and make every ratio read off it wrong.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_plan_shape_counters_move_once_per_executed_query() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-plan-shape-counters", object_store).await;
+
+    for vertex_id in 1..=4_u64 {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("Source")
+                    .with_property(
+                        "app_external_id",
+                        VertexPropertyValue::String(format!("ext-{vertex_id}")),
+                    )
+                    .with_property("tier", VertexPropertyValue::String("common".to_string())),
+            )
+            .await
+            .unwrap();
+    }
+
+    // (total, label_scan, property_index, full_scan, equality_pushdown)
+    let counters = |shard: &GraphShard| {
+        let metrics = shard.graph_operational_metrics();
+        (
+            metrics.query_plans_total,
+            metrics.query_plans_with_label_scan,
+            metrics.query_plans_with_property_index,
+            metrics.query_plans_with_full_scan,
+            metrics.query_plans_with_equality_pushdown,
+        )
+    };
+    let delta = |before: (u64, u64, u64, u64, u64), after: (u64, u64, u64, u64, u64)| {
+        (
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            after.3 - before.3,
+            after.4 - before.4,
+        )
+    };
+
+    // A pushed-down WHERE: one plan, an index seek, no label scan. The query
+    // returns one row of four, so a per-row counter would show four plans.
+    let before = counters(&shard);
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "plan-counters-pushdown"),
+            "MATCH (s:Source) WHERE s.app_external_id = 'ext-2' RETURN s.tier AS tier",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(delta(before, counters(&shard)), (1, 0, 1, 0, 1));
+
+    // The same label without a filter still scans, and records no pushdown.
+    let before = counters(&shard);
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "plan-counters-label-scan"),
+            "MATCH (s:Source) RETURN s.tier AS tier",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 4);
+    assert_eq!(delta(before, counters(&shard)), (1, 1, 0, 0, 0));
+
+    // EXPLAIN plans without executing. Counting it would inflate the
+    // denominator with traffic that never touched the graph.
+    let before = counters(&shard);
+    shard
+        .explain_opencypher_rows(
+            QueryContext::new("cell-a", "plan-counters-explain"),
+            "MATCH (s:Source) WHERE s.app_external_id = 'ext-2' RETURN s.tier AS tier",
+        )
+        .await
+        .unwrap();
+    assert_eq!(delta(before, counters(&shard)), (0, 0, 0, 0, 0));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+async fn seed_auxiliary_graph(shard: &GraphShard, chunk_to_source_forward: bool) {
+    let scope = "tenant_id: 'acme', sub_tenant_id: 'marketing'";
+    // graph_sink writes (c:Chunk)-[:HAS_CHUNK]->(s:Source). The reverse case is
+    // seeded by the caller to prove the undirected hop finds either.
+    let has_chunk = if chunk_to_source_forward {
+        format!("CREATE (c:Chunk {{id: 1, chunk_id: 'c1', {scope}}})-[:HAS_CHUNK]->(s:Source {{id: 2, source_id: 's1', app_external_id: 'ext-1', app_provider: 'slack', {scope}}})")
+    } else {
+        format!("CREATE (s:Source {{id: 2, source_id: 's1', app_external_id: 'ext-1', app_provider: 'slack', {scope}}})-[:HAS_CHUNK]->(c:Chunk {{id: 1, chunk_id: 'c1', {scope}}})")
+    };
+    for (index, query) in [
+        has_chunk,
+        format!("CREATE (s:Source {{id: 2, source_id: 's1', app_external_id: 'ext-1', app_provider: 'slack', {scope}}})-[e:HAS_COMMENT {{created_at: 100}}]->(cmt:Comment {{id: 3, comment_id: 'm1', author_display: 'ada', {scope}}})"),
+        format!("CREATE (s:Source {{id: 2, source_id: 's1', app_external_id: 'ext-1', app_provider: 'slack', {scope}}})-[e:HAS_COMMENT {{created_at: 200}}]->(cmt:Comment {{id: 4, comment_id: 'm2', author_display: 'bob', {scope}}})"),
+        // A chunk outside the requested id set, to prove IN actually filters.
+        format!("CREATE (c:Chunk {{id: 5, chunk_id: 'c9', {scope}}})-[:HAS_CHUNK]->(s:Source {{id: 6, source_id: 's9', app_external_id: 'ext-9', app_provider: 'slack', {scope}}})"),
+        format!("CREATE (s:Source {{id: 6, source_id: 's9', app_external_id: 'ext-9', app_provider: 'slack', {scope}}})-[e:HAS_COMMENT {{created_at: 300}}]->(cmt:Comment {{id: 7, comment_id: 'm9', author_display: 'zoe', {scope}}})"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .execute_cypher(
+                QueryContext::new("cell-a", format!("aux-seed-{index}")),
+                &query,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(feature = "opencypher")]
+const AUX_HAS_COMMENT_QUERY: &str = "
+    MATCH (c:Chunk {tenant_id: $tenant_id, sub_tenant_id: $sub_tenant_id})
+    WHERE c.chunk_id IN $chunk_ids
+    MATCH (c)-[:HAS_CHUNK]-(s:Source {tenant_id: $tenant_id, sub_tenant_id: $sub_tenant_id})
+    MATCH (s)-[e:HAS_COMMENT]->(cmt:Comment {tenant_id: $tenant_id, sub_tenant_id: $sub_tenant_id})
+    RETURN DISTINCT
+        s.source_id AS src_id,
+        'SOURCE' AS src_type,
+        cmt.comment_id AS tgt_id,
+        cmt.author_display AS tgt_name,
+        'COMMENT' AS tgt_type,
+        '' AS raw_predicate,
+        e.created_at AS created_at
+    ORDER BY src_id, tgt_id
+    LIMIT $cap";
+
+#[cfg(feature = "opencypher")]
+fn auxiliary_query_context(idempotency: &str) -> QueryContext {
+    QueryContext::new("cell-a", idempotency)
+        .with_parameters([
+            (
+                "tenant_id".to_string(),
+                VertexPropertyValue::String("acme".to_string()),
+            ),
+            (
+                "sub_tenant_id".to_string(),
+                VertexPropertyValue::String("marketing".to_string()),
+            ),
+            ("cap".to_string(), VertexPropertyValue::Integer(5001)),
+        ])
+        .with_list_parameters([(
+            "chunk_ids".to_string(),
+            vec![
+                VertexPropertyValue::String("c1".to_string()),
+                VertexPropertyValue::String("c-absent".to_string()),
+            ],
+        )])
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn auxiliary_by_chunks_query_returns_rows_end_to_end() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/aux-by-chunks", object_store).await;
+    seed_auxiliary_graph(&shard, true).await;
+
+    let rows = shard
+        .execute_cypher_rows(auxiliary_query_context("aux-read"), AUX_HAS_COMMENT_QUERY)
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = rows.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "src_id",
+            "src_type",
+            "tgt_id",
+            "tgt_name",
+            "tgt_type",
+            "raw_predicate",
+            "created_at"
+        ]
+    );
+    // Two comments on s1; the c9/s9 comment is excluded by IN.
+    assert_eq!(rows.rows.len(), 2, "unexpected rows: {:?}", rows.rows);
+    assert_eq!(
+        rows.rows[0].values[0],
+        QueryValue::Property(VertexPropertyValue::String("s1".to_string()))
+    );
+    // Constant projections survive execution, not just lowering.
+    assert_eq!(
+        rows.rows[0].values[1],
+        QueryValue::Property(VertexPropertyValue::String("SOURCE".to_string()))
+    );
+    assert_eq!(
+        rows.rows[0].values[5],
+        QueryValue::Property(VertexPropertyValue::String(String::new()))
+    );
+    // ORDER BY src_id, tgt_id
+    assert_eq!(
+        rows.rows[0].values[2],
+        QueryValue::Property(VertexPropertyValue::String("m1".to_string()))
+    );
+    assert_eq!(
+        rows.rows[1].values[2],
+        QueryValue::Property(VertexPropertyValue::String("m2".to_string()))
+    );
+    // The relationship property is read off the HAS_COMMENT binding.
+    assert_eq!(
+        rows.rows[0].values[6],
+        QueryValue::Property(VertexPropertyValue::Integer(100))
+    );
+    shard.close().await.unwrap();
+}
+
+/// The point of the undirected hop: the same query has to work whichever way
+/// HAS_CHUNK was written. Seeding it backwards would return nothing if the
+/// executor only ever expanded src -> dst.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn auxiliary_by_chunks_query_matches_a_reversed_has_chunk_edge() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/aux-by-chunks-reversed", object_store).await;
+    seed_auxiliary_graph(&shard, false).await;
+
+    let rows = shard
+        .execute_cypher_rows(
+            auxiliary_query_context("aux-read-reversed"),
+            AUX_HAS_COMMENT_QUERY,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.rows.len(),
+        2,
+        "undirected hop must find a backwards-written edge: {:?}",
+        rows.rows
+    );
+    shard.close().await.unwrap();
+}
+
+/// A self-loop satisfies both orientations of an undirected hop. It must be
+/// reported once, not twice.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn undirected_hop_reports_a_self_loop_once() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/undirected-self-loop", object_store).await;
+    shard
+        .execute_cypher(
+            QueryContext::new("cell-a", "self-loop-seed"),
+            "CREATE (a:Node {id: 1, name: 'solo'})-[:LINK]->(b:Node {id: 1, name: 'solo'})",
+        )
+        .await
+        .unwrap();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "self-loop-read"),
+            "MATCH (a:Node)-[:LINK]-(b:Node) RETURN a.name AS a_name, b.name AS b_name",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.rows.len(),
+        1,
+        "self-loop must not double-count: {:?}",
+        rows.rows
+    );
+    shard.close().await.unwrap();
+}
+
+/// Two nodes joined in both directions are two distinct relationships, so an
+/// undirected hop that binds the relationship must report both.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn undirected_hop_reports_both_relationships_of_a_reciprocal_pair() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/undirected-reciprocal", object_store).await;
+    for (index, query) in [
+        "CREATE (a:Node {id: 1, name: 'left'})-[r:LINK {relationship_id: 'ab', weight: 1}]->(b:Node {id: 2, name: 'right'})",
+        "CREATE (a:Node {id: 2, name: 'right'})-[r:LINK {relationship_id: 'ba', weight: 2}]->(b:Node {id: 1, name: 'left'})",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .execute_cypher(
+                QueryContext::new("cell-a", format!("reciprocal-seed-{index}")),
+                query,
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "reciprocal-read"),
+            "MATCH (a:Node {name: 'left'})-[r:LINK]-(b:Node {name: 'right'}) \
+             RETURN r.weight AS weight ORDER BY weight",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.rows.len(),
+        2,
+        "both relationships must survive dedup: {:?}",
+        rows.rows
+    );
+    shard.close().await.unwrap();
+}
+
+/// hydradb-application's `get_chunk_ids_by_sub_tenant`, verbatim. Every
+/// staging run of it was rejected with "WITH currently supports only
+/// pass-through identifiers without ... LIMIT" until a trailing windowed WITH
+/// was folded into the RETURN window.
+#[cfg(feature = "opencypher")]
+const CHUNK_IDS_BY_SUB_TENANT_QUERY: &str = "
+		MATCH (s:Source {tenant_id: $tenant_id, sub_tenant_id: $sub_tenant_id})-[:HAS_CHUNK]-(c:Chunk)
+		WITH c
+		LIMIT $fetch_limit
+		RETURN c.chunk_id AS chunk_id
+	";
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn with_limit_chunk_scope_query_is_bounded_end_to_end() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/with-limit-chunk-scope", object_store).await;
+    let scope = "tenant_id: 'acme', sub_tenant_id: 'marketing'";
+    let mut next_id = 1;
+    for source in 0..2 {
+        let source_id = next_id;
+        next_id += 1;
+        for chunk in 0..3 {
+            let chunk_id = next_id;
+            next_id += 1;
+            shard
+                .execute_cypher(
+                    QueryContext::new("cell-a", format!("with-limit-seed-{source}-{chunk}")),
+                    &format!(
+                        "CREATE (c:Chunk {{id: {chunk_id}, chunk_id: 'c{source}{chunk}', {scope}}})\
+                         -[:HAS_CHUNK]->\
+                         (s:Source {{id: {source_id}, source_id: 's{source}', {scope}}})"
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    // A chunk in another sub-tenant must never be counted.
+    shard
+        .execute_cypher(
+            QueryContext::new("cell-a", "with-limit-seed-other"),
+            &format!(
+                "CREATE (c:Chunk {{id: {next_id}, chunk_id: 'other', tenant_id: 'acme', sub_tenant_id: 'sales'}})\
+                 -[:HAS_CHUNK]->\
+                 (s:Source {{id: {}, source_id: 'so', tenant_id: 'acme', sub_tenant_id: 'sales'}})",
+                next_id + 1
+            ),
+        )
+        .await
+        .unwrap();
+
+    let run = |limit: u64| {
+        let context = QueryContext::new("cell-a", format!("with-limit-read-{limit}"))
+            .with_parameters([
+                (
+                    "tenant_id".to_string(),
+                    VertexPropertyValue::String("acme".to_string()),
+                ),
+                (
+                    "sub_tenant_id".to_string(),
+                    VertexPropertyValue::String("marketing".to_string()),
+                ),
+                (
+                    "fetch_limit".to_string(),
+                    VertexPropertyValue::Integer(limit),
+                ),
+            ]);
+        let shard = &shard;
+        async move {
+            shard
+                .execute_cypher_rows(context, CHUNK_IDS_BY_SUB_TENANT_QUERY)
+                .await
+                .unwrap()
+        }
+    };
+
+    // The caller asks for limit + 1 to detect a clipped scope.
+    let clipped = run(4).await;
+    assert_eq!(
+        clipped
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["chunk_id"]
+    );
+    assert_eq!(clipped.rows.len(), 4, "{:?}", clipped.rows);
+
+    let all = run(100).await;
+    let mut ids: Vec<String> = all
+        .rows
+        .iter()
+        .map(|row| match &row.values[0] {
+            QueryValue::Property(VertexPropertyValue::String(id)) => id.clone(),
+            other => panic!("unexpected chunk_id value {other:?}"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["c00", "c01", "c02", "c10", "c11", "c12"]);
+    shard.close().await.unwrap();
 }

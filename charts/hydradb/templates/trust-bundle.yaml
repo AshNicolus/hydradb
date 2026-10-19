@@ -10,6 +10,9 @@ spec:
     - secret:
         name: {{ default (include "hydradb.publicTlsSecretName" .) .Values.tls.public.trustBundle.sourceSecretName }}
         key: {{ .Values.tls.public.trustBundle.sourceSecretKey }}
+    {{- with .Values.tls.public.trustBundle.additionalSources }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   target:
     configMap:
       key: ca.crt

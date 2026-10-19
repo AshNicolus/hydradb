@@ -192,6 +192,11 @@ pub fn vertex(cell_id: &str, vertex_id: VertexId) -> String {
     format!("cell/{cell_id}/vertex/{vertex_id:020}")
 }
 
+#[cfg(feature = "experimental-cypher-engine")]
+pub fn vertex_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/vertex/")
+}
+
 pub fn vertex_label(cell_id: &str, label: &str, vertex_id: VertexId) -> String {
     format!("cell/{cell_id}/vlabel/{label}/{vertex_id:020}")
 }
@@ -207,7 +212,21 @@ pub fn vertex_property_index(
     encoded_value: &str,
     vertex_id: VertexId,
 ) -> String {
-    format!("cell/{cell_id}/vprop_idx/{property}/{encoded_value}/{vertex_id:020}")
+    format!(
+        "cell/{cell_id}/vprop_idx/{property}/{}",
+        vertex_property_index_entry_suffix(encoded_value, vertex_id)
+    )
+}
+
+/// The `<encoded value>/<vertex id>` tail of a vertex property index key. An
+/// ordered scan seeks to a position inside one property's range and builds it
+/// from this, so the zero padding that makes vertex IDs sort numerically rather
+/// than lexically lives in one place: a seek position built by hand to a
+/// different width lands in the wrong run. The caller spells the value however
+/// the key holds it -- a scan whose prefix already carries the type tag passes
+/// the value without it.
+pub fn vertex_property_index_entry_suffix(encoded_value: &str, vertex_id: VertexId) -> String {
+    format!("{encoded_value}/{vertex_id:020}")
 }
 
 #[cfg(feature = "opencypher")]
@@ -245,6 +264,27 @@ pub fn relationship_property_index(
     )
 }
 
+/// The point-get counterpart of [`relationship_property_index`]: the same
+/// components minus the trailing relationship id, which lives in the value
+/// instead of the key. `rprop_idx` answers "which relationships have this
+/// value" by scan; this key answers "the relationship with this identity" by
+/// point get, so the lookup can use bloom filters. Written only for the MERGE
+/// identity property, and only while exactly one live relationship carries
+/// the identity — parallel relationships may legitimately share a value, and
+/// an ambiguous identity keeps no pointer and stays on the scan path. The
+/// write/invalidate protocol lives in `shard/write.rs` beside
+/// `RELATIONSHIP_IDENTITY_PROPERTY`.
+pub fn relationship_merge_index(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/rmerge_idx/{edge_type}/{property}/{encoded_value}/{src:020}/{dst:020}")
+}
+
 #[cfg(feature = "opencypher")]
 pub fn relationship_property_index_prefix(
     cell_id: &str,
@@ -253,6 +293,15 @@ pub fn relationship_property_index_prefix(
     encoded_value: &str,
 ) -> String {
     format!("cell/{cell_id}/rprop_idx/{edge_type}/{property}/{encoded_value}/")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn relationship_property_index_property_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+) -> String {
+    format!("cell/{cell_id}/rprop_idx/{edge_type}/{property}/")
 }
 
 #[cfg(feature = "opencypher")]
@@ -292,8 +341,29 @@ pub fn query_stats_edge_type(cell_id: &str, edge_type: &str) -> String {
 }
 
 #[cfg(feature = "opencypher")]
+pub fn query_stats_edge_expansion(
+    cell_id: &str,
+    edge_type: &str,
+    direction: &str,
+    source_labels: &[&str],
+) -> String {
+    format!(
+        "cell/{cell_id}/qstats/expand/{direction}/{edge_type}/{}",
+        source_labels.join("+")
+    )
+}
+
+#[cfg(feature = "opencypher")]
 pub fn query_stats_vertex_label(cell_id: &str, label: &str) -> String {
     format!("cell/{cell_id}/qstats/vlabel/{label}")
+}
+
+/// Canonical multi-label intersection count. Callers validate individual
+/// labels and pass them sorted and deduplicated; `+` cannot occur in a valid
+/// storage component, so the representation is unambiguous and prefix-safe.
+#[cfg(feature = "opencypher")]
+pub fn query_stats_vertex_label_intersection(cell_id: &str, labels: &[&str]) -> String {
+    format!("cell/{cell_id}/qstats/vlabels/{}", labels.join("+"))
 }
 
 #[cfg(feature = "opencypher")]

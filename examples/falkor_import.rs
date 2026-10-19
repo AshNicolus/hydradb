@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::StreamExt;
-use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt};
-use slatedb_graph_kernel::{
+use hydradb::{
     object_store_from_env, EdgeMetadata, GraphCacheConfig, GraphError, GraphLimits,
     GraphOpenOptions, GraphShard, RelationshipMutation, Result, VertexId, VertexMetadata,
     VertexPropertyValue,
 };
+use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt};
 
 const DEFAULT_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -205,6 +205,7 @@ impl ArgParser {
     fn required(&mut self, name: &str) -> Result<String> {
         self.optional(name)?
             .ok_or_else(|| GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "FalkorImport",
                 feature: format!("missing required argument {name}"),
             })
@@ -217,6 +218,7 @@ impl ArgParser {
         self.args.remove(idx);
         if idx >= self.args.len() || self.args[idx].starts_with('-') {
             return Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "FalkorImport",
                 feature: format!("{name} requires a value"),
             });
@@ -224,6 +226,7 @@ impl ArgParser {
         let value = self.args.remove(idx);
         if value.trim().is_empty() {
             return Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "FalkorImport",
                 feature: format!("{name} cannot be empty"),
             });
@@ -237,6 +240,7 @@ impl ArgParser {
                 value
                     .parse::<usize>()
                     .map_err(|err| GraphError::UnsupportedQuery {
+                        reason: hydradb::QueryFailureReason::InvalidRequest,
                         dialect: "FalkorImport",
                         feature: format!("{name} must be a positive integer: {err}"),
                     })
@@ -259,6 +263,7 @@ impl ArgParser {
             Ok(())
         } else {
             Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "FalkorImport",
                 feature: format!("unknown arguments: {}", self.args.join(" ")),
             })
@@ -276,12 +281,14 @@ impl DuplicatePolicy {
         match value {
             "preserve" => Ok(Self::Preserve),
             "reject" | "collapse-first" | "collapse-last" => Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "FalkorImport",
                 feature: format!(
                     "--duplicate-policy {value} requires global edge identity dedupe; this streaming importer supports preserve only so Falkor multigraph relationships are not lost"
                 ),
             }),
             _ => Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "FalkorImport",
                 feature: format!(
                     "unsupported duplicate policy {value}; expected preserve"
@@ -714,6 +721,7 @@ fn normalize_source_prefix(source: &str) -> Result<String> {
     let source = source.trim();
     if source.is_empty() {
         return Err(GraphError::UnsupportedQuery {
+            reason: hydradb::QueryFailureReason::InvalidRequest,
             dialect: "FalkorImport",
             feature: "--source-prefix cannot be empty".to_string(),
         });
@@ -723,6 +731,7 @@ fn normalize_source_prefix(source: &str) -> Result<String> {
         let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
         if bucket.is_empty() {
             return Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "FalkorImport",
                 feature: "s3 source prefix must include a bucket name".to_string(),
             });
@@ -730,6 +739,7 @@ fn normalize_source_prefix(source: &str) -> Result<String> {
         let key = key.trim_matches('/');
         if key.is_empty() {
             return Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "FalkorImport",
                 feature: "s3 source prefix must include an object key prefix, for example s3://bucket/orgs/graph".to_string(),
             });

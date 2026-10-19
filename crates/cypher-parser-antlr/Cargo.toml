@@ -1,0 +1,18 @@
+[package]
+name = "hydradb-cypher-parser-antlr"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Dialect-aware Cypher lexer, parser, and syntax tree for HydraDB"
+publish = false
+build = "build.rs"
+
+# This crate intentionally has no dependency on `hydradb` or on
+# `libcypher-parser`. It is the side-by-side, pure-Rust frontend whose AST will
+# feed a dialect-independent graph IR in a later milestone.
+[dependencies]
+antlr-rust-runtime = { workspace = true }
+hydradb-cypher-ast = { path = "../cypher-ast" }
+
+[build-dependencies]
+antlr-rust-codegen = { workspace = true }

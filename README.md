@@ -1,28 +1,26 @@
 # HydraDB
 
-[![Container image](https://github.com/hydra-db/hydradb/actions/workflows/container.yml/badge.svg)](https://github.com/hydra-db/hydradb/actions/workflows/container.yml)
-[![OpenCypher TCK](https://github.com/hydra-db/hydradb/actions/workflows/opencypher-tck.yml/badge.svg)](https://github.com/hydra-db/hydradb/actions/workflows/opencypher-tck.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](rust-toolchain.toml)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-live-brightgreen.svg)](https://hydra-db.github.io/benchmark/)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/HcBKJHXmnu)
+
+Join the community on [Discord](https://discord.gg/HcBKJHXmnu). Contributions
+start with an approved issue. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 HydraDB is an object-store-native distributed graph database written in Rust.
 It combines durable graph storage on SlateDB with snapshot-consistent
 OpenCypher queries, GraphBLAS traversal, Neo4j-compatible Bolt connectivity,
 and an HTTPS query API.
 
-Storage and compute are fully disaggregated. S3-compatible object storage is the
-durable source of truth, and compute runs as two independent roles: **data
-nodes** (`graph-node`) serve queries and canonical mutations, while **indexers**
-(`graph-indexer`) build immutable traversal indexes in the background. Both keep
-only disposable state in memory and on local SSD or NVMe, so they can be replaced
-or scaled without moving the graph itself.
+S3-compatible object storage is the durable source of truth. Query nodes and
+indexers keep only disposable state in memory and on local SSD or NVMe, so they
+can be replaced or scaled without moving the graph itself.
 
 ## Why HydraDB
 
 - **Object-store durability.** Graph records, WALs, manifests, and immutable
   traversal indexes live in S3-compatible storage.
-- **Independent compute.** Data nodes and indexers scale separately and can
+- **Independent compute.** Query nodes and indexers scale separately and can
   rebuild their local caches from durable state.
 - **Safe writer handoff.** Object-store CAS leases select the active writer for
   each cell, while SlateDB writer epochs fence stale writers.
@@ -40,44 +38,39 @@ or scaled without moving the graph itself.
 ## Architecture
 
 ```mermaid
-flowchart TB
+flowchart LR
     C["Applications<br/>Neo4j drivers or HTTPS"]
     SVC["Service or load balancer"]
 
-    subgraph Q["Data tier — graph-node"]
-        direction LR
-        subgraph N1["graph-node"]
-            Q1["query + mutation engine"]
-            S1["local SSD / NVMe cache"]
-            Q1 <--> S1
-        end
-        subgraph N2["graph-node"]
-            Q2["query + mutation engine"]
-            S2["local SSD / NVMe cache"]
-            Q2 <--> S2
-        end
+    subgraph Q["Query tier"]
+        Q1["graph-node"]
+        Q2["graph-node"]
+        QN["graph-node"]
     end
 
-    subgraph I["Indexing tier — graph-indexer"]
+    subgraph I["Indexing tier"]
         IX1["graph-indexer"]
         IXN["graph-indexer"]
     end
 
+    CACHE["Disposable memory and SSD cache"]
     STORE["S3-compatible object storage<br/>WAL, SSTs, leases, CSC generations"]
 
     C --> SVC
-    SVC --> N1
-    SVC --> N2
-    N1 <--> STORE
-    N2 <--> STORE
+    SVC --> Q1
+    SVC --> Q2
+    SVC --> QN
+    Q1 <--> CACHE
+    Q2 <--> CACHE
+    QN <--> CACHE
+    Q1 <--> STORE
+    Q2 <--> STORE
+    QN <--> STORE
     IX1 <--> STORE
     IXN <--> STORE
 ```
 
-Each data node owns a private local SSD/NVMe cache; the object store is the shared
-layer beneath the whole tier and the only durable copy of the graph.
-
-Data nodes serve reads and canonical graph mutations. Indexer workers build
+Query nodes serve reads and canonical graph mutations. Indexer workers build
 immutable CSC generations asynchronously and publish them through atomic
 object-store pointers. Readers remain correct when an index is absent or behind
 because the visible WAL tail is applied to the indexed base.
@@ -87,87 +80,7 @@ writer coordination, index lifecycle, and failure semantics.
 
 ## Getting Started
 
-There are two ways to bring up a single development node: the published **Docker
-image**, or a **build from source**. Either way, once the node is listening, use
-[Verify a running node](#verify-a-running-node) to confirm it works — a listening
-port is not proof; a round-tripped write is. TLS is required by default in
-deployed environments, so the local flows below enable plaintext explicitly.
-
-<details>
-<summary><strong>Run with Docker</strong> — fastest, no local toolchain</summary>
-
-Release images are published to
-[`ghcr.io/hydra-db/hydradb`](https://github.com/hydra-db/hydradb/pkgs/container/hydradb).
-Each `v*` release is tagged with its full version, compatible minor and major
-versions, the commit SHA, and `latest` (for example `0.1.0`, `0.1`, `0`,
-`latest`, `sha-7bf77ac`):
-
-```bash
-docker pull ghcr.io/hydra-db/hydradb:latest
-```
-
-Images are published for `linux/amd64` and `linux/arm64`, so Docker selects the
-right one for the host and Apple Silicon needs no extra flags. Releases up to
-and including `0.1.0` were `linux/amd64` only, and pulling one of those on an
-ARM host fails with:
-
-```
-no matching manifest for linux/arm64/v8 in the manifest list entries
-```
-
-That message means the tag predates multi-architecture publishing, not that the
-pull is misconfigured. Move to a release after `0.1.0`, or run the older tag
-under emulation with `--platform linux/amd64` — correct but slower, and it
-requires Rosetta on Apple Silicon. To see which architectures a tag actually
-carries before pulling it:
-
-```bash
-docker buildx imagetools inspect ghcr.io/hydra-db/hydradb:latest
-```
-
-This starts one plaintext node backed by a host directory mounted into the
-container:
-
-```bash
-mkdir -p hydradb-data/store hydradb-data/cache
-printf '%s\n' 'local-development-token-32-bytes' > hydradb-data/auth-token
-
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  -p 7687:7687 -p 8443:8443 -p 9090:9090 \
-  -v "$PWD/hydradb-data:/data" \
-  -e CLOUD_PROVIDER=local \
-  -e LOCAL_PATH=/data/store \
-  -e GRAPH_NAMESPACE=default \
-  -e GRAPH_ID=default \
-  -e GRAPH_CELL_ID=cell-0 \
-  -e GRAPH_CELLS=cell-0 \
-  -e GRAPH_NODE_ID=node-0 \
-  -e GRAPH_BOLT_NODE_ADDRESSES=node-0=127.0.0.1:7687 \
-  -e GRAPH_ADVERTISED_BOLT_ADDR=127.0.0.1:7687 \
-  -e GRAPH_DATA_CACHE_DIR=/data/cache \
-  -e GRAPH_AUTH_TOKEN_FILE=/data/auth-token \
-  -e GRAPH_ALLOW_PLAINTEXT=true \
-  -e RUST_MIN_STACK=33554432 \
-  ghcr.io/hydra-db/hydradb:latest
-```
-
-The node runs in the foreground. `LOCAL_PATH` must point at a directory that
-already exists, which is why `hydradb-data/store` is created before the mount.
-`--user "$(id -u):$(id -g)"` is required: the image runs as UID/GID `10001`,
-but the bind-mounted `hydradb-data` is owned by the host user, so without it the
-container cannot write its store or cache and fails on the first storage
-operation. Running as the host user makes the mounted directories writable and
-keeps the created files host-owned. The image entrypoint is `graph-node`; it
-also ships `graph-indexer`. For production, pin an image digest rather than
-`latest` — see the [Helm chart guide](charts/hydradb/README.md).
-
-</details>
-
-<details>
-<summary><strong>Build from source</strong> — for development and the full recipe surface</summary>
-
-#### Prerequisites
+### Prerequisites
 
 HydraDB requires Rust 1.91 or newer, a C/C++ toolchain,
 `libcypher-parser`, and SuiteSparse GraphBLAS.
@@ -215,7 +128,7 @@ repository. Install it with `cargo install just --locked` when your package
 manager does not provide it. Docker is optional and is used only by MinIO,
 Neo4j comparison, image-build, and Kubernetes harnesses.
 
-#### Clone and verify
+### Clone and verify
 
 ```bash
 git clone https://github.com/hydra-db/hydradb.git
@@ -236,10 +149,11 @@ To exercise the same flow against an ephemeral MinIO instance:
 just minio-smoke
 ```
 
-#### Run a local server
+### Run a local server
 
 The following starts a single plaintext development node backed by a local
-directory.
+directory. TLS is required by default in deployed environments; plaintext must
+be enabled explicitly.
 
 ```bash
 mkdir -p .hydradb/store .hydradb/cache
@@ -255,6 +169,13 @@ export GRAPH_NODE_ID=node-0
 export GRAPH_BOLT_NODE_ADDRESSES=node-0=127.0.0.1:7687
 export GRAPH_ADVERTISED_BOLT_ADDR=127.0.0.1:7687
 export GRAPH_DATA_CACHE_DIR="$PWD/.hydradb/cache"
+# Cache chunks default to 4 MiB. Smaller parts reduce cold probe overfetch,
+# but can increase later cache misses; benchmark before changing this value.
+# The value must be a positive multiple of 1024.
+export GRAPH_DATA_CACHE_PART_BYTES=4194304
+# Process-wide budget retained by SlateDB disk-cache file caches. Scoped
+# runtimes divide it across every possible cell reader and writer.
+export GRAPH_DATA_CACHE_MAX_OPEN_FILES=512
 export GRAPH_AUTH_TOKEN_FILE="$PWD/.hydradb/auth-token"
 export GRAPH_ALLOW_PLAINTEXT=true
 
@@ -273,36 +194,9 @@ cargo run --locked --features server-runtime --bin graph-node
 ```
 
 The node runs in the foreground and does not return; that is it working, not
-hanging. Confirm it from a second shell with
-[Verify a running node](#verify-a-running-node).
+hanging. Run the checks below from a second shell.
 
-For a fully scripted Bolt and HTTP round trip against a source build, install the
-Python Neo4j driver and run. Homebrew's and Debian's Python both refuse a bare
-`pip install` under PEP 668, so use a virtualenv (`apt-get install -y
-python3-venv` on Debian/Ubuntu):
-
-```bash
-python3 -m venv /tmp/hydradb-venv && /tmp/hydradb-venv/bin/pip install neo4j
-
-# macOS: this script calls cargo directly, so it does not inherit what the
-# justfile exports. Without this it fails at bindgen with
-# `'cypher-parser.h' file not found`. Linux needs neither.
-if command -v brew >/dev/null; then
-  export BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix)/include"
-  export LIBRARY_PATH="$(brew --prefix)/lib"
-fi
-
-PYTHON=/tmp/hydradb-venv/bin/python bash scripts/runtime_smoke.sh
-```
-
-Prints `runtime-smoke-ok`. The node's log is at
-`/tmp/sgk-runtime-smoke/node.log`; read it first if the script fails.
-
-</details>
-
-### Verify a running node
-
-However you started it, the node listens on:
+The node listens on:
 
 | Endpoint | Address | Purpose |
 |---|---|---|
@@ -332,8 +226,29 @@ The second call returns one row containing
 `{"type":"vertex_id","value":2}`. A listening port is not proof the node works;
 a round-tripped write is.
 
-<details>
-<summary><strong>Troubleshooting local runs</strong></summary>
+For a scripted Bolt and HTTP round trip, install the Python Neo4j driver and
+run. Homebrew's and Debian's Python both refuse a bare `pip install` under
+PEP 668, so use a virtualenv (`apt-get install -y python3-venv` on
+Debian/Ubuntu):
+
+```bash
+python3 -m venv /tmp/hydradb-venv && /tmp/hydradb-venv/bin/pip install neo4j
+
+# macOS: this script calls cargo directly, so it does not inherit what the
+# justfile exports. Without this it fails at bindgen with
+# `'cypher-parser.h' file not found`. Linux needs neither.
+if command -v brew >/dev/null; then
+  export BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix)/include"
+  export LIBRARY_PATH="$(brew --prefix)/lib"
+fi
+
+PYTHON=/tmp/hydradb-venv/bin/python bash scripts/runtime_smoke.sh
+```
+
+Prints `runtime-smoke-ok`. The node's log is at
+`/tmp/sgk-runtime-smoke/node.log`; read it first if the script fails.
+
+### Troubleshooting local runs
 
 | Symptom | Cause and fix |
 |---|---|
@@ -343,13 +258,6 @@ a round-tripped write is.
 | `wrapper.h:4:10: fatal error: 'cypher-parser.h' file not found` | `BINDGEN_EXTRA_CLANG_ARGS` unset while invoking `cargo` directly on macOS. Prefer `just`, which exports it |
 | Node answers `/readyz`, then aborts with `has overflowed its stack` on the first query | `RUST_MIN_STACK` unset; export `33554432` |
 | `curl: (7) Failed to connect ... port 9090` | The node is not running. `graph-node` holds the foreground, so start it in its own shell |
-
-</details>
-
-Agents working in this repository should read [AGENTS.md](AGENTS.md), which
-carries the same sequence plus repository conventions and failure modes.
-Contributors building HydraDB should also read [DEVELOPMENT.md](DEVELOPMENT.md)
-for the full recipe, harness, and script surface.
 
 ## Querying
 
@@ -410,7 +318,8 @@ HydraDB exposes two read modes:
 
 HTTPS requests set `"consistency": "causal"` or `"strong"` in the request
 body. Bolt clients set `consistency` in `RUN` metadata or
-`hydradb.consistency` in transaction metadata.
+`hydradb.consistency` in transaction metadata. The former
+`turbolay.consistency` key remains accepted as a migration alias.
 
 ## Kubernetes
 
@@ -429,8 +338,8 @@ helm upgrade --install hydradb charts/hydradb \
 
 Copy and edit the example values before deploying. Object-store credentials,
 bucket names, image references, TLS, advertised Bolt addresses, and workload
-identity are environment-specific. See the [Helm chart guide](charts/hydradb/README.md)
-for configuration and rollout details.
+identity are environment-specific. See the values file comments and the chart
+templates under `charts/hydradb/` for configuration and rollout details.
 
 ## Observability
 
@@ -447,17 +356,87 @@ paths, cache outcomes, consistency mode, scope, cell, storage sequence, and
 planner decisions. Build with `--features server-runtime,otlp` or
 `--features indexer-runtime,otlp` to export OpenTelemetry data.
 
-Prometheus duration histograms have deliberately different units. Read
-[docs/runbooks/duration-histograms.md](docs/runbooks/duration-histograms.md)
-before building latency dashboards or alerts.
+Prometheus duration histograms have deliberately different units. Check each
+metric's unit before building latency dashboards or alerts.
 
 ## Development
 
 Run `just` or `just help` to list the command surface. Recipes use Bash and run
-from the repository root; the full native suite requires `libcypher-parser` and
-SuiteSparse GraphBLAS. [DEVELOPMENT.md](DEVELOPMENT.md) documents the complete
-surface — verification recipes, local and MinIO harnesses, and the standalone
-scripts. Run `just ci` before opening a pull request.
+from the repository root. The full native suite requires `libcypher-parser` and
+SuiteSparse GraphBLAS.
+
+### Verification Recipes
+
+| Recipe | Coverage |
+|---|---|
+| `just native-check` | Verifies that `cypher-parser` and GraphBLAS are discoverable |
+| `just fmt`, `just fmt-check` | Formats Rust or checks formatting without modifying files |
+| `just clippy` | Default-feature lint used by CI |
+| `just clippy-chaos`, `just clippy-opencypher` | Chaos-harness and OpenCypher lint configurations |
+| `just clippy-native`, `just clippy-client-protocols`, `just clippy-runtime` | Full native, public protocol, and production runtime lint configurations |
+| `just check` | Checks every default-feature target |
+| `just check-all-features` | Checks every target with every Cargo feature |
+| `just check-client-api`, `just check-bolt-server` | Checks shared client code and standalone Bolt independently |
+| `just check-examples`, `just check-examples-native`, `just check-examples-chaos` | Checks example targets under their supported feature sets |
+| `just test [cargo test args]` | Runs default library tests and forwards optional arguments |
+| `just test-opencypher`, `just test-native`, `just test-client-protocols`, `just test-chaos` | Runs the major library and public-protocol test matrices |
+| `just test-server-runtime`, `just test-indexer`, `just test-node-otlp` | Runs graph-node, indexer, and OTLP binary tests |
+| `just test-placement`, `just test-telemetry` | Lints and tests the two workspace crates |
+| `just ci` | Runs the complete local CI-equivalent sequence; a clean feature-matrix run can take tens of minutes (25m 41s in the verification run for this README) |
+
+`scripts/ci_local.sh` is a compatibility entry point that sets a shared Cargo
+target directory and delegates to `just ci`, so the script and Justfile cannot
+silently drift into different test matrices.
+
+### Local Harnesses
+
+| Recipe | What it runs | Output or side effect |
+|---|---|---|
+| `just smoke` | Isolated local object-store write, traversal, reopen, and verification | Temporary directory removed on exit |
+| `just smoke-graphblas` | The same smoke flow with SuiteSparse selected explicitly | Temporary directory removed on exit |
+| `just query-correctness` | Exact OpenCypher result checks | `bench-results/query_correctness.csv` and `.log` |
+| `just stress` | Multiprocess writes, restart recovery, compaction, GC, and verification | Temporary local stores removed on exit |
+| `just fence` | Hard SlateDB writer-takeover proof | Temporary local stores removed on exit |
+
+The benchmark recipes intentionally use production-sized defaults and can run
+for a long time. Override their documented `GRAPH_QUERY_*` environment
+variables for a small development sample.
+
+### Docker And MinIO Harnesses
+
+| Recipe | Purpose |
+|---|---|
+| `just minio-smoke` | Runs the object-store smoke flow against an ephemeral MinIO container |
+| `just minio-query-correctness` | Runs exact query checks against MinIO |
+| `just minio-query-bench` | Runs the query benchmark against MinIO |
+| `just minio-chaos` | Pauses, restarts, and recovers MinIO during graph operations |
+| `just minio-fence` | Runs writer takeover against MinIO |
+| `just minio-mbt` | Replays the formal MBT adapters against MinIO; unavailable in this checkout because the referenced `tests/formal_mbt*.rs` targets are absent |
+
+The MinIO recipes create isolated containers, networks, buckets, and temporary
+configuration files. Their cleanup traps remove those resources unless a
+recipe-specific keep flag is set. Docker may pull pinned images on the first
+run.
+
+### Standalone Scripts
+
+The scripts below are not all exposed as Just recipes because several operate
+external infrastructure or incur cloud cost.
+
+| Script | Requirements and behavior |
+|---|---|
+| `scripts/runtime_smoke.sh` | Builds `graph-node`, checks readiness and metrics, then exercises Bolt, scoped databases, HTTP, and graceful shutdown; requires Python `neo4j` |
+| `scripts/bolt_neo4j_driver_smoke.sh` | Exercises direct and routing Bolt URIs through the official Python Neo4j driver |
+| `scripts/query_correctness.sh` | Implements the corresponding local Just recipe |
+| `scripts/multiprocess_stress.sh`, `scripts/fence_takeover.sh` | Implement the local stress and fencing recipes |
+| `scripts/minio_*.sh` | MinIO smoke, correctness, chaos, fencing, MBT, and write-profile harnesses; require Docker |
+| `scripts/multinode_k3s.sh` | Creates a disposable multi-node K3d cluster and performs disruptive failover tests; requires Docker, K3d, kubectl, and Helm |
+| `scripts/deploy_single_node_k3s.sh` | Builds and deploys to an existing K3s host using an S3 bucket; changes Kubernetes and AWS resources |
+| `scripts/multinode_k3s_client.py` | Runs inside the disposable K3d client Pod created by `multinode_k3s.sh` |
+
+`just update-slatedb` is a maintenance command, not a verification command. It
+updates the pinned SlateDB dependency in `Cargo.lock`; review and test the
+resulting lockfile diff before committing it.
 
 ### Repository layout
 
@@ -469,10 +448,9 @@ src/query/          OpenCypher parsing, algebra, planning, transport types
 src/client/         Bolt, HTTP, authentication, quotas, cursors
 src/sparse_kernel/  Rust sparse and SuiteSparse GraphBLAS execution
 crates/             placement and telemetry workspace crates
-charts/hydradb/    Kubernetes Helm chart
+charts/hydradb/     Kubernetes Helm chart
 examples/           smoke, import, benchmark, and correctness programs
 scripts/            local, MinIO, stress, fencing, and deployment harnesses
-docs/               architecture notes, runbooks, benchmarks, and verification
 ```
 
 ## Benchmarks
@@ -482,17 +460,12 @@ Published latency and throughput results are available on the
 measurements locally or against S3, use the benchmark commands and scripts
 documented above.
 
-
 ## Documentation
 
 | Document | Contents |
 |---|---|
 | [Architecture](architecture.md) | End-to-end design, snapshots, writer ownership, query execution, and indexing |
-| [Helm chart guide](charts/hydradb/README.md) | Kubernetes configuration, TLS, authentication, upgrades, and verification |
-| [Duration histograms](docs/runbooks/duration-histograms.md) | Correct latency units, PromQL, aggregation, and alerting |
-| [Correctness casebook](docs/bugs-found-fixed/README.md) | Reproduced storage and query invariants with regression evidence |
-| [Formal verification](docs/formal-methods/0003-hydradb-quint-verification-evidence.md) | Quint and model-based testing evidence |
-| [Jepsen report](docs/jepsen/jepsen-consistency-report.md) | Distributed consistency test results |
+| [Using HydraDB](USING-HYDRADB.md) | Getting started, querying, and operating HydraDB |
 
 ## Contributing
 

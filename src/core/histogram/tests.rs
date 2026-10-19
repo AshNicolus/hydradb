@@ -14,8 +14,8 @@ fn bounds_are_strictly_increasing() {
     }
 }
 
-/// The three rungs the rest of the system cross-checks against. If someone
-/// re-cuts the ladder, these are the ones that may not silently disappear.
+/// The rungs the rest of the system cross-checks against. If someone re-cuts
+/// the ladder, these are the ones that may not silently disappear.
 #[test]
 fn bounds_that_other_code_depends_on_are_present() {
     // `slow_query_log_threshold` default: the cumulative count here and the
@@ -23,6 +23,17 @@ fn bounds_that_other_code_depends_on_are_present() {
     assert!(DURATION_BUCKET_BOUNDS_US.contains(&500_000));
     // `DEFAULT_MAX_QUERY_RUNTIME_MS` and `DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS`.
     assert!(DURATION_BUCKET_BOUNDS_US.contains(&30_000_000));
+    // The raised `GRAPH_MAX_QUERY_RUNTIME_MS` staging runs with. Without a rung
+    // here the budget and the overflow bucket are the same edge again.
+    assert!(DURATION_BUCKET_BOUNDS_US.contains(&120_000_000));
+    // The ceiling must sit strictly above the largest configured budget, or
+    // `+Inf` conflates "timed out" with "slow but successful".
+    assert!(
+        *DURATION_BUCKET_BOUNDS_US
+            .last()
+            .expect("a non-empty ladder")
+            > 120_000_000
+    );
     // The floor.
     assert_eq!(DURATION_BUCKET_BOUNDS_US[0], 100);
 }
@@ -70,7 +81,7 @@ fn every_bucket_is_reachable() {
 fn values_above_the_ceiling_overflow() {
     let histogram = AtomicDurationHistogram::default();
     histogram.record_micros(u64::MAX);
-    histogram.record_micros(30_000_001);
+    histogram.record_micros(300_000_001);
     let snapshot = histogram.snapshot();
     assert_eq!(snapshot.bucket_counts[DURATION_BUCKET_COUNT - 1], 2);
     assert_eq!(snapshot.count(), 2);

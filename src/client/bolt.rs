@@ -27,6 +27,8 @@ use super::service::{
     ClientQueryPage, ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
     ClientReadConsistency, PreparedClientQuery,
 };
+use crate::query::opencypher::{opencypher_query_fingerprint, opencypher_query_shape_for_log};
+use crate::QueryFailureReason;
 use crate::{
     GraphError, GraphScope, QueryColumn, QueryCursorToken, QueryRow, QueryTransportAction,
     QueryTransportConnectionIdentity, QueryTransportTlsServerConfigProvider, Result,
@@ -37,7 +39,7 @@ mod values;
 mod wire;
 use routing::validate_bolt_routing_table;
 pub use routing::{
-    BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider,
+    BoltReadRouting, BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider,
     ObjectStoreBoltRoutingTableProvider,
 };
 use values::{
@@ -224,6 +226,7 @@ impl BoltServerConfig {
             .checked_mul(self.max_pipelined_messages)
             .and_then(|bytes| bytes.checked_mul(2))
             .ok_or_else(|| GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "Bolt",
                 feature: "Bolt pipeline byte budget overflows usize".to_string(),
             })?;
@@ -254,6 +257,7 @@ impl BoltServerConfig {
 
 fn bolt_config_error<T>(reason: &str) -> Result<T> {
     Err(GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::InvalidRequest,
         dialect: "Bolt",
         feature: reason.to_string(),
     })
@@ -366,7 +370,7 @@ async fn run_bolt_server(
                 let (stream, peer_addr) = match accepted {
                     Ok(accepted) => accepted,
                     Err(err) => {
-                        tracing::warn!(target: "slatedb_graph_kernel", error = %err, "Bolt accept failed");
+                        tracing::warn!(target: "hydradb", error = %err, "Bolt accept failed");
                         continue;
                     }
                 };
@@ -390,7 +394,7 @@ async fn run_bolt_server(
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(err)) = completed {
-                    tracing::warn!(target: "slatedb_graph_kernel", error = %err, "Bolt connection task failed");
+                    tracing::warn!(target: "hydradb", error = %err, "Bolt connection task failed");
                 }
             }
         }
@@ -424,7 +428,7 @@ async fn serve_bolt_connection(
         if matches!(err, BoltError::Protocol(_)) {
             metrics.handshake_failures.fetch_add(1, Ordering::Relaxed);
         }
-        tracing::debug!(target: "slatedb_graph_kernel", %peer_addr, error = %err, "Bolt connection closed");
+        tracing::debug!(target: "hydradb", %peer_addr, error = %err, "Bolt connection closed");
     }
 }
 
@@ -854,10 +858,20 @@ async fn run_bolt_protocol(
                 // with the right error; there is nothing useful to say about it
                 // twice.
                 let inbound_traceparent = bolt_traceparent(&extra).ok().flatten();
+                let query_fingerprint = opencypher_query_fingerprint(&query);
+                // Kept for the preparation-failure arm below, which names the
+                // statement it could not run; `query` itself moves into the
+                // request. Taken as the shape rather than as a copy of the
+                // text: this is held across preparation, and a RUN may carry a
+                // statement up to the 2 MiB message limit on each of the
+                // connections the listener allows, whereas the shape is capped
+                // at 4 KiB.
+                let query_shape = opencypher_query_shape_for_log(&query);
                 // Opened before anything can reject the request, and from the
                 // `db` name alone, so that a RUN which never becomes a
                 // statement is still attributed to the tenant that sent it.
                 let run_span = bolt_run_span(&session, &context, &extra);
+                run_span.record("hydradb.query.fingerprint", query_fingerprint.as_str());
                 crate::core::trace_context::adopt_remote_parent(
                     &run_span,
                     inbound_traceparent.as_deref(),
@@ -868,7 +882,7 @@ async fn run_bolt_protocol(
                     Ok(prepared) => prepared,
                     Err(error) => {
                         run_span.in_scope(|| {
-                            tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt RUN rejected");
+                            tracing::warn!(target: "hydradb", error = %error, "Bolt RUN rejected");
                         });
                         send_bolt_failure(&mut writer, &error).await?;
                         state = BoltState::Failed;
@@ -885,7 +899,27 @@ async fn run_bolt_protocol(
                     Err(error) => {
                         run_span.record("error.class", error.class());
                         run_span.in_scope(|| {
-                            tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt RUN preparation failed");
+                            // A query-class failure (unsupported, parse,
+                            // missing parameter) is about the statement, so the
+                            // line names it: the literal-free shape plus the
+                            // same closed reason the failure counter uses.
+                            // Everything else -- timeouts, freshness, storage
+                            // -- is not, and keeps the short line.
+                            match error.failure_reason() {
+                                Some(reason) => tracing::warn!(
+                                    target: "hydradb",
+                                    error = %error,
+                                    failure_reason = reason.as_str(),
+                                    cypher_engine = context.service.cypher_engine().as_str(),
+                                    query_shape = %query_shape,
+                                    "Bolt RUN preparation failed"
+                                ),
+                                None => tracing::warn!(
+                                    target: "hydradb",
+                                    error = %error,
+                                    "Bolt RUN preparation failed"
+                                ),
+                            }
                         });
                         send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
                         state = BoltState::Failed;
@@ -1108,7 +1142,7 @@ async fn run_bolt_protocol(
                     }
                     Err(error) => {
                         route_span.in_scope(|| {
-                            tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt ROUTE rejected");
+                            tracing::warn!(target: "hydradb", error = %error, "Bolt ROUTE rejected");
                         });
                         send_bolt_failure(&mut writer, &error).await?;
                         state = BoltState::Failed;
@@ -1140,7 +1174,7 @@ async fn run_bolt_protocol(
 
     clear_pending_result(&context, &mut session).await;
     reader_task.stop().await;
-    tracing::debug!(target: "slatedb_graph_kernel", %peer_addr, "Bolt session closed");
+    tracing::debug!(target: "hydradb", %peer_addr, "Bolt session closed");
     Ok(())
 }
 
@@ -1215,7 +1249,7 @@ fn selected_bolt_database(
 macro_rules! bolt_ingress_span {
     ($name:literal) => {
         tracing::info_span!(
-            target: "slatedb_graph_kernel",
+            target: "hydradb",
             $name,
             hydradb.scope = tracing::field::Empty,
             hydradb.cell_id = tracing::field::Empty,
@@ -1223,6 +1257,7 @@ macro_rules! bolt_ingress_span {
             hydradb.tenant.scope_id = tracing::field::Empty,
             hydradb.sub_tenant_id = tracing::field::Empty,
             hydradb.sub_tenant.scope_id = tracing::field::Empty,
+            hydradb.query.fingerprint = tracing::field::Empty,
             error.class = tracing::field::Empty,
         )
     };
@@ -1370,19 +1405,23 @@ fn bolt_query_request(
 /// key the channel has carried in production, and its handling below is
 /// unchanged by the allowlist that now surrounds it.
 const TX_METADATA_CONSISTENCY: &str = "hydradb.consistency";
+const LEGACY_TX_METADATA_CONSISTENCY: &str = "turbolay.consistency";
 
 /// `tx_metadata` key carrying the caller's own request identifier — the field
 /// that makes a HydraDB log line and an ingestion log line joinable.
 const TX_METADATA_CORRELATION_ID: &str = "hydradb.correlation_id";
+const LEGACY_TX_METADATA_CORRELATION_ID: &str = "turbolay.correlation_id";
 
 /// `tx_metadata` key carrying the caller's operation label, e.g. which step of
 /// a multi-step workflow issued this query.
 const TX_METADATA_CALLER_STEP: &str = "hydradb.caller.step";
+const LEGACY_TX_METADATA_CALLER_STEP: &str = "turbolay.caller.step";
 
 /// Optional caller-owned mutation identity. A caller that retries the same
 /// logical write must preserve this value across attempts. When absent, Bolt
 /// generates a globally unique identity for this RUN request.
 const TX_METADATA_IDEMPOTENCY_KEY: &str = "hydradb.idempotency_key";
+const LEGACY_TX_METADATA_IDEMPOTENCY_KEY: &str = "turbolay.idempotency_key";
 
 /// Every `tx_metadata` key HydraDB reads.
 ///
@@ -1392,9 +1431,13 @@ const TX_METADATA_IDEMPOTENCY_KEY: &str = "hydradb.idempotency_key";
 /// and the idempotency key controls durable write deduplication.
 const TX_METADATA_ALLOWLIST: &[&str] = &[
     TX_METADATA_CONSISTENCY,
+    LEGACY_TX_METADATA_CONSISTENCY,
     TX_METADATA_CORRELATION_ID,
+    LEGACY_TX_METADATA_CORRELATION_ID,
     TX_METADATA_CALLER_STEP,
+    LEGACY_TX_METADATA_CALLER_STEP,
     TX_METADATA_IDEMPOTENCY_KEY,
+    LEGACY_TX_METADATA_IDEMPOTENCY_KEY,
     TX_METADATA_TRACEPARENT,
 ];
 
@@ -1449,14 +1492,16 @@ fn bolt_caller_metadata(extra: &BoltDict) -> std::result::Result<BoltCallerMetad
         // this line is here so "I set the key and nothing appeared" is
         // diagnosable, not so unknown input reaches a log sink.
         tracing::debug!(
-            target: "slatedb_graph_kernel",
+            target: "hydradb",
             dropped,
             "Bolt tx_metadata keys outside the allowlist were dropped"
         );
     }
     Ok(BoltCallerMetadata {
-        correlation_id: allowlisted_caller_value(metadata, TX_METADATA_CORRELATION_ID),
-        caller_step: allowlisted_caller_value(metadata, TX_METADATA_CALLER_STEP),
+        correlation_id: allowlisted_caller_value(metadata, TX_METADATA_CORRELATION_ID)
+            .or_else(|| allowlisted_caller_value(metadata, LEGACY_TX_METADATA_CORRELATION_ID)),
+        caller_step: allowlisted_caller_value(metadata, TX_METADATA_CALLER_STEP)
+            .or_else(|| allowlisted_caller_value(metadata, LEGACY_TX_METADATA_CALLER_STEP)),
     })
 }
 
@@ -1466,7 +1511,12 @@ fn bolt_mutation_idempotency_key(
     let Some(metadata) = bolt_tx_metadata(extra)? else {
         return Ok(None);
     };
-    let Some(value) = metadata.get(TX_METADATA_IDEMPOTENCY_KEY) else {
+    let Some(value) = aliased_metadata_value(
+        metadata,
+        TX_METADATA_IDEMPOTENCY_KEY,
+        LEGACY_TX_METADATA_IDEMPOTENCY_KEY,
+    )?
+    else {
         return Ok(None);
     };
     let BoltValue::String(value) = value else {
@@ -1512,12 +1562,32 @@ fn allowlisted_caller_value(metadata: &BoltDict, key: &str) -> Option<String> {
     }
 }
 
+fn aliased_metadata_value<'a>(
+    metadata: &'a BoltDict,
+    canonical_key: &str,
+    legacy_key: &str,
+) -> std::result::Result<Option<&'a BoltValue>, BoltError> {
+    match (metadata.get(canonical_key), metadata.get(legacy_key)) {
+        (Some(canonical), Some(legacy)) if canonical != legacy => Err(BoltError::Protocol(
+            format!("conflicting Bolt metadata values for {canonical_key} and {legacy_key}"),
+        )),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
 fn bolt_read_consistency(
     extra: &BoltDict,
 ) -> std::result::Result<Option<ClientReadConsistency>, BoltError> {
     let direct = extra.get("consistency");
-    let metadata =
-        bolt_tx_metadata(extra)?.and_then(|metadata| metadata.get(TX_METADATA_CONSISTENCY));
+    let metadata = match bolt_tx_metadata(extra)? {
+        Some(metadata) => aliased_metadata_value(
+            metadata,
+            TX_METADATA_CONSISTENCY,
+            LEGACY_TX_METADATA_CONSISTENCY,
+        )?,
+        None => None,
+    };
     let value = match (direct, metadata) {
         (Some(left), Some(right)) if left != right => {
             return Err(BoltError::Protocol(
@@ -1632,6 +1702,45 @@ where
     }
 }
 
+/// Record-encoding time accumulated across one PULL and reported to the
+/// service between page fetches, so a fetch's wait is never billed as
+/// serialization. Dropping it reports what is left, so a PULL that fails or
+/// returns early still counts the records it already wrote.
+struct SerializeTally<'a> {
+    service: &'a ClientQueryService,
+    elapsed: Duration,
+    rows: usize,
+}
+
+impl<'a> SerializeTally<'a> {
+    fn new(service: &'a ClientQueryService) -> Self {
+        Self {
+            service,
+            elapsed: Duration::ZERO,
+            rows: 0,
+        }
+    }
+
+    fn add(&mut self, elapsed: Duration) {
+        self.elapsed += elapsed;
+        self.rows += 1;
+    }
+
+    fn flush(&mut self) {
+        if self.rows > 0 {
+            self.service.record_serialization(self.elapsed, self.rows);
+        }
+        self.elapsed = Duration::ZERO;
+        self.rows = 0;
+    }
+}
+
+impl Drop for SerializeTally<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 async fn consume_bolt_records<W>(
     context: &Arc<BoltConnectionContext>,
     authenticated: &ClientQuerySession,
@@ -1645,19 +1754,25 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut remaining = count.unwrap_or(usize::MAX);
+    // Encoding and writing records, excluding the page fetches interleaved
+    // with them, so serialization is its own term in a request's decomposition.
+    let mut serialize = SerializeTally::new(&context.service);
     while remaining > 0 {
         if let Some(row) = pending.rows.pop_front() {
             if matches!(disposition, BoltRecordDisposition::Send) {
+                let started = Instant::now();
                 let values = row
                     .values
                     .iter()
                     .map(query_value_to_bolt)
                     .collect::<std::result::Result<Vec<_>, BoltError>>()?;
                 send_bolt_message(channels.writer, &ServerMessage::Record { data: values }).await?;
+                serialize.add(started.elapsed());
             }
             remaining -= 1;
             continue;
         }
+        serialize.flush();
         let cursor = if pending.started {
             let Some(cursor) = pending.next_cursor.take() else {
                 break;
@@ -1677,7 +1792,7 @@ where
         // where the wall-clock actually went.
         pending.pages += 1;
         let page_span = tracing::info_span!(
-            target: "slatedb_graph_kernel",
+            target: "hydradb",
             parent: &pending.statement_span,
             "query.page",
             hydradb.scope = %scope,
@@ -1756,6 +1871,7 @@ where
             outcome => return Ok(outcome),
         }
     }
+    serialize.flush();
     Ok(PageAwaitResult::Complete(Ok(ClientQueryPage {
         query_id: pending.prepared.request.query_id.clone(),
         page: crate::QueryResultPage::new(pending.columns.clone(), Vec::new(), pending.next_cursor),
@@ -1842,13 +1958,10 @@ async fn prepare_bolt_route(
             "route to",
         )
         .map_err(graph_error_to_bolt)?;
-    if let Some(bookmark) = highest_matching_bookmark(&target, bookmarks)? {
-        context
-            .service
-            .ensure_bookmark(&bookmark)
-            .await
-            .map_err(graph_error_to_bolt)?;
-    }
+    // Routing depends on placement and writer leases, not the router's data
+    // snapshot. Validate scope/encoding here; RUN enforces the bookmark on the
+    // selected execution node before reading graph data.
+    highest_matching_bookmark(&target, bookmarks)?;
     let table = match &context.routing_table_provider {
         Some(provider) => provider
             .routing_table(&database, &target)
@@ -2046,6 +2159,49 @@ mod caller_metadata_tests {
             caller.caller_step.as_deref(),
             Some("delete_source.relates_3_0")
         );
+    }
+
+    #[test]
+    fn legacy_turbolay_metadata_remains_supported_during_the_rename() {
+        let extra = tx_metadata([
+            (LEGACY_TX_METADATA_CONSISTENCY, string("strong")),
+            (
+                LEGACY_TX_METADATA_CORRELATION_ID,
+                string("legacy-correlation"),
+            ),
+            (LEGACY_TX_METADATA_CALLER_STEP, string("legacy-step")),
+            (
+                LEGACY_TX_METADATA_IDEMPOTENCY_KEY,
+                string("legacy-mutation"),
+            ),
+        ]);
+
+        assert_eq!(
+            bolt_read_consistency(&extra).expect("valid legacy consistency"),
+            Some(ClientReadConsistency::Strong)
+        );
+        assert_eq!(
+            bolt_caller_metadata(&extra).expect("valid legacy caller metadata"),
+            BoltCallerMetadata {
+                correlation_id: Some("legacy-correlation".to_string()),
+                caller_step: Some("legacy-step".to_string()),
+            }
+        );
+        assert_eq!(
+            request(extra).mutation_idempotency_key(),
+            Some("bolt-caller-v1-legacy-mutation")
+        );
+    }
+
+    #[test]
+    fn conflicting_canonical_and_legacy_mutation_keys_are_rejected() {
+        let error = request_result(tx_metadata([
+            (TX_METADATA_IDEMPOTENCY_KEY, string("canonical")),
+            (LEGACY_TX_METADATA_IDEMPOTENCY_KEY, string("legacy")),
+        ]))
+        .expect_err("conflicting durable identities must fail the request");
+
+        assert!(matches!(error, BoltError::Protocol(_)));
     }
 
     #[test]

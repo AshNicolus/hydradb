@@ -139,6 +139,7 @@ impl GraphShard {
 
         let mut expected_counts = BTreeMap::<(VertexId, VertexId), u64>::new();
         let mut expected_property_indexes = BTreeSet::<RelationshipPropertyIndexEntry>::new();
+        let mut live_identities = BTreeMap::<(String, VertexId, VertexId), BTreeSet<u64>>::new();
         for record in &relationships {
             if !expected_edges.contains(&(record.src, record.dst)) {
                 record_mismatch(
@@ -158,6 +159,16 @@ impl GraphShard {
                     record.dst,
                     record.relationship_id,
                 ));
+                if property == "id" {
+                    live_identities
+                        .entry((
+                            encode_vertex_property_value_key(value),
+                            record.src,
+                            record.dst,
+                        ))
+                        .or_default()
+                        .insert(record.relationship_id);
+                }
             }
         }
 
@@ -182,6 +193,46 @@ impl GraphShard {
             &actual_property_indexes,
             report,
         );
+
+        // The `rmerge_idx` identity pointers. A pointer may only exist while
+        // exactly one live relationship carries its identity, and must name
+        // that relationship. The *absence* of a pointer is never a mismatch —
+        // heal-on-read earns pointers lazily — so only the three ways a
+        // present pointer can be wrong are checked. Deleting a bad pointer is
+        // always a safe repair: the next MERGE falls back to the scan and
+        // re-earns it if the identity is unique.
+        let merge_pointers = self
+            .scan_relationship_merge_index_entries(cell_id, edge_type)
+            .await?;
+        report.relationship_merge_indexes = merge_pointers.len() as u64;
+        for ((encoded, src, dst), relationship_id) in &merge_pointers {
+            match live_identities.get(&(encoded.clone(), *src, *dst)) {
+                None => record_mismatch(
+                    report,
+                    format!(
+                        "relationship_merge_index:dangling encoded={encoded} src={src} dst={dst} \
+                         relationship_id={relationship_id}"
+                    ),
+                ),
+                Some(ids) if ids.len() > 1 => record_mismatch(
+                    report,
+                    format!(
+                        "relationship_merge_index:ambiguous-identity encoded={encoded} src={src} \
+                         dst={dst} live_rows={}",
+                        ids.len()
+                    ),
+                ),
+                Some(ids) if !ids.contains(relationship_id) => record_mismatch(
+                    report,
+                    format!(
+                        "relationship_merge_index:wrong-target encoded={encoded} src={src} \
+                         dst={dst} pointer={relationship_id} live={:?}",
+                        ids.iter().next()
+                    ),
+                ),
+                Some(_) => {}
+            }
+        }
         Ok(())
     }
 
@@ -233,6 +284,24 @@ impl GraphShard {
             }
         }
         Ok(counters)
+    }
+
+    async fn scan_relationship_merge_index_entries(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<BTreeMap<(String, VertexId, VertexId), u64>> {
+        let mut iter = self
+            .scan_remote_prefix(&format!("cell/{cell_id}/rmerge_idx/{edge_type}/"))
+            .await?;
+        let mut entries = BTreeMap::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (encoded, src, dst) = parse_relationship_merge_index_key_for_verify(&key)?;
+            let relationship_id = decode_u64(&key, &kv.value)?;
+            entries.insert((encoded, src, dst), relationship_id);
+        }
+        Ok(entries)
     }
 
     async fn scan_relationship_property_index_entries(

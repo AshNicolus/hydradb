@@ -1,4 +1,8 @@
 use super::*;
+use crate::core::memory_diagnostics::{
+    request_estimated_bytes, MemoryDiagnosticGuard, MemoryStage,
+};
+use crate::QueryFailureReason;
 
 use tracing::Instrument as _;
 
@@ -149,10 +153,8 @@ impl GraphShard {
         let db = GraphStore::lazy(
             store_path.clone(),
             Arc::clone(&object_store),
-            options.cache.clone(),
-            memory.storage.clone(),
-            options.durability.clone(),
-            options.fence_backoff_interval,
+            &options,
+            &memory,
             process_writer,
         )?;
         match &write_authority {
@@ -189,6 +191,9 @@ impl GraphShard {
             hydration_gate,
             matrix_compilation_gate,
             graph_write_gate,
+            write_pipeline_gate: Arc::new(Semaphore::new(
+                super::write_pipeline::MAX_PENDING_DURABLE_WRITES,
+            )),
             artifact_build_gate,
             gc_gate,
             index_policy: options.index_policy,
@@ -216,6 +221,16 @@ impl GraphShard {
             parsed_row_query_cache: Mutex::new(BoundedGraphCache::new(
                 cache_policy.max_parsed_row_queries,
                 tenant_quota,
+            )),
+            // Sized like the parsed-query cache: one shape asks for a handful
+            // of facts, so the vocabulary of facts is a small multiple of the
+            // vocabulary of shapes. The byte cap matters only for records that
+            // carry a Bloom filter; plain counts are a few hundred bytes.
+            #[cfg(feature = "experimental-cypher-engine")]
+            experimental_statistics_memo: Mutex::new(BoundedGraphCache::new_with_byte_limit(
+                cache_policy.max_parsed_row_queries,
+                tenant_quota,
+                crate::shard::experimental_cypher::STATISTICS_MEMO_MAX_BYTES,
             )),
             #[cfg(feature = "opencypher")]
             relationship_rows_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
@@ -261,6 +276,10 @@ impl GraphShard {
         self.operation_metrics.snapshot()
     }
 
+    pub fn graph_storage_metrics(&self) -> GraphStorageMetricsSnapshot {
+        self.db.storage_metrics()
+    }
+
     pub fn graph_index_policy(&self) -> GraphIndexPolicy {
         self.index_policy
     }
@@ -280,9 +299,44 @@ impl GraphShard {
     ) -> Result<LocalWriteGuard> {
         validate_component("cell_id", cell_id)?;
         validate_component("operation", operation)?;
-        let guard = LocalWriteGuard::new(Arc::clone(&self.local_write_guard).lock_owned().await);
+        let guard = LocalWriteGuard::new(
+            Arc::clone(&self.local_write_guard)
+                .lock_owned()
+                .instrument(tracing::info_span!("shard.local_write_guard", hydradb.cell_id = %cell_id, hydradb.write.operation = operation))
+                .await,
+        );
+        self.await_prior_write_durability().await?;
         self.db.refresh_writer_fence().await?;
         Ok(guard)
+    }
+
+    pub(crate) async fn acquire_local_write_guard_no_fence(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<LocalWriteGuard> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("operation", operation)?;
+        let guard = LocalWriteGuard::new(
+            Arc::clone(&self.local_write_guard)
+                .lock_owned()
+                .instrument(tracing::info_span!("shard.local_write_guard", hydradb.cell_id = %cell_id, hydradb.write.operation = operation))
+                .await,
+        );
+        self.await_prior_write_durability().await?;
+        Ok(guard)
+    }
+
+    /// Only for paths that must commit before reporting success. SlateDB fences
+    /// a superseded writer at the create-only WAL barrier, so a durable commit
+    /// already verifies ownership. A replay/no-op must use the manifest check
+    /// instead; an in-memory acknowledgement has no WAL barrier to wait for.
+    pub(crate) async fn validate_changing_write(&self) -> Result<()> {
+        if self.await_durable_writes && self.db.writer()?.snapshot().await.is_ok() {
+            return Ok(());
+        }
+        // Retain fenced-handle cleanup/backoff and memory-only write behavior.
+        self.db.refresh_writer_fence().await
     }
 
     pub(crate) async fn acquire_local_artifact_guard(
@@ -398,12 +452,32 @@ impl GraphShard {
     pub(crate) async fn acquire_graph_write_permit(
         &self,
         operation: &'static str,
-    ) -> Result<OwnedSemaphorePermit> {
+    ) -> Result<(OwnedSemaphorePermit, MemoryDiagnosticGuard)> {
         self.operation_metrics
             .write_attempts
             .fetch_add(1, Ordering::Relaxed);
-        self.acquire_operation_permit(operation, &self.graph_write_gate)
-            .await
+        let bytes = request_estimated_bytes();
+        let waiting = MemoryDiagnosticGuard::new(MemoryStage::ShardWriteWait, bytes);
+        let acquire = self.acquire_operation_permit(operation, &self.graph_write_gate);
+        // A queued request has not started a transaction. Stop it here without
+        // dropping a commit already in progress or releasing another writer's permit.
+        let permit = match crate::QueryCancellationToken::current() {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(GraphError::QueryTimeout {
+                    operation: "query_cancelled",
+                    elapsed_ms: 0,
+                    limit_ms: 0,
+                }),
+                permit = acquire => permit?,
+            },
+            None => acquire.await?,
+        };
+        drop(waiting);
+        Ok((
+            permit,
+            MemoryDiagnosticGuard::new(MemoryStage::ShardWriteActive, bytes),
+        ))
     }
 
     pub(crate) async fn acquire_artifact_build_permit(
@@ -552,9 +626,11 @@ impl GraphShard {
         if operation != "drop_cell" {
             let drop_marker = keys::cell_drop_marker(cell_id);
             let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
-            if read_txn_remote(txn, &drop_marker).await?.is_some()
-                || read_txn_remote(txn, &pending_drop_marker).await?.is_some()
-            {
+            let (dropped, pending) = tokio::join!(
+                read_txn_remote(txn, &drop_marker),
+                read_txn_remote(txn, &pending_drop_marker),
+            );
+            if dropped?.is_some() || pending?.is_some() {
                 return Err(GraphError::CellDropped {
                     operation,
                     cell_id: cell_id.to_string(),
@@ -661,6 +737,61 @@ impl GraphShard {
             .fetch_add(duration_micros_u64(commit), Ordering::Relaxed);
     }
 
+    /// The relationship CREATE/MERGE counterpart of
+    /// [`Self::record_bulk_import_profile`]: one call per committed
+    /// `import_relationships_batch_txn_locked` transaction, attributing its
+    /// storage time to the phase that spent it. Recorded only on the attempt
+    /// that commits, so every `_us` sum divides by `batches_profiled`; the
+    /// per-attempt story, including the attempts that fail or retry, lives on
+    /// the `shard.write_txn` span's `hydradb.relimport.*` attributes instead.
+    pub(crate) fn record_relationship_import_profile(
+        &self,
+        profile: &crate::RelationshipImportProfile,
+    ) {
+        self.operation_metrics
+            .relationship_import_batches_profiled
+            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics
+            .relationship_import_endpoint_check_us
+            .fetch_add(
+                duration_micros_u64(profile.endpoint_check),
+                Ordering::Relaxed,
+            );
+        self.operation_metrics
+            .relationship_import_identity_scan_us
+            .fetch_add(
+                duration_micros_u64(profile.identity_scan),
+                Ordering::Relaxed,
+            );
+        self.operation_metrics
+            .relationship_import_identity_pointer_hits
+            .fetch_add(profile.identity_pointer_hits, Ordering::Relaxed);
+        self.operation_metrics
+            .relationship_import_identity_pointer_misses
+            .fetch_add(profile.identity_pointer_misses, Ordering::Relaxed);
+        self.operation_metrics
+            .relationship_import_record_read_us
+            .fetch_add(duration_micros_u64(profile.record_read), Ordering::Relaxed);
+        self.operation_metrics
+            .relationship_import_structural_check_us
+            .fetch_add(
+                duration_micros_u64(profile.structural_check),
+                Ordering::Relaxed,
+            );
+        self.operation_metrics
+            .relationship_import_segment_scans
+            .fetch_add(profile.segment_scans, Ordering::Relaxed);
+        self.operation_metrics
+            .relationship_import_segment_neighbors
+            .fetch_add(profile.segment_neighbors, Ordering::Relaxed);
+        self.operation_metrics
+            .relationship_import_counter_read_us
+            .fetch_add(duration_micros_u64(profile.counter_read), Ordering::Relaxed);
+        self.operation_metrics
+            .relationship_import_commit_us
+            .fetch_add(duration_micros_u64(profile.commit), Ordering::Relaxed);
+    }
+
     pub async fn snapshot(&self, cell_id: &str) -> Result<GraphSnapshot<'_>> {
         self.snapshot_for_query(cell_id, false).await
     }
@@ -702,19 +833,60 @@ impl GraphShard {
         cell_id: &str,
         minimum: StorageSequence,
     ) -> Result<StorageSequence> {
+        Ok(self
+            .wait_for_storage_sequence_observed(cell_id, minimum)
+            .await?
+            .0)
+    }
+
+    /// [`Self::wait_for_storage_sequence`], reporting what the wait did.
+    ///
+    /// The sequence alone cannot distinguish the two outcomes this whole change
+    /// is about — a wait that exited on its first check because this node holds
+    /// the cell's writer, and a wait that spun on the object store because it
+    /// does not — and both return the same number. [`BookmarkWait`] carries the
+    /// difference out to the client, which is the only layer that knows which
+    /// request paid for it. Change 4 of
+    /// `docs/plans/2026-08-21-cell-affine-read-routing.md`.
+    ///
+    /// Nothing here allocates, locks or reaches the store that did not already:
+    /// the writer flag falls out of the branch `durable_sequence` took anyway,
+    /// and the refresh count is a local `u32`.
+    pub async fn wait_for_storage_sequence_observed(
+        &self,
+        cell_id: &str,
+        minimum: StorageSequence,
+    ) -> Result<(StorageSequence, BookmarkWait)> {
         validate_component("cell_id", cell_id)?;
-        let current = self.db.durable_sequence().await?;
+        let (current, served_by_cell_writer) = self.db.durable_sequence_observed().await?;
+        let mut wait = BookmarkWait {
+            served_by_cell_writer,
+            refreshes: 0,
+        };
         if current >= minimum {
-            return Ok(current);
+            return Ok((current, wait));
         }
+        // The wait gets its own budget, deliberately smaller than
+        // `max_query_runtime_ms`. It used to *be* `max_query_runtime_ms`, so a
+        // read whose reader could not catch up spent the entire 30s query
+        // budget here and was then killed by the client watchdog at 29,999ms
+        // (`src/client/service.rs`) with a phase-agnostic timeout — the
+        // `SnapshotAhead` below, which names the cell and both epochs, lost
+        // that race and so was almost never observed in production. Bounding
+        // the wait separately makes it lose to nothing: it degrades into a
+        // clear, Bolt-retriable error with the rest of the budget intact.
+        // Change 3 of `docs/plans/2026-08-21-cell-affine-read-routing.md`.
         let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(
-                self.limits.max_query_runtime_ms.unwrap_or(30_000).max(1),
-            );
+            + std::time::Duration::from_millis(self.limits.max_bookmark_wait_ms);
         loop {
             let current = self.db.refresh_durable_reader().await?;
+            // Counted after the call rather than before it, so the number is
+            // "manifest refreshes this wait actually performed" and a saturating
+            // add keeps a pathological wait from wrapping to zero and reading as
+            // the free path.
+            wait.refreshes = wait.refreshes.saturating_add(1);
             if current >= minimum {
-                return Ok(current);
+                return Ok((current, wait));
             }
             if std::time::Instant::now() >= deadline {
                 return Err(GraphError::SnapshotAhead {
@@ -744,6 +916,7 @@ impl GraphShard {
         }
         if read_epoch != current_epoch {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "GraphSnapshot",
                 feature: "historical graph epochs are not SlateDB snapshots".to_string(),
             });

@@ -1,4 +1,4 @@
-use slatedb_graph_kernel::{
+use hydradb::{
     object_store_from_env, GraphError, GraphShard, QueryContext, QueryResultSet, QueryValue,
     Result, VertexPropertyValue,
 };
@@ -57,6 +57,7 @@ impl ArgParser {
     fn required(&mut self, name: &str) -> Result<String> {
         self.optional(name)?
             .ok_or_else(|| GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "CypherQuery",
                 feature: format!("missing required argument {name}"),
             })
@@ -69,6 +70,7 @@ impl ArgParser {
         self.args.remove(idx);
         if idx >= self.args.len() || self.args[idx].starts_with('-') {
             return Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "CypherQuery",
                 feature: format!("{name} requires a value"),
             });
@@ -76,6 +78,7 @@ impl ArgParser {
         let value = self.args.remove(idx);
         if value.trim().is_empty() {
             return Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "CypherQuery",
                 feature: format!("{name} cannot be empty"),
             });
@@ -98,6 +101,7 @@ impl ArgParser {
             Ok(())
         } else {
             Err(GraphError::UnsupportedQuery {
+                reason: hydradb::QueryFailureReason::InvalidRequest,
                 dialect: "CypherQuery",
                 feature: format!("unknown arguments: {}", self.args.join(" ")),
             })

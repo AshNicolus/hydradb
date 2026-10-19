@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use slatedb_graph_kernel::parse_opencypher_tck_corpus_dir;
+use hydradb::parse_opencypher_tck_corpus_dir;
 
 fn main() {
     let Some(root) = std::env::args_os().nth(1).map(PathBuf::from) else {

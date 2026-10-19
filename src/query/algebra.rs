@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+use crate::QueryFailureReason;
 use crate::{
     validate_component, CommitResult, EdgeMetadata, GraphError, GraphScope, QueryFloat,
     RelationshipId, Result, StorageSequence, VertexId, VertexMetadata, VertexPropertyValue,
@@ -84,6 +85,16 @@ pub struct QueryBatchVertex {
     derive(serde::Deserialize, serde::Serialize)
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchIsolatedVertex {
+    pub vertex: VertexId,
+    pub path_node_constraints: VertexMetadata,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryBatchRelationship {
     pub src: VertexId,
     pub dst: VertexId,
@@ -123,6 +134,7 @@ impl QueryBatchMergePolicy {
             .contains(&self.update_if_newer_by)
         {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Unwind,
                 dialect: "QueryBatch",
                 feature: format!(
                     "update guard {} cannot also be create-only",
@@ -157,6 +169,15 @@ pub enum QueryBatchOperation {
     DeleteVertices {
         vertices: Vec<VertexId>,
         detach: bool,
+    },
+    DeleteIsolatedVertices {
+        candidates: Vec<QueryBatchIsolatedVertex>,
+        deleted_column: QueryColumn,
+    },
+    DeleteVerticesAndIsolatedCandidates {
+        detach_vertices: Vec<VertexId>,
+        isolated_candidates: Vec<QueryBatchIsolatedVertex>,
+        deleted_column: QueryColumn,
     },
     DeleteRelationshipsByProperty {
         edge_type: String,
@@ -243,6 +264,8 @@ impl QueryBatchOperation {
                 | Self::CreateEdgesBetweenLabeledVertices { .. }
                 | Self::DeleteEdges { .. }
                 | Self::DeleteVertices { .. }
+                | Self::DeleteIsolatedVertices { .. }
+                | Self::DeleteVerticesAndIsolatedCandidates { .. }
                 | Self::DeleteRelationshipsByProperty { .. }
                 | Self::UpsertVertices { .. }
                 | Self::GuardedUpsertVertices { .. }
@@ -259,6 +282,14 @@ impl QueryBatchOperation {
             | Self::CreateEdgesBetweenLabeledVertices { edges, .. }
             | Self::DeleteEdges { edges, .. } => edges.len(),
             Self::DeleteVertices { vertices, .. } => vertices.len(),
+            Self::DeleteIsolatedVertices { candidates, .. } => candidates.len(),
+            Self::DeleteVerticesAndIsolatedCandidates {
+                detach_vertices,
+                isolated_candidates,
+                ..
+            } => detach_vertices
+                .len()
+                .saturating_add(isolated_candidates.len()),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
             Self::UpsertVertices { vertices } | Self::GuardedUpsertVertices { vertices, .. } => {
                 vertices.len()
@@ -282,6 +313,32 @@ impl QueryBatchOperation {
     feature = "query-transport",
     derive(serde::Deserialize, serde::Serialize)
 )]
+#[cfg_attr(feature = "query-transport", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CypherEngineMode {
+    #[default]
+    Legacy,
+    Experimental,
+}
+
+impl CypherEngineMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Experimental => "experimental",
+        }
+    }
+
+    #[cfg(feature = "query-transport")]
+    fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryContext {
     pub scope: GraphScope,
@@ -290,8 +347,20 @@ pub struct QueryContext {
     pub read_epoch: Option<StorageSequence>,
     pub result_window: QueryWindow,
     pub parameters: BTreeMap<String, VertexPropertyValue>,
+    /// List-valued parameters, kept beside `parameters` rather than in it:
+    /// `VertexPropertyValue` is the stored-property type and must not grow a
+    /// list variant. Only `IN` reads these. `serde(default)` is load-bearing
+    /// during a rolling deploy, where a context serialized by an older node
+    /// still has to decode here.
+    #[cfg_attr(feature = "query-transport", serde(default))]
+    pub list_parameters: BTreeMap<String, Vec<VertexPropertyValue>>,
     pub max_runtime_ms: Option<u64>,
     pub max_result_bytes: Option<u64>,
+    #[cfg_attr(
+        feature = "query-transport",
+        serde(default, skip_serializing_if = "CypherEngineMode::is_legacy")
+    )]
+    pub cypher_engine: CypherEngineMode,
     #[cfg_attr(feature = "query-transport", serde(default))]
     refreshed_reader: bool,
     #[cfg_attr(feature = "query-transport", serde(skip, default))]
@@ -310,8 +379,10 @@ impl QueryContext {
             read_epoch: None,
             result_window: QueryWindow::default(),
             parameters: BTreeMap::new(),
+            list_parameters: BTreeMap::new(),
             max_runtime_ms: None,
             max_result_bytes: None,
+            cypher_engine: CypherEngineMode::Legacy,
             refreshed_reader: false,
             cancellation_token: None,
             #[cfg(feature = "opencypher")]
@@ -347,6 +418,14 @@ impl QueryContext {
         self
     }
 
+    pub fn with_list_parameters(
+        mut self,
+        parameters: impl IntoIterator<Item = (String, Vec<VertexPropertyValue>)>,
+    ) -> Self {
+        self.list_parameters.extend(parameters);
+        self
+    }
+
     pub fn with_timeout_ms(mut self, max_runtime_ms: u64) -> Self {
         self.max_runtime_ms = Some(max_runtime_ms);
         self
@@ -354,6 +433,11 @@ impl QueryContext {
 
     pub fn with_max_result_bytes(mut self, max_result_bytes: u64) -> Self {
         self.max_result_bytes = Some(max_result_bytes);
+        self
+    }
+
+    pub fn with_cypher_engine(mut self, cypher_engine: CypherEngineMode) -> Self {
+        self.cypher_engine = cypher_engine;
         self
     }
 
@@ -431,7 +515,20 @@ pub struct QueryCancellationToken {
     notify: Arc<Notify>,
 }
 
+tokio::task_local! {
+    static ACTIVE_QUERY_CANCELLATION: QueryCancellationToken;
+}
+
 impl QueryCancellationToken {
+    #[cfg(any(feature = "query-transport", test))]
+    pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        ACTIVE_QUERY_CANCELLATION.scope(self.clone(), future).await
+    }
+
+    pub(crate) fn current() -> Option<Self> {
+        ACTIVE_QUERY_CANCELLATION.try_with(Clone::clone).ok()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -486,8 +583,16 @@ pub enum QueryCardinalityStatsKind {
     EdgeType {
         edge_type: String,
     },
+    EdgeExpansion {
+        edge_type: String,
+        direction: QueryStatsDirection,
+        source_labels: Vec<String>,
+    },
     VertexLabel {
         label: String,
+    },
+    VertexLabelIntersection {
+        labels: Vec<String>,
     },
     VertexProperty {
         property: String,
@@ -498,6 +603,24 @@ pub enum QueryCardinalityStatsKind {
         property: String,
         value: VertexPropertyValue,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryStatsDirection {
+    Outgoing,
+    Incoming,
+    Undirected,
+}
+
+impl QueryStatsDirection {
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn as_key_component(self) -> &'static str {
+        match self {
+            Self::Outgoing => "out",
+            Self::Incoming => "in",
+            Self::Undirected => "both",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -517,6 +640,91 @@ pub struct QueryStatsRecord {
     pub distinct_values: u64,
     pub total_values: u64,
     pub most_common_count: u64,
+    pub bloom: Option<QueryStatsBloom>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryStatsBloom {
+    pub bit_count: u64,
+    pub hash_count: u32,
+    pub inserted_count: u64,
+    pub false_positive_rate_ppm: u32,
+    pub bits: Vec<u8>,
+}
+
+impl QueryStatsBloom {
+    pub fn from_encoded_values<'a>(values: impl Iterator<Item = &'a str>) -> Self {
+        const BITS_PER_VALUE: u64 = 10;
+        const HASH_COUNT: u32 = 7;
+        let values = values.collect::<Vec<_>>();
+        let inserted_count = values.len() as u64;
+        let requested_bits = inserted_count.saturating_mul(BITS_PER_VALUE).max(64);
+        let bit_count = requested_bits.saturating_add(7) / 8 * 8;
+        let mut bloom = Self {
+            bit_count,
+            hash_count: HASH_COUNT,
+            inserted_count,
+            false_positive_rate_ppm: bloom_false_positive_rate_ppm(
+                bit_count,
+                HASH_COUNT,
+                inserted_count,
+            ),
+            bits: vec![
+                0;
+                usize::try_from(bit_count / 8)
+                    .expect("bloom size derives from an in-memory value count")
+            ],
+        };
+        for value in values {
+            bloom.insert(value.as_bytes());
+        }
+        bloom
+    }
+
+    pub fn may_contain_encoded(&self, value: &str) -> bool {
+        if self.bit_count == 0
+            || self.bits.len() as u64 != self.bit_count / 8
+            || !(1..=32).contains(&self.hash_count)
+        {
+            return true;
+        }
+        bloom_indexes(value.as_bytes(), self.bit_count, self.hash_count).all(|index| {
+            let byte = usize::try_from(index / 8).expect("bloom index fits its backing vector");
+            self.bits[byte] & (1 << (index % 8)) != 0
+        })
+    }
+
+    fn insert(&mut self, value: &[u8]) {
+        for index in bloom_indexes(value, self.bit_count, self.hash_count) {
+            let byte = usize::try_from(index / 8).expect("bloom index fits its backing vector");
+            self.bits[byte] |= 1 << (index % 8);
+        }
+    }
+}
+
+fn bloom_indexes(value: &[u8], bit_count: u64, hash_count: u32) -> impl Iterator<Item = u64> {
+    let first = stable_bloom_hash(value, 0x517c_c1b7_2722_0a95);
+    let second = stable_bloom_hash(value, 0x6c8e_9cf5_7093_2bd5) | 1;
+    (0..hash_count)
+        .map(move |index| first.wrapping_add(u64::from(index).wrapping_mul(second)) % bit_count)
+}
+
+fn stable_bloom_hash(value: &[u8], seed: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
+    for byte in value {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn bloom_false_positive_rate_ppm(bit_count: u64, hash_count: u32, values: u64) -> u32 {
+    if values == 0 || bit_count == 0 {
+        return 0;
+    }
+    let exponent = -(f64::from(hash_count) * values as f64 / bit_count as f64);
+    let rate = (1.0 - exponent.exp()).powf(f64::from(hash_count));
+    (rate * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32
 }
 
 impl QueryStatsRecord {
@@ -528,6 +736,7 @@ impl QueryStatsRecord {
             distinct_values: 1,
             total_values: count,
             most_common_count: count,
+            bloom: None,
         }
     }
 
@@ -545,6 +754,7 @@ impl QueryStatsRecord {
             distinct_values,
             total_values: count,
             most_common_count,
+            bloom: None,
         }
     }
 
@@ -599,6 +809,26 @@ impl QueryStatsRefreshSpec {
             kind: QueryStatsRefreshKind::VertexPropertyHistogram {
                 property: property.into(),
             },
+        }
+    }
+
+    pub fn edge_expansion<I, S>(
+        cell_id: impl Into<String>,
+        edge_type: impl Into<String>,
+        direction: QueryStatsDirection,
+        source_labels: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            cell_id: cell_id.into(),
+            kind: QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeExpansion {
+                edge_type: edge_type.into(),
+                direction,
+                source_labels: source_labels.into_iter().map(Into::into).collect(),
+            }),
         }
     }
 
@@ -860,6 +1090,28 @@ pub struct QueryMutationResult {
     pub updated_vertices: u64,
     pub updated_relationships: u64,
     pub noops: u64,
+    pub topology_sequence: Option<crate::StorageSequence>,
+    /// Rows produced by a trailing `RETURN count(<binding>)`, when the
+    /// mutation had one. `None` is the historical shape: a mutation that
+    /// reports only counters and yields an empty result set.
+    pub returned_rows: Option<QueryResultSet>,
+}
+
+impl QueryMutationResult {
+    /// The rows a row-shaped caller sees for this mutation.
+    ///
+    /// A mutation with a trailing `RETURN count(...)` yields that one row; one
+    /// without keeps the historical empty result. Either way the topology
+    /// sequence rides along, so a caller can still wait on its own write.
+    pub fn into_result_set(self) -> QueryResultSet {
+        let rows = self
+            .returned_rows
+            .unwrap_or_else(|| QueryResultSet::new(Vec::new(), Vec::new()));
+        match self.topology_sequence {
+            Some(sequence) => rows.with_storage_sequence(sequence),
+            None => rows,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1017,6 +1269,9 @@ pub enum RowQueryAccess {
 pub enum RowQueryOptimizerPass {
     UtilizeVertexIndex,
     OrderedLimitPushdown,
+    /// A WHERE equality was folded into a node pattern so the pattern could be
+    /// anchored on the vertex property index instead of scanned by label.
+    EqualityPredicatePushdown,
     UtilizeEdgeIndex,
     CostBasedLabelScan,
     ConnectivityOrder,
@@ -1159,6 +1414,7 @@ impl QueryPlan {
         let expected_physical = physical_plan(&self.logical);
         if self.physical != expected_physical {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Other,
                 dialect: "GraphQuery",
                 feature: "physical query plan does not match logical query plan".to_string(),
             });
@@ -1168,6 +1424,7 @@ impl QueryPlan {
             validate_component("idempotency_key", &self.idempotency_key)?;
             if self.read_epoch.is_some() {
                 return Err(GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::InvalidRequest,
                     dialect: "GraphQuery",
                     feature: "snapshot epochs are only valid for read queries".to_string(),
                 });
@@ -1175,6 +1432,7 @@ impl QueryPlan {
         }
         if !self.result_window.is_default() && !self.returns_vertices() {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "GraphQuery",
                 feature: "result windows are only valid for vertex-returning read queries"
                     .to_string(),

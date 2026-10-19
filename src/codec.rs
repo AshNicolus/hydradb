@@ -151,33 +151,47 @@ pub(crate) async fn commit_txn_strict_with_sequence(
             key: "storage_sequence".to_string(),
             reason: "SlateDB storage sequence overflow".to_string(),
         })?;
-    let options = WriteOptions {
-        await_durable,
-        seqnum: sequence,
-    };
+    let options = WriteOptions { seqnum: sequence };
+    if await_durable {
+        if let Some(pipeline) = crate::shard::write_pipeline::current() {
+            return pipeline.commit_local(txn, sequence).await;
+        }
+    }
     let handle = txn.commit_with_options(&options).await?;
-    Ok(handle.map(|handle| handle.seqnum()))
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    if await_durable {
+        handle.await_durable().await?;
+    }
+    Ok(Some(handle.seqnum()))
 }
 
 pub(crate) fn remote_read_options() -> ReadOptions {
     ReadOptions {
-        durability_filter: DurabilityLevel::Remote,
+        durability_filter: crate::shard::write_pipeline::read_durability(),
         ..Default::default()
     }
 }
 
+const MAX_CACHED_REMOTE_ITEMS: u64 = 1_024;
+
+pub(crate) fn remote_read_options_for_expected_items(expected_items: u64) -> ReadOptions {
+    let mut options = remote_read_options();
+    options.cache_blocks = expected_items <= MAX_CACHED_REMOTE_ITEMS;
+    options
+}
+
 pub(crate) fn remote_scan_options() -> ScanOptions {
     ScanOptions::default()
-        .with_durability_filter(DurabilityLevel::Remote)
+        .with_durability_filter(crate::shard::write_pipeline::read_durability())
         .with_cache_blocks(false)
 }
 
-const MAX_CACHED_REMOTE_SCAN_ITEMS: u64 = 1_024;
-
 pub(crate) fn remote_scan_options_for_expected_items(expected_items: u64) -> ScanOptions {
     ScanOptions::default()
-        .with_durability_filter(DurabilityLevel::Remote)
-        .with_cache_blocks(expected_items <= MAX_CACHED_REMOTE_SCAN_ITEMS)
+        .with_durability_filter(crate::shard::write_pipeline::read_durability())
+        .with_cache_blocks(expected_items <= MAX_CACHED_REMOTE_ITEMS)
 }
 
 pub(crate) fn validate_component(component: &'static str, value: &str) -> Result<()> {
@@ -238,16 +252,31 @@ pub(crate) fn decode_u64(key: &str, value: &[u8]) -> Result<u64> {
 
 #[cfg(feature = "opencypher")]
 pub(crate) fn encode_query_stats_record(record: &QueryStatsRecord) -> Vec<u8> {
-    format!(
-        "query-stats-v1\ncount\t{}\nread_epoch\t{}\nrefreshed_at_ms\t{}\ndistinct_values\t{}\ntotal_values\t{}\nmost_common_count\t{}\n",
+    let version = if record.bloom.is_some() {
+        "query-stats-v2"
+    } else {
+        "query-stats-v1"
+    };
+    let mut encoded = format!(
+        "{version}\ncount\t{}\nread_epoch\t{}\nrefreshed_at_ms\t{}\ndistinct_values\t{}\ntotal_values\t{}\nmost_common_count\t{}\n",
         record.count,
         record.read_epoch,
         record.refreshed_at_ms,
         record.distinct_values,
         record.total_values,
         record.most_common_count,
-    )
-    .into_bytes()
+    );
+    if let Some(bloom) = &record.bloom {
+        encoded.push_str(&format!(
+            "bloom_bit_count\t{}\nbloom_hash_count\t{}\nbloom_inserted_count\t{}\nbloom_false_positive_rate_ppm\t{}\nbloom_bits\t{}\n",
+            bloom.bit_count,
+            bloom.hash_count,
+            bloom.inserted_count,
+            bloom.false_positive_rate_ppm,
+            hex_encode(&bloom.bits),
+        ));
+    }
+    encoded.into_bytes()
 }
 
 #[cfg(feature = "opencypher")]
@@ -261,8 +290,9 @@ pub(crate) fn decode_query_stats_record(key: &str, value: &[u8]) -> Result<Query
         reason: err.to_string(),
     })?;
     let mut lines = text.lines();
-    match lines.next() {
-        Some("query-stats-v1") => {}
+    let has_bloom = match lines.next() {
+        Some("query-stats-v1") => false,
+        Some("query-stats-v2") => true,
         Some(other) => {
             return Err(GraphError::CorruptValue {
                 key: key.to_string(),
@@ -275,7 +305,7 @@ pub(crate) fn decode_query_stats_record(key: &str, value: &[u8]) -> Result<Query
                 reason: "empty query stats record".to_string(),
             });
         }
-    }
+    };
 
     let mut count = None;
     let mut read_epoch = None;
@@ -283,6 +313,11 @@ pub(crate) fn decode_query_stats_record(key: &str, value: &[u8]) -> Result<Query
     let mut distinct_values = None;
     let mut total_values = None;
     let mut most_common_count = None;
+    let mut bloom_bit_count = None;
+    let mut bloom_hash_count = None;
+    let mut bloom_inserted_count = None;
+    let mut bloom_false_positive_rate_ppm = None;
+    let mut bloom_bits = None;
     for line in lines {
         let parts: Vec<_> = line.split('\t').collect();
         let [field, value] = parts.as_slice() else {
@@ -291,6 +326,10 @@ pub(crate) fn decode_query_stats_record(key: &str, value: &[u8]) -> Result<Query
                 reason: format!("invalid query stats line {line}"),
             });
         };
+        if *field == "bloom_bits" {
+            bloom_bits = Some(hex_decode(key, value)?);
+            continue;
+        }
         let parsed = value
             .parse::<u64>()
             .map_err(|err| GraphError::CorruptValue {
@@ -304,6 +343,10 @@ pub(crate) fn decode_query_stats_record(key: &str, value: &[u8]) -> Result<Query
             "distinct_values" => distinct_values = Some(parsed),
             "total_values" => total_values = Some(parsed),
             "most_common_count" => most_common_count = Some(parsed),
+            "bloom_bit_count" => bloom_bit_count = Some(parsed),
+            "bloom_hash_count" => bloom_hash_count = Some(parsed),
+            "bloom_inserted_count" => bloom_inserted_count = Some(parsed),
+            "bloom_false_positive_rate_ppm" => bloom_false_positive_rate_ppm = Some(parsed),
             other => {
                 return Err(GraphError::CorruptValue {
                     key: key.to_string(),
@@ -312,6 +355,53 @@ pub(crate) fn decode_query_stats_record(key: &str, value: &[u8]) -> Result<Query
             }
         }
     }
+    let bloom = if has_bloom {
+        let bit_count = required_query_stats_field(key, "bloom_bit_count", bloom_bit_count)?;
+        let hash_count = u32::try_from(required_query_stats_field(
+            key,
+            "bloom_hash_count",
+            bloom_hash_count,
+        )?)
+        .map_err(|error| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("invalid query stats bloom_hash_count: {error}"),
+        })?;
+        let inserted_count =
+            required_query_stats_field(key, "bloom_inserted_count", bloom_inserted_count)?;
+        let false_positive_rate_ppm = u32::try_from(required_query_stats_field(
+            key,
+            "bloom_false_positive_rate_ppm",
+            bloom_false_positive_rate_ppm,
+        )?)
+        .map_err(|error| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("invalid query stats bloom_false_positive_rate_ppm: {error}"),
+        })?;
+        let bits = bloom_bits.ok_or_else(|| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "missing query stats field bloom_bits".to_string(),
+        })?;
+        if bit_count == 0
+            || bit_count % 8 != 0
+            || bits.len() as u64 != bit_count / 8
+            || !(1..=32).contains(&hash_count)
+            || false_positive_rate_ppm > 1_000_000
+        {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "invalid query stats bloom dimensions".to_string(),
+            });
+        }
+        Some(QueryStatsBloom {
+            bit_count,
+            hash_count,
+            inserted_count,
+            false_positive_rate_ppm,
+            bits,
+        })
+    } else {
+        None
+    };
     Ok(QueryStatsRecord {
         count: required_query_stats_field(key, "count", count)?,
         read_epoch: required_query_stats_field(key, "read_epoch", read_epoch)?,
@@ -319,6 +409,7 @@ pub(crate) fn decode_query_stats_record(key: &str, value: &[u8]) -> Result<Query
         distinct_values: required_query_stats_field(key, "distinct_values", distinct_values)?,
         total_values: required_query_stats_field(key, "total_values", total_values)?,
         most_common_count: required_query_stats_field(key, "most_common_count", most_common_count)?,
+        bloom,
     })
 }
 
@@ -596,6 +687,17 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// The string a property-index key holds, from its hex-encoded form without
+/// the `s` type tag -- the inverse of the string arm of
+/// [`encode_vertex_property_value_key`].
+#[cfg(feature = "experimental-cypher-engine")]
+pub(crate) fn decode_string_index_value(key: &str, encoded: &str) -> Result<String> {
+    String::from_utf8(hex_decode(key, encoded)?).map_err(|error| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("string index value is not UTF-8: {error}"),
+    })
+}
+
 fn hex_decode(key: &str, text: &str) -> Result<Vec<u8>> {
     if (text.len() & 1) != 0 {
         return Err(GraphError::CorruptValue {
@@ -604,7 +706,7 @@ fn hex_decode(key: &str, text: &str) -> Result<Vec<u8>> {
         });
     }
     let mut bytes = Vec::with_capacity(text.len() / 2);
-    for pair in text.as_bytes().chunks_exact(2) {
+    for pair in text.as_bytes().as_chunks::<2>().0 {
         let high = hex_value(pair[0]).ok_or_else(|| GraphError::CorruptValue {
             key: key.to_string(),
             reason: format!("invalid hex digit {}", pair[0] as char),
@@ -750,13 +852,8 @@ pub(crate) fn decode_out_edge_segment(key: &str, value: &[u8]) -> Result<OutEdge
         });
     }
     let mut destinations = Vec::with_capacity(expected_count);
-    for chunk in edge_bytes.chunks_exact(8) {
-        destinations.push(u64::from_be_bytes(chunk.try_into().map_err(|_| {
-            GraphError::CorruptValue {
-                key: key.to_string(),
-                reason: "invalid graph-out-segment destination bytes".to_string(),
-            }
-        })?));
+    for chunk in edge_bytes.as_chunks::<8>().0 {
+        destinations.push(u64::from_be_bytes(*chunk));
     }
     Ok(OutEdgeSegment {
         cell_id,
@@ -1553,5 +1650,13 @@ mod scan_option_tests {
     fn bounded_remote_scans_admit_only_small_working_sets() {
         assert!(remote_scan_options_for_expected_items(1_024).cache_blocks);
         assert!(!remote_scan_options_for_expected_items(1_025).cache_blocks);
+    }
+
+    #[test]
+    fn bounded_remote_point_reads_admit_only_small_working_sets() {
+        let bounded = remote_read_options_for_expected_items(1_024);
+        assert_eq!(bounded.durability_filter, DurabilityLevel::Remote);
+        assert!(bounded.cache_blocks);
+        assert!(!remote_read_options_for_expected_items(1_025).cache_blocks);
     }
 }

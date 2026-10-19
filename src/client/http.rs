@@ -22,6 +22,7 @@ use super::service::{
     ClientBookmark, ClientQueryCredentials, ClientQueryPage, ClientQueryRequest,
     ClientQueryService, ClientQuerySession, ClientQueryTarget, ClientReadConsistency,
 };
+use crate::QueryFailureReason;
 use crate::{
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryCursorToken, QueryFloat,
     QueryParameterValue, QueryPath, QueryTransportConnectionIdentity,
@@ -120,6 +121,7 @@ impl HttpQueryServerConfig {
 
 fn http_config_error(reason: &str) -> Result<()> {
     Err(GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::InvalidRequest,
         dialect: "HttpQueryApi",
         feature: reason.to_string(),
     })
@@ -223,7 +225,7 @@ impl ClientHttpServer {
                                 generation = next_generation;
                             }
                             Err(err) => tracing::warn!(
-                                target: "slatedb_graph_kernel",
+                                target: "hydradb",
                                 error = %err,
                                 "HTTPS TLS configuration reload failed"
                             ),
@@ -418,7 +420,8 @@ impl HttpApiError {
             | GraphError::MissingQueryParameter { .. }
             | GraphError::QueryParse { .. }
             | GraphError::SnapshotAhead { .. }
-            | GraphError::UnsupportedQuery { .. } => Self {
+            | GraphError::UnsupportedQuery { .. }
+            | GraphError::UnclassifiedQuery { .. } => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_request",
                 message: error.to_string(),
@@ -426,7 +429,7 @@ impl HttpApiError {
                 authenticate: false,
             },
             _ => {
-                tracing::warn!(target: "slatedb_graph_kernel", error = %error, "HTTP suppressed internal graph error");
+                tracing::warn!(target: "hydradb", error = %error, "HTTP suppressed internal graph error");
                 Self {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     code: "internal",
@@ -507,11 +510,18 @@ async fn execute_query_inner(
         request = request.with_consistency(consistency);
     }
     if body.read_epoch.is_some() {
-        return Err(HttpApiError::from_graph(GraphError::UnsupportedQuery {
+        let error = GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::InvalidRequest,
             dialect: "HTTP",
             feature: "read_epoch is not a storage snapshot selector; use bookmark for causal reads"
                 .to_string(),
-        }));
+        };
+        state.service.record_request_failure(
+            crate::QueryFailureStage::Prepare,
+            &error,
+            state.service.cypher_engine(),
+        );
+        return Err(HttpApiError::from_graph(error));
     }
     if let Some(timeout_ms) = body.timeout_ms {
         request = request.with_timeout_ms(timeout_ms);
@@ -545,10 +555,15 @@ async fn execute_query_inner(
         )
         .map_err(HttpApiError::from_graph);
     }
+    let serialize_started = Instant::now();
+    let rows = first_page.page.rows.len();
     let response = http_query_response(first_page).map_err(HttpApiError::from_graph)?;
-    Ok(with_no_store(
-        (StatusCode::OK, Json(response)).into_response(),
-    ))
+    // `Json::into_response` serializes eagerly, so this is the whole encode.
+    let response = with_no_store((StatusCode::OK, Json(response)).into_response());
+    state
+        .service
+        .record_serialization(serialize_started.elapsed(), rows);
+    Ok(response)
 }
 
 async fn cancel_query(
@@ -765,6 +780,7 @@ fn http_query_value(value: &QueryValue) -> Result<HttpQueryValue> {
 
 fn non_finite_json_error() -> GraphError {
     GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Evaluation,
         dialect: "HttpQueryApi",
         feature: "non-finite floats cannot be represented in JSON".to_string(),
     }

@@ -82,17 +82,30 @@
 {{- if and .Values.podDisruptionBudget.enabled .Values.indexer.enabled (gt (int .Values.podDisruptionBudget.indexer.minAvailable) (int .Values.indexer.replicaCount)) -}}
 {{- fail "podDisruptionBudget.indexer.minAvailable cannot exceed indexer.replicaCount" -}}
 {{- end -}}
+{{- if and (eq .Values.node.updateStrategy "RollingUpdate") (gt (int .Values.node.rollingUpdatePartition) (int .Values.node.replicaCount)) -}}
+{{- fail "node.rollingUpdatePartition cannot exceed node.replicaCount" -}}
+{{- end -}}
 {{- if lt (int .Values.indexer.maxOpenScopes) (int .Values.indexer.scopeConcurrency) -}}
 {{- fail "indexer.maxOpenScopes must be greater than or equal to indexer.scopeConcurrency" -}}
 {{- end -}}
 {{- if lt (int .Values.indexer.scopesPerCycle) (int .Values.indexer.scopeConcurrency) -}}
 {{- fail "indexer.scopesPerCycle must be greater than or equal to indexer.scopeConcurrency" -}}
 {{- end -}}
+{{- $minimumCacheOpenFiles := mul (int .Values.runtime.maxOpenScopes) (mul (len .Values.graph.cells) 2) -}}
+{{- if lt (int .Values.runtime.dataCacheMaxOpenFiles) (int $minimumCacheOpenFiles) -}}
+{{- fail (printf "runtime.dataCacheMaxOpenFiles must be at least runtime.maxOpenScopes × graph.cells count × 2 (%d)" (int $minimumCacheOpenFiles)) -}}
+{{- end -}}
 {{- if lt (int .Values.runtime.writerLeaseMs) 3000 -}}
 {{- fail "runtime.writerLeaseMs must be at least 3000" -}}
 {{- end -}}
 {{- if gt (int .Values.runtime.writerLeaseMs) 300000 -}}
 {{- fail "runtime.writerLeaseMs must be at most 300000" -}}
+{{- end -}}
+{{- if lt (int .Values.runtime.walFlushIntervalMs) 1 -}}
+{{- fail "runtime.walFlushIntervalMs must be at least 1" -}}
+{{- end -}}
+{{- if gt (int .Values.runtime.walFlushIntervalMs) 1000 -}}
+{{- fail "runtime.walFlushIntervalMs must be at most 1000" -}}
 {{- end -}}
 {{- if lt (int .Values.runtime.maxWalFlushesBeforeL0Flush) 1 -}}
 {{- fail "runtime.maxWalFlushesBeforeL0Flush must be at least 1" -}}
