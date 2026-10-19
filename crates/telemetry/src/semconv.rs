@@ -76,6 +76,13 @@ pub const BASE_SEQUENCE: &str = "hydradb.base_sequence";
 /// Edge type. Bounded by schema, safe as a dimension.
 pub const EDGE_TYPE: &str = "hydradb.edge_type";
 
+/// Which Cypher engine served this node's client queries: `legacy` or
+/// `experimental`, from `GRAPH_CYPHER_ENGINE`. Fixed for the life of the
+/// process, so it is the one dimension that lets a legacy node and an
+/// experimental node be told apart on the same latency panel without a join
+/// on the instance name.
+pub const CYPHER_ENGINE: &str = "hydradb.cypher_engine";
+
 /// Query shape hash with parameters elided. Never the query text.
 pub const QUERY_FINGERPRINT: &str = "hydradb.query.fingerprint";
 
@@ -145,6 +152,22 @@ pub const PLACEMENT_PREVIOUS_STATE: &str = "hydradb.placement.previous_state";
 
 /// Number of live nodes carried by the current placement view.
 pub const PLACEMENT_LIVE_NODES: &str = "hydradb.placement.live_nodes";
+
+/// Which nodes a Bolt routing table's `READ` role names: `owner` or `fleet`.
+///
+/// Set by `GRAPH_READ_ROUTING` and constant for the life of a process. It is on
+/// `bolt.route` because a routing table captured in a trace is otherwise
+/// ambiguous — the same three-node fleet produces a one-address `READ` list
+/// under `owner` and a three-address one under `fleet`, and nothing on the span
+/// said which mode had produced the one in front of you. See
+/// `docs/plans/2026-08-21-cell-affine-read-routing.md`.
+///
+/// Span-only despite a closed two-value domain: it is a *deployment* fact, so
+/// as a metric dimension it would be a column with one value per process for
+/// the whole life of that process — the same reasoning that keeps
+/// [`NODE_ID`] off metrics. On a trace it is the thing that makes the table
+/// readable.
+pub const READ_ROUTING: &str = "hydradb.read_routing";
 
 /// Delay applied before the next writer re-open attempt.
 pub const WRITER_REOPEN_DELAY_MS: &str = "hydradb.writer.reopen_delay_ms";
@@ -285,6 +308,9 @@ pub const DB_OPERATION_WRITE: &str = "write";
 /// Bounded by the ladder length — 18 values, closed at compile time.
 pub const LE: &str = "le";
 
+/// Fixed application memory diagnostic stage, bounded by the instrumented stages.
+pub const MEMORY_STAGE: &str = "hydradb.memory.stage";
+
 /// An attribute key that is allowed to be a **metric dimension**.
 ///
 /// The constructor is private to this module, so a `MetricLabel` can only name
@@ -322,8 +348,11 @@ pub const L_CELL_ID: MetricLabel = MetricLabel(CELL_ID);
 ///
 /// Note that the *product* `cell_id × edge_type` is what a per-shard series
 /// costs: 8 cells and 12 edge types is 96 series per instrument per node.
-/// Affordable for a counter, not for an 18-bucket histogram family.
+/// Affordable for a counter, not for a 21-bucket histogram family.
 pub const L_EDGE_TYPE: MetricLabel = MetricLabel(EDGE_TYPE);
+
+/// [`CYPHER_ENGINE`] as a metric dimension. Two values, one per process.
+pub const L_CYPHER_ENGINE: MetricLabel = MetricLabel(CYPHER_ENGINE);
 
 /// [`KERNEL`] as a metric dimension. Three values — the sparse-kernel ladder.
 pub const L_KERNEL: MetricLabel = MetricLabel(KERNEL);
@@ -380,6 +409,9 @@ pub const L_DB_SYSTEM_NAME: MetricLabel = MetricLabel(DB_SYSTEM_NAME);
 /// `db.client.operation.duration`.
 pub const L_DB_OPERATION_NAME: MetricLabel = MetricLabel(DB_OPERATION_NAME);
 
+/// Fixed memory diagnostic stage vocabulary; never a query, tenant or scope ID.
+pub const L_MEMORY_STAGE: MetricLabel = MetricLabel(MEMORY_STAGE);
+
 /// [`LE`] as a metric dimension — bucket bounds on an exported histogram
 /// family. Never a span attribute.
 pub const L_LE: MetricLabel = MetricLabel(LE);
@@ -389,6 +421,7 @@ pub const L_LE: MetricLabel = MetricLabel(LE);
 pub const METRIC_LABELS: &[MetricLabel] = &[
     L_CELL_ID,
     L_EDGE_TYPE,
+    L_CYPHER_ENGINE,
     L_KERNEL,
     L_OUTCOME,
     L_ERROR_CLASS,
@@ -399,6 +432,7 @@ pub const METRIC_LABELS: &[MetricLabel] = &[
     L_DB_SYSTEM_NAME,
     L_DB_OPERATION_NAME,
     L_LE,
+    L_MEMORY_STAGE,
 ];
 
 /// Every key that must stay on spans and logs and must never become a metric
@@ -423,6 +457,7 @@ pub const SPAN_ONLY_KEYS: &[&str] = &[
     WRITER_LAST_PROMOTED_AT,
     CONSISTENCY,
     PLACEMENT_LIVE_NODES,
+    READ_ROUTING,
     WRITER_REOPEN_DELAY_MS,
     WRITER_REOPEN_CAP_MS,
     CORRELATION_ID,
@@ -434,6 +469,7 @@ pub const SPAN_ONLY_KEYS: &[&str] = &[
 /// Every `hydradb.*` key defined above, for tests and for the redaction
 /// layer's allowlist cross-check.
 pub const ALL_HYDRADB_KEYS: &[&str] = &[
+    MEMORY_STAGE,
     SCOPE,
     CELL_ID,
     NODE_ID,
@@ -442,6 +478,7 @@ pub const ALL_HYDRADB_KEYS: &[&str] = &[
     GENERATION,
     BASE_SEQUENCE,
     EDGE_TYPE,
+    CYPHER_ENGINE,
     QUERY_FINGERPRINT,
     QUERY_ACCESS_PATH,
     QUERY_OPTIMIZER_PASSES,
@@ -459,6 +496,7 @@ pub const ALL_HYDRADB_KEYS: &[&str] = &[
     PLACEMENT_STATE,
     PLACEMENT_PREVIOUS_STATE,
     PLACEMENT_LIVE_NODES,
+    READ_ROUTING,
     WRITER_REOPEN_DELAY_MS,
     WRITER_REOPEN_CAP_MS,
     CORRELATION_ID,
@@ -479,6 +517,7 @@ pub const ALL_HYDRADB_KEYS: &[&str] = &[
 /// `ALL_HYDRADB_KEYS` would classify vacuously, passing while checking
 /// nothing.
 pub const ALL_REGISTRY_KEYS: &[&str] = &[
+    MEMORY_STAGE,
     SCOPE,
     CELL_ID,
     NODE_ID,
@@ -487,6 +526,7 @@ pub const ALL_REGISTRY_KEYS: &[&str] = &[
     GENERATION,
     BASE_SEQUENCE,
     EDGE_TYPE,
+    CYPHER_ENGINE,
     QUERY_FINGERPRINT,
     QUERY_ACCESS_PATH,
     QUERY_OPTIMIZER_PASSES,
@@ -504,6 +544,7 @@ pub const ALL_REGISTRY_KEYS: &[&str] = &[
     PLACEMENT_STATE,
     PLACEMENT_PREVIOUS_STATE,
     PLACEMENT_LIVE_NODES,
+    READ_ROUTING,
     WRITER_REOPEN_DELAY_MS,
     WRITER_REOPEN_CAP_MS,
     CORRELATION_ID,

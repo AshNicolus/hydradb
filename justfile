@@ -44,8 +44,7 @@ fmt-check:
 # These are `clippy`, not `check`, and `--all-targets` covers examples and tests,
 # so each strictly subsumes the same-feature `check`/`check-examples*` recipe
 # below — which is why `ci` runs these in their place rather than in addition to
-# them. The check recipes stay defined because plans under `docs/` call them by
-# name and because they are the faster inner loop.
+# them. The check recipes stay defined because they are the faster inner loop.
 # Lint the default feature set, as `ci.yml` does.
 clippy:
     cargo clippy --locked --all-targets -- -D warnings
@@ -217,6 +216,37 @@ test-telemetry:
     cargo clippy --locked --all-targets -p hydradb-telemetry --features otlp -- -D warnings
     cargo test --locked -p hydradb-telemetry --features otlp
 
+# Generate the Neo4j grammar, lint the frontend facade, and execute its parser
+# tests. This member is deliberately separate from the root package, so no bare
+# root `cargo test` reaches it.
+test-cypher-ast:
+    cargo clippy --locked --all-targets -p hydradb-cypher-ast -- -D warnings
+    cargo test --locked -p hydradb-cypher-ast
+
+test-cypher: test-cypher-ast
+    cargo clippy --locked --all-targets -p hydradb-cypher-parser-antlr -- -D warnings
+    cargo test --locked -p hydradb-cypher-parser-antlr
+
+# Lower the shared Cypher AST into semantic graph IR and select a KV plan.
+test-graph-plan:
+    cargo clippy --locked --all-targets -p hydradb-graph-plan -- -D warnings
+    cargo test --locked -p hydradb-graph-plan
+
+# Prepare and execute selected graph plans in the isolated Cypher engine.
+test-cypher-engine:
+    cargo clippy --locked --all-targets -p hydradb-cypher-engine -- -D warnings
+    cargo test --locked -p hydradb-cypher-engine
+
+# Opt-in parser/planner/GraphShard route, including Bolt/HTTP preparation and
+# graph-node runtime switch tests. The default runtime remains legacy.
+test-experimental-cypher:
+    cargo clippy --locked --all-targets --features server-runtime,experimental-cypher-engine -- -D warnings
+    cargo test --locked --all-targets --features server-runtime,experimental-cypher-engine
+
+# Build the two-phase ordered-boundary-tie memory probe used by experiment 006.
+build-ordered-tie-memory-probe:
+    cargo build --locked --release --features experimental-cypher-engine --example ordered_tie_memory_probe
+
 # Verify native libraries required by Rust FFI crates.
 native-check:
     #!/usr/bin/env bash
@@ -243,7 +273,7 @@ native-check:
 # would pay for the same compile twice, once through rustc and once through
 # clippy-driver, for no extra coverage.
 # Run the local CI-equivalent check set.
-ci: native-check fmt-check clippy clippy-chaos clippy-opencypher clippy-native clippy-client-protocols clippy-runtime test-placement test-telemetry check-all-features check-client-api check-bolt-server test test-opencypher test-native test-client-protocols test-chaos test-server-runtime test-indexer test-node-otlp
+ci: native-check fmt-check clippy clippy-chaos clippy-opencypher clippy-native clippy-client-protocols clippy-runtime test-placement test-telemetry test-cypher test-graph-plan test-cypher-engine check-all-features check-client-api check-bolt-server test test-opencypher test-native test-client-protocols test-chaos test-server-runtime test-indexer test-node-otlp
 
 # Run the local object-store smoke test.
 smoke:
@@ -279,21 +309,24 @@ fence:
 minio-smoke:
     bash scripts/minio_smoke.sh
 
-# Run Query engine Cypher query benchmarks.
-query-bench:
-    bash scripts/query_bench.sh
-
-# Run low-memory query/build/concurrency profiling.
-query-memory-profile:
-    bash scripts/query_memory_profile.sh
-
 # Run Query engine exact query correctness benchmark.
 query-correctness:
     bash scripts/query_correctness.sh
 
-# Run Query engine Cypher query benchmarks against MinIO. Requires Docker.
-minio-query-bench:
-    bash scripts/minio_query_bench.sh
+# Build one node containing both routes, seed through legacy Bolt, then compare
+# the two routes through real Bolt and HTTP against the same immutable store.
+# Requires a Python interpreter with the neo4j package (set PYTHON if needed).
+cypher-engine-ab:
+    bash scripts/cypher_engine_ab.sh
+
+# Bounded protocol benchmark: 10 iterations per corpus query/transport/route.
+# Results are timestamped below ignored bench-results/cypher_engine_ab/.
+cypher-engine-ab-bench:
+    GRAPH_CYPHER_ENGINE_AB_MODE=benchmark GRAPH_CYPHER_ENGINE_AB_ITERATIONS=10 bash scripts/cypher_engine_ab.sh
+
+# Fast offline coverage for the normalization and fixed supported corpus.
+test-cypher-engine-ab:
+    python3 scripts/cypher_engine_ab_client.py self-test
 
 # Run Query engine exact query correctness benchmark against MinIO. Requires Docker.
 minio-query-correctness:

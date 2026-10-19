@@ -1,9 +1,9 @@
-use slatedb::object_store::ObjectStore;
-use slatedb::{CloseReason, ErrorKind};
-use slatedb_graph_kernel::{
+use hydradb::{
     local_object_store, object_store_from_env, EdgeMutation, GraphError, GraphIndexPolicy,
     GraphOpenOptions, GraphShard, Result,
 };
+use slatedb::object_store::ObjectStore;
+use slatedb::{CloseReason, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

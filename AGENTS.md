@@ -46,9 +46,6 @@ crates/telemetry/  tracing and OTLP export
 examples/          smoke, stress, correctness, benchmark, profiling binaries
 scripts/           local, MinIO, query, stress, and chaos harnesses
 charts/hydradb/   production Helm chart
-docs/plans/        design plans, dated; see conventions below
-docs/runbooks/     operational procedures
-interactive/       standalone HTML design documents
 architecture.md    system design and component flows
 ```
 
@@ -371,43 +368,6 @@ deeper.
 | `curl: (7) Failed to connect ... 19091` | `graph-node` runs in the **foreground** and never returns. That is it working. Start it in its own shell. |
 | `cannot close database reader while snapshots are active` | A `GraphSnapshot` is still alive when `close()` runs. Drop it first. Fixed on current `main`; appears on older commits. |
 | `No available formula with the name "libcypher-parser"` | Not in homebrew-core. `brew install cleishm/neo4j/libcypher-parser`. |
-
-## Repository conventions
-
-**Never use the Artifact tool in this repository.** Visual and long-form
-deliverables are standalone HTML files written into `interactive/` with ordinary
-file writes. Requirements: complete document with `<!doctype html>`, `<meta
-charset="utf-8">` and a viewport tag; must work by double-clicking a `file://`
-URL; fully self-contained with no CDN scripts, external stylesheets, remote
-fonts or images; light and dark following `interactive/assets/textbook.css`.
-`interactive/README.md` documents the house style.
-
-**Plan documents** live in `docs/plans/` and are named
-`YYYY-MM-DD-kebab-case-title.md`, dated the day the plan was written, so the
-directory sorts chronologically and staleness is obvious. Every plan opens with
-YAML frontmatter:
-
-```yaml
----
-title: Sparse kernel backend consolidation
-status: draft-for-review        # draft-for-review | step-N-complete | done | superseded
-date: 2026-07-25
-branch: HydraDB-V3.5
-base_commit: 989cc72            # tree the plan was written against
-head_commit: 73309df            # add once the work lands; omit while unstarted
-tags:
-  - sparse-kernel
-  - refactor
----
-```
-
-A plan resting on prior analysis opens with a **Sources** section naming the
-files that hold it — design notes under `interactive/`, memory entries, and
-exact paths in any reference repo (`../sleet`, `../tidb-master`). Name the file
-and what it holds, not just the repo, so the next session reads instead of
-re-deriving. `docs/plans/2026-07-25-sparse-kernel-backend-consolidation.md` is
-the reference example. `optimisation-phases.md` predates the convention; leave
-it unless asked, since `build.rs:10` references it by name.
 
 ## Things that will mislead you
 

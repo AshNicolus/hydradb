@@ -25,13 +25,14 @@ mod engine;
 // renaming. Private, so this costs nothing outside the crate: every item below
 // is re-exported under its own unchanged name.
 mod locality;
+mod prefix_filter;
 mod query;
 mod sparse_kernel;
 
 #[cfg(feature = "bolt-server")]
 pub use client::bolt::{
-    BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider, BoltServerConfig,
-    BoltServerHandle, ClientBoltServer, ObjectStoreBoltRoutingTableProvider,
+    BoltReadRouting, BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider,
+    BoltServerConfig, BoltServerHandle, ClientBoltServer, ObjectStoreBoltRoutingTableProvider,
 };
 #[cfg(feature = "http-api")]
 pub use client::http::{ClientHttpServer, HttpQueryServerConfig, HttpQueryServerHandle};
@@ -40,7 +41,7 @@ pub use client::service::{
     ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryMetricsSnapshot,
     ClientQueryPage, ClientQueryRequest, ClientQueryResult, ClientQueryService,
     ClientQueryServiceConfig, ClientQuerySession, ClientQueryTarget, ClientReadConsistency,
-    HierarchicalClientDatabaseResolver, StaticClientDatabaseResolver,
+    CypherEngineSelection, HierarchicalClientDatabaseResolver, StaticClientDatabaseResolver,
 };
 pub(crate) use core::cache::BoundedGraphCache;
 #[cfg(feature = "opencypher")]
@@ -52,10 +53,13 @@ pub(crate) use core::cache::{
 pub(crate) use core::config::{open_graph_db, open_graph_reader};
 pub use core::config::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
-    GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphStorageMemoryConfig,
+    GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphReaderMode, GraphStorageMemoryConfig,
     DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
-pub use core::error::{GraphError, Result};
+pub use core::db_cache::SlateDbCacheMetricsSnapshot;
+pub(crate) use core::db_cache::{process_slate_db_cache, SharedSlateDbCache};
+pub use core::error::{GraphError, QueryFailureReason, Result};
+pub use core::metrics::{QueryFailureCountsSnapshot, QueryFailureStage};
 // Widen this as H1 converts the remaining client duration counters. It is no
 // longer feature-gated: `GraphOperationalMetrics::query_rows_latency` is a
 // default-features field, so the type is constructed on every build.
@@ -63,11 +67,17 @@ pub(crate) use core::histogram::AtomicDurationHistogram;
 pub use core::histogram::{
     DurationHistogramSnapshot, DURATION_BUCKET_BOUNDS_US, DURATION_BUCKET_COUNT,
 };
+pub use core::memory_diagnostics::{memory_diagnostic_snapshot, MemoryDiagnosticSnapshot};
 pub use core::metrics::{
-    GraphCacheKind, GraphCacheMetricsSnapshot, GraphCachePolicy, GraphOperationalMetricsSnapshot,
+    ExperimentalOperatorMetricsSnapshot, GraphCacheKind, GraphCacheMetricsSnapshot,
+    GraphCachePolicy, GraphOperationalMetricsSnapshot,
 };
-pub(crate) use core::metrics::{GraphCacheMetrics, GraphOperationalMetrics};
+pub(crate) use core::metrics::{
+    GraphCacheMetrics, GraphOperationalMetrics, RelationshipImportProfile,
+};
 pub(crate) use core::model::OutEdgeSegment;
+#[cfg(feature = "opencypher")]
+pub(crate) use core::model::RelationshipDeleteBatchResult;
 pub use core::model::{
     BulkImportDuplicatePolicy, BulkImportOptions, BulkImportResult, CommitResult, DeleteResult,
     EdgeDeleteBatchResult, EdgeExistenceBatchEntry, EdgeIngestOptions, EdgeIngestResult,
@@ -89,7 +99,8 @@ pub(crate) use core::state::{
     GraphStore, GraphWriteAuthority, GraphWriteOp, LocalWriteGuard,
 };
 pub use core::state::{
-    GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard, ProcessWriterRegistry,
+    BookmarkWait, GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard,
+    GraphStorageMetricsSnapshot, ProcessWriterRegistry,
 };
 pub use core::trace_context::{install_trace_context_bridge, TraceContextBridge};
 pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
@@ -97,25 +108,33 @@ pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 pub use engine::ScopedRoutedGraphCluster;
 pub use engine::{
     local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, CellOwnership,
-    GraphCluster, GraphIndexBuildPath, GraphIndexGeneration, GraphShardRuntimeMetrics,
-    MatrixArtifact, MatrixTraversalResult, ObjectStoreGraphScopeDirectory,
-    ObjectStoreNodeDirectory, ObjectStoreWriterLeaseDirectory, PlacementConfig,
-    PlacementRefreshHandle, PlacementView, RoutedGraphCluster, ScopedGraphShardRuntimeMetrics,
-    TraversalBackend, WriterLeaseOwner, WriterLeaseRenewalFailure,
+    GraphCluster, GraphIndexBuildPath, GraphIndexGeneration, GraphScopeChange,
+    GraphShardRuntimeMetrics, MatrixArtifact, MatrixTraversalResult,
+    ObjectStoreGraphScopeDirectory, ObjectStoreNodeDirectory, ObjectStoreWriterLeaseDirectory,
+    PlacementConfig, PlacementRefreshHandle, PlacementView, RoutedGraphCluster,
+    ScopedGraphShardRuntimeMetrics, TraversalBackend, WriterLeaseOwner, WriterLeaseRenewalFailure,
+};
+pub use hydradb_graph_plan::{
+    explain_physical_plan, lower_cypher_ast, plan_physical, BoundValue, GraphLogicalPlan,
+    GraphPhysicalPlan, GraphPlanError, GraphPlanResult, LogicalBinaryOperator, LogicalExpression,
+    LogicalProjection, PhysicalBinaryOperator, PhysicalExpression, PhysicalPlanningContext,
+    PhysicalProjection, ScalarValue, Symbol, ValueOrigin,
 };
 pub use locality::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
     LocalityCellExtractor, LocalityLayoutExperiment, StorageLayout,
 };
 pub use query::algebra::{
-    LogicalQueryPlan, PhysicalQueryPlan, QueryBatchEdge, QueryBatchMergePolicy,
-    QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex,
-    QueryCancellationToken, QueryCardinalityStatsKind, QueryCardinalityStatsRefresh, QueryColumn,
-    QueryContext, QueryCursorToken, QueryMutationResult, QueryOutput, QueryParameterValue,
-    QueryPath, QueryPathNode, QueryPathRelationship, QueryPlan, QueryPlanner, QueryResultPage,
-    QueryResultSet, QueryRow, QueryStatement, QueryStatsHistogramRefresh, QueryStatsRecord,
-    QueryStatsRefreshKind, QueryStatsRefreshResult, QueryStatsRefreshSpec, QueryValue, QueryWindow,
-    RowQueryAccess, RowQueryOptimizerPass, RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
+    CypherEngineMode, LogicalQueryPlan, PhysicalQueryPlan, QueryBatchEdge,
+    QueryBatchIsolatedVertex, QueryBatchMergePolicy, QueryBatchOperation, QueryBatchRelationship,
+    QueryBatchRelationshipMerge, QueryBatchVertex, QueryCancellationToken,
+    QueryCardinalityStatsKind, QueryCardinalityStatsRefresh, QueryColumn, QueryContext,
+    QueryCursorToken, QueryMutationResult, QueryOutput, QueryParameterValue, QueryPath,
+    QueryPathNode, QueryPathRelationship, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet,
+    QueryRow, QueryStatement, QueryStatsBloom, QueryStatsDirection, QueryStatsHistogramRefresh,
+    QueryStatsRecord, QueryStatsRefreshKind, QueryStatsRefreshResult, QueryStatsRefreshSpec,
+    QueryValue, QueryWindow, RowQueryAccess, RowQueryOptimizerPass, RowQueryPlan,
+    RowQueryPlanGroup, RowQueryPlanPattern,
 };
 #[cfg(feature = "query-service-discovery")]
 pub use query::coordination::{
@@ -149,8 +168,10 @@ pub use query::corpus::{
 };
 #[cfg(feature = "opencypher")]
 pub use query::opencypher::{
+    parse_opencypher_mutation_query_with_list_parameters,
     parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query,
-    parse_opencypher_row_query_with_parameters, ParsedMutationQuery, ParsedRowQuery,
+    parse_opencypher_row_query_with_list_parameters, parse_opencypher_row_query_with_parameters,
+    EdgeDirection, ListParameters, MutationReturn, ParsedMutationQuery, ParsedRowQuery,
     RowAggregateFunction, RowComparisonOp, RowEdgePattern, RowExpression, RowMatchGroup,
     RowMutationAction, RowNodePattern, RowPattern, RowPredicate, RowProjection, RowSort,
     RowSortExpression,

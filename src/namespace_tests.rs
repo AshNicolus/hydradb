@@ -68,9 +68,23 @@ fn namespace_paths_are_validated_hierarchical_and_collision_free() {
 fn query_context_scope_round_trips_and_unscoped_frames_are_rejected() {
     let scoped = QueryContext::new("cell-a", "query-a").in_scope(scope("acme", "search", "social"));
     let encoded = serde_json::to_value(&scoped).unwrap();
+    assert!(encoded.get("cypher_engine").is_none());
     assert_eq!(
-        serde_json::from_value::<QueryContext>(encoded).unwrap(),
+        serde_json::from_value::<QueryContext>(encoded.clone()).unwrap(),
         scoped
+    );
+
+    let experimental = scoped
+        .clone()
+        .with_cypher_engine(CypherEngineMode::Experimental);
+    let experimental_encoded = serde_json::to_value(&experimental).unwrap();
+    assert_eq!(
+        experimental_encoded.get("cypher_engine"),
+        Some(&serde_json::Value::String("experimental".to_string()))
+    );
+    assert_eq!(
+        serde_json::from_value::<QueryContext>(experimental_encoded).unwrap(),
+        experimental
     );
 
     let unscoped = serde_json::json!({
@@ -366,7 +380,11 @@ async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(denied, GraphError::UnsupportedQuery { .. }));
+    // A remote authorization denial is not a query failure, so it arrives
+    // without a reason: same wording, class and client mapping as before, and
+    // left out of the query-failure counter.
+    assert!(matches!(denied, GraphError::UnclassifiedQuery { .. }));
+    assert_eq!(denied.failure_reason(), None);
     assert!(denied.to_string().contains("not authorized"));
 
     for (index, mutation_query) in [
@@ -548,6 +566,7 @@ async fn parent_namespace_quota_limits_queries_across_subtenants() {
 #[cfg(feature = "query-transport")]
 struct ScopeCancellationQueryClient {
     started: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Semaphore,
 }
 
 #[cfg(feature = "query-transport")]
@@ -555,12 +574,16 @@ struct ScopeCancellationQueryClient {
 impl QueryCellClient for ScopeCancellationQueryClient {
     async fn execute_cypher_rows(
         &self,
-        _context: QueryContext,
+        context: QueryContext,
         _query: &str,
     ) -> Result<QueryResultSet> {
         self.started
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let cancellation = context.cancellation_token.unwrap();
+        tokio::select! {
+            _ = cancellation.cancelled() => {},
+            permit = self.release.acquire() => permit.unwrap().forget(),
+        }
         Ok(QueryResultSet::new(Vec::new(), Vec::new()))
     }
 
@@ -584,6 +607,7 @@ async fn query_cancellation_is_isolated_by_graph_scope() {
     let billing = scope("acme", "billing", "ledger");
     let query_client = Arc::new(ScopeCancellationQueryClient {
         started: std::sync::atomic::AtomicUsize::new(0),
+        release: tokio::sync::Semaphore::new(0),
     });
     let authorizer = StaticQueryTransportScopeAuthorizer::new()
         .with_bearer_grant(
@@ -653,6 +677,7 @@ async fn query_cancellation_is_isolated_by_graph_scope() {
     assert!(search_error
         .to_string()
         .contains("query_transport_cancelled"));
+    query_client.release.add_permits(1);
     billing_task.await.unwrap().unwrap();
     assert_eq!(server.metrics().cancellations, 1);
     server.stop().await.unwrap();
@@ -665,6 +690,7 @@ async fn query_cancellation_requires_access_to_the_requested_graph_scope() {
     let billing = scope("acme", "billing", "ledger");
     let query_client = Arc::new(ScopeCancellationQueryClient {
         started: std::sync::atomic::AtomicUsize::new(0),
+        release: tokio::sync::Semaphore::new(0),
     });
     let authorizer = StaticQueryTransportScopeAuthorizer::new()
         .with_bearer_grant(

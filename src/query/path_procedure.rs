@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::QueryFailureReason;
 use crate::{GraphError, QueryColumn, QueryFloat, Result, VertexId, VertexPropertyValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +130,7 @@ pub(crate) fn parse_native_path_procedure(
     };
     let rel_types =
         config_string_list(&config, "relTypes")?.ok_or_else(|| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Procedure,
             dialect: "OpenCypher",
             feature: "native path procedures require a non-empty relTypes list".to_string(),
         })?;
@@ -439,6 +441,7 @@ fn optional_vertex(
     u64::try_from(value)
         .map(Some)
         .map_err(|_| GraphError::UnsupportedQuery {
+            reason: QueryFailureReason::Procedure,
             dialect: "OpenCypher",
             feature: format!("{key} must be a non-negative integer node id"),
         })
@@ -507,6 +510,7 @@ fn config_u64(
 
 fn non_negative_u64(value: i64, key: &str) -> Result<u64> {
     u64::try_from(value).map_err(|_| GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Procedure,
         dialect: "OpenCypher",
         feature: format!("{key} must be a non-negative integer"),
     })

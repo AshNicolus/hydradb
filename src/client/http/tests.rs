@@ -224,6 +224,49 @@ async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     server.stop().await.unwrap();
 }
 
+/// HTTP rejects `read_epoch` before the query service sees the request, so it
+/// has to count the failure itself or the dashboard never shows it.
+#[tokio::test]
+async fn an_http_read_epoch_rejection_is_counted_as_a_prepare_failure() {
+    let backend = Arc::new(HttpTestClient {
+        observed_epochs: Mutex::new(Vec::new()),
+        refreshes: AtomicU64::new(0),
+    });
+    let service = http_service(backend);
+    let server = ClientHttpServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        service.clone(),
+        HttpQueryServerConfig::default()
+            .with_default_page_size(2)
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/v1/graphs/social/query",
+            server.local_addr()
+        ))
+        .bearer_auth("http-secret")
+        .header(GRAPH_NAMESPACE_HEADER, "acme")
+        .json(&serde_json::json!({
+            "cell_id": "cell-a",
+            "query": "MATCH (n {id: 1}) RETURN n.id",
+            "read_epoch": 7
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error(), "{}", response.status());
+    let counted: u64 = service
+        .metrics()
+        .failure_counter_fields()
+        .filter(|(_, stage, reason, _)| (*stage, *reason) == ("prepare", "invalid_request"))
+        .map(|(.., count)| count)
+        .sum();
+    assert_eq!(counted, 1);
+}
+
 #[tokio::test]
 async fn http_strong_consistency_refreshes_the_slatedb_reader() {
     let backend = Arc::new(HttpTestClient {

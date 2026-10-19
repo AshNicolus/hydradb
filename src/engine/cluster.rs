@@ -2,8 +2,8 @@ use super::*;
 use crate::keys;
 
 use chrono::Utc;
-use tracing::Instrument as _;
 use hydradb_placement::cell_writer::{self, CellWriterRecord};
+use tracing::Instrument as _;
 
 /// Stamp a failure onto the span that raised it.
 ///
@@ -465,6 +465,8 @@ impl RoutedGraphCluster {
             placement,
             writer_leases,
             writer_lease_registration_active: std::sync::atomic::AtomicBool::new(promotable),
+            #[cfg(feature = "query-transport")]
+            scope_registration: tokio::sync::OnceCell::new(),
             shards,
             promotable,
         })
@@ -497,6 +499,7 @@ impl RoutedGraphCluster {
                 cache: shard.graph_cache_metrics(),
                 cache_entries: shard.graph_cache_entry_counts().await,
                 cache_resident_bytes: shard.graph_cache_resident_bytes().await,
+                storage: shard.graph_storage_metrics(),
             });
         }
         metrics
@@ -1341,7 +1344,21 @@ impl ScopedRoutedGraphCluster {
                 limit: 1,
             });
         }
+        let possible_cache_handles = max_open_scopes
+            .saturating_mul(directory.cells().count())
+            .saturating_mul(2);
+        if options.cache.object_store_cache_dir.is_some()
+            && options.cache.object_store_cache_max_open_file_handles < possible_cache_handles
+        {
+            return Err(GraphError::AdmissionRejected {
+                operation: "data_cache_file_handle_budget",
+                actual: possible_cache_handles as u64,
+                limit: options.cache.object_store_cache_max_open_file_handles as u64,
+            });
+        }
         let writer_registry = process_writer_registry(&object_store);
+        let slatedb_cache =
+            crate::process_slate_db_cache(&object_store, options.cache.slatedb_cache_bytes)?;
         let writer_leases = super::writer_lease::process_writer_lease_directory(
             base_path.clone(),
             Arc::clone(&object_store),
@@ -1360,7 +1377,9 @@ impl ScopedRoutedGraphCluster {
                 graph_id,
                 Arc::clone(&object_store),
             ),
+            indexer_change_wake: None,
             object_store,
+            slatedb_cache,
             writer_leases,
             writer_registry,
             options,
@@ -1371,7 +1390,8 @@ impl ScopedRoutedGraphCluster {
             scope_open_gates: tokio::sync::Mutex::new(BTreeMap::new()),
             scope_closures: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             scope_capacity_gate: tokio::sync::Mutex::new(()),
-            scope_open_reservations: AtomicUsize::new(0),
+            scope_capacity_available: Arc::new(tokio::sync::Notify::new()),
+            scope_open_reservations: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1385,8 +1405,18 @@ impl ScopedRoutedGraphCluster {
         self
     }
 
+    /// Wake an external indexer notifier after its durable change hint lands.
+    pub fn with_indexer_change_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
+        self.indexer_change_wake = Some(wake);
+        self
+    }
+
     pub fn writer_lease_directory(&self) -> Arc<ObjectStoreWriterLeaseDirectory> {
         Arc::clone(&self.writer_leases)
+    }
+
+    pub fn slatedb_cache_metrics(&self) -> SlateDbCacheMetricsSnapshot {
+        self.slatedb_cache.snapshot()
     }
 
     /// Renew every writer lease held by this process and withdraw any writer
@@ -1447,13 +1477,30 @@ impl ScopedRoutedGraphCluster {
         if let Some(bytes) = options.cache.object_store_cache_bytes {
             options.cache.object_store_cache_bytes = Some((bytes / self.max_open_scopes).max(1));
         }
+        // SlateDB builds an independent file-handle cache for every reader and
+        // writer. A retained graph scope can open both for each cell, so its
+        // upstream per-handle default would multiply into tens of thousands of
+        // descriptors and eventually turn cache reads, TLS reloads, and S3
+        // connections into EMFILE failures. Partition the process budget by
+        // the worst-case number of handles the scoped runtime can retain.
+        let possible_handles = self
+            .max_open_scopes
+            .saturating_mul(self.directory.cells().count())
+            .saturating_mul(2)
+            .max(1);
+        options.cache.object_store_cache_max_open_file_handles /= possible_handles;
         options
     }
 
+    #[tracing::instrument(name = "graph.scope_acquire", skip_all)]
     pub(crate) async fn cluster_for_scope(
         &self,
         scope: &GraphScope,
     ) -> Result<Arc<RoutedGraphCluster>> {
+        self.cluster_for_scope_once(scope).await
+    }
+
+    async fn cluster_for_scope_once(&self, scope: &GraphScope) -> Result<Arc<RoutedGraphCluster>> {
         self.validate_scope(scope)?;
         loop {
             let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1521,11 +1568,11 @@ impl ScopedRoutedGraphCluster {
                 self.scope_open_reservations.fetch_add(1, Ordering::AcqRel);
                 (
                     evicted,
-                    ScopedOpenReservation::new(&self.scope_open_reservations),
+                    ScopedOpenReservation::new(Arc::clone(&self.scope_open_reservations)),
                 )
             };
             drop(capacity_guard);
-            if let Some((candidate, cluster, close)) = evicted {
+            let reservation = if let Some((candidate, cluster, close)) = evicted {
                 let cluster = Arc::try_unwrap(cluster).map_err(|_| GraphError::CorruptValue {
                     key: format!("scoped-cluster/{candidate}"),
                     reason: "idle scoped cluster acquired a concurrent owner during eviction"
@@ -1533,19 +1580,26 @@ impl ScopedRoutedGraphCluster {
                 })?;
                 // Closing outlives the request that triggered eviction. If the
                 // request is cancelled, this task still drains the old writer
-                // and only then releases same-scope reopeners.
-                tokio::spawn(async move {
-                    let result = cluster.close_for_eviction().await;
-                    drop(cluster);
-                    close.release();
-                    result
-                })
+                // and only then releases same-scope reopeners. It also owns
+                // capacity until cleanup finishes, even if its caller leaves.
+                tokio::spawn(
+                    async move {
+                        let result = cluster.close_for_eviction().await;
+                        drop(cluster);
+                        close.release();
+                        result?;
+                        Ok::<_, GraphError>(reservation)
+                    }
+                    .instrument(tracing::info_span!("graph.scope_evict")),
+                )
                 .await
                 .map_err(|error| GraphError::CorruptValue {
                     key: format!("scoped-cluster/{candidate}"),
                     reason: format!("scope close task failed: {error}"),
-                })??;
-            }
+                })??
+            } else {
+                reservation
+            };
 
             let cluster = Arc::new(
                 RoutedGraphCluster::open_promotable_scoped_with_writer_registry(
@@ -1562,6 +1616,7 @@ impl ScopedRoutedGraphCluster {
                     self.options_for_scope(scope),
                     self.memory.clone(),
                 )
+                .instrument(tracing::info_span!("graph.scope_open"))
                 .await?,
             );
             let _capacity_guard = self.scope_capacity_gate.lock().await;
@@ -1574,6 +1629,58 @@ impl ScopedRoutedGraphCluster {
                 },
             );
             return Ok(cluster);
+        }
+    }
+
+    /// Wait for an in-flight scoped query to release an eviction candidate.
+    ///
+    /// `max_open_scopes` is a memory bound, not a request-rate bound. A burst
+    /// across more scopes than the node can retain must therefore wait behind
+    /// active scopes instead of surfacing the cache's instantaneous state as a
+    /// client admission failure. The client query runtime owns the deadline and
+    /// cancellation token; callers outside that runtime keep the immediate
+    /// `cluster_for_scope` behavior so maintenance code cannot wait forever.
+    #[tracing::instrument(name = "graph.scope_capacity_wait", skip_all)]
+    pub(crate) async fn cluster_for_scope_wait(
+        &self,
+        scope: &GraphScope,
+    ) -> Result<Arc<RoutedGraphCluster>> {
+        let Some(cancellation) = crate::QueryCancellationToken::current() else {
+            return self.cluster_for_scope(scope).await;
+        };
+        loop {
+            // Register before checking capacity so a query release between the
+            // failed check and the await cannot become a lost wake-up.
+            let capacity_available = self.scope_capacity_available.notified();
+            match self.cluster_for_scope_once(scope).await {
+                Ok(cluster) => return Ok(cluster),
+                Err(GraphError::AdmissionRejected {
+                    operation: "open_graph_scopes",
+                    ..
+                }) => {
+                    tokio::select! {
+                        _ = capacity_available => {}
+                        // Weak handles used by background maintenance do not
+                        // carry a client release guard. Recheck occasionally
+                        // so their short upgrade window cannot strand a wait.
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        _ = cancellation.cancelled() => {
+                            return Err(GraphError::QueryTimeout {
+                                operation: "client_query_cancelled",
+                                elapsed_ms: 0,
+                                limit_ms: 0,
+                            });
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn scope_capacity_release_guard(&self) -> ScopeCapacityRelease {
+        ScopeCapacityRelease {
+            available: Arc::clone(&self.scope_capacity_available),
         }
     }
 
@@ -1596,6 +1703,7 @@ impl ScopedRoutedGraphCluster {
         Some(Arc::clone(&entry.cluster))
     }
 
+    #[cfg(test)]
     pub(crate) async fn cluster_for_scope_write(
         &self,
         scope: &GraphScope,
@@ -1603,8 +1711,60 @@ impl ScopedRoutedGraphCluster {
     ) -> Result<Arc<RoutedGraphCluster>> {
         let cluster = self.cluster_for_scope(scope).await?;
         cluster.ensure_local_writer(cell_id).await?;
-        self.scope_directory.register(scope).await?;
+        // Registration is durable and immutable; retry failures, but share success
+        // for this retained cluster. Reopening an evicted scope registers again.
+        cluster
+            .scope_registration
+            .get_or_try_init(|| self.scope_directory.register(scope))
+            .await?;
         Ok(cluster)
+    }
+
+    pub(crate) async fn cluster_for_scope_write_wait(
+        &self,
+        scope: &GraphScope,
+        cell_id: &str,
+    ) -> Result<Arc<RoutedGraphCluster>> {
+        let cluster = self.cluster_for_scope_wait(scope).await?;
+        cluster.ensure_local_writer(cell_id).await?;
+        cluster
+            .scope_registration
+            .get_or_try_init(|| self.scope_directory.register(scope))
+            .await?;
+        Ok(cluster)
+    }
+
+    /// Notify the background indexer after a committed scoped mutation.
+    ///
+    /// The notification is deliberately outside the client latency path. The
+    /// durable graph write remains authoritative and the indexer's fair sweep
+    /// repairs a notification lost during process shutdown.
+    pub(crate) fn notify_graph_index_change(
+        &self,
+        scope: GraphScope,
+        cell_id: String,
+        sequence: crate::StorageSequence,
+    ) {
+        let directory = self.scope_directory.clone();
+        let wake = self.indexer_change_wake.clone();
+        tokio::spawn(async move {
+            match directory.notify_changed(&scope, &cell_id, sequence).await {
+                Ok(()) => {
+                    if let Some(wake) = wake {
+                        wake.notify_one();
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        hydradb.scope = %scope,
+                        hydradb.cell_id = %cell_id,
+                        hydradb.base_sequence = sequence,
+                        error = %error,
+                        "failed to persist graph index change hint"
+                    );
+                }
+            }
+        });
     }
 
     /// Close idle writers that the current placement view assigns to another node.
@@ -1789,14 +1949,26 @@ impl ScopedRoutedGraphCluster {
 }
 
 #[cfg(feature = "query-transport")]
-struct ScopedOpenReservation<'a> {
-    counter: &'a AtomicUsize,
+struct ScopedOpenReservation {
+    counter: Arc<AtomicUsize>,
     active: bool,
 }
 
 #[cfg(feature = "query-transport")]
-impl<'a> ScopedOpenReservation<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
+pub(crate) struct ScopeCapacityRelease {
+    available: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "query-transport")]
+impl Drop for ScopeCapacityRelease {
+    fn drop(&mut self) {
+        self.available.notify_one();
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl ScopedOpenReservation {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
         Self {
             counter,
             active: true,
@@ -1810,7 +1982,7 @@ impl<'a> ScopedOpenReservation<'a> {
 }
 
 #[cfg(feature = "query-transport")]
-impl Drop for ScopedOpenReservation<'_> {
+impl Drop for ScopedOpenReservation {
     fn drop(&mut self) {
         if self.active {
             self.counter.fetch_sub(1, Ordering::AcqRel);
@@ -1883,10 +2055,10 @@ async fn close_routed_shards_best_effort(shards: BTreeMap<String, Arc<GraphShard
 
 #[cfg(all(test, feature = "query-transport"))]
 mod scoped_cluster_tests {
+    use hydradb_placement::heartbeat::{self, Heartbeat};
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
     use slatedb::object_store::prefix::PrefixStore;
-    use hydradb_placement::heartbeat::{self, Heartbeat};
 
     use super::*;
     use crate::NamespaceId;
@@ -1904,7 +2076,10 @@ mod scoped_cluster_tests {
             PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
             Arc::new(InMemory::new()),
             GraphOpenOptions {
-                cache: crate::GraphCacheConfig::disk_cache("/cache", 800),
+                cache: crate::GraphCacheConfig {
+                    object_store_cache_max_open_file_handles: 512,
+                    ..crate::GraphCacheConfig::disk_cache("/cache", 800)
+                },
                 ..GraphOpenOptions::default()
             },
             GraphMemoryConfig::default(),
@@ -1928,6 +2103,12 @@ mod scoped_cluster_tests {
         let second_options = runtime.options_for_scope(&second);
         assert_eq!(first_options.cache.object_store_cache_bytes, Some(100));
         assert_eq!(second_options.cache.object_store_cache_bytes, Some(100));
+        // Eight scopes can retain one reader and one writer for this cell, so
+        // all independent SlateDB caches together remain within 512 handles.
+        assert_eq!(
+            first_options.cache.object_store_cache_max_open_file_handles,
+            32
+        );
         assert_ne!(
             first_options.cache.object_store_cache_dir,
             second_options.cache.object_store_cache_dir
@@ -1937,6 +2118,37 @@ mod scoped_cluster_tests {
             .object_store_cache_dir
             .unwrap()
             .ends_with("production/tenant-a/graphs/hydradb"));
+    }
+
+    #[test]
+    fn scoped_clusters_reject_an_undersized_disk_cache_handle_budget() {
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let result = ScopedRoutedGraphCluster::new(
+            "graph/data",
+            root,
+            GraphId::new("hydradb").unwrap(),
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+            Arc::new(InMemory::new()),
+            GraphOpenOptions {
+                cache: crate::GraphCacheConfig {
+                    object_store_cache_max_open_file_handles: 15,
+                    ..crate::GraphCacheConfig::disk_cache("/cache", 800)
+                },
+                ..GraphOpenOptions::default()
+            },
+            GraphMemoryConfig::default(),
+            8,
+        );
+        assert!(matches!(
+            result.err().expect("undersized budget must be rejected"),
+            GraphError::AdmissionRejected {
+                operation: "data_cache_file_handle_budget",
+                actual: 16,
+                limit: 15,
+            }
+        ));
     }
 
     /// A runtime whose scope map is exactly `max_open_scopes` deep, so the next
@@ -1967,6 +2179,182 @@ mod scoped_cluster_tests {
                 .unwrap(),
             runtime.root_scope().graph_id,
         )
+    }
+
+    #[tokio::test]
+    async fn cancelled_eviction_retains_capacity_until_handles_close() {
+        let store = crate::tests::ReadCountingObjectStore::new();
+        let runtime = ScopedRoutedGraphCluster::new(
+            "graph/cancel-eviction-capacity",
+            NamespacePath::root(NamespaceId::new("production").unwrap()),
+            GraphId::new("hydradb").unwrap(),
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+            store.clone(),
+            GraphOpenOptions {
+                reader_manifest_poll_interval: Duration::from_secs(60),
+                ..Default::default()
+            },
+            GraphMemoryConfig::default(),
+            1,
+        )
+        .unwrap();
+        let first = tenant_scope(&runtime, "first");
+        let cluster = runtime
+            .cluster_for_scope_write(&first, "cell-0")
+            .await
+            .unwrap();
+        drop(
+            cluster
+                .shard("cell-0")
+                .unwrap()
+                .db
+                .reader_snapshot()
+                .await
+                .unwrap(),
+        );
+        drop(cluster);
+        let (started, release) = store.pause_next_get();
+        let cold = tenant_scope(&runtime, "cold");
+        let mut open = Box::pin(runtime.cluster_for_scope(&cold));
+        tokio::select! {
+            result = &mut open => panic!("eviction must await paused storage: {}", result.is_ok()),
+            result = tokio::time::timeout(Duration::from_secs(3), started) => result.unwrap().unwrap(),
+        }
+        drop(open);
+        let reserved = runtime.scope_open_reservations.load(Ordering::Acquire);
+        let third = tenant_scope(&runtime, "third");
+        let rejected = matches!(
+            runtime.cluster_for_scope(&third).await,
+            Err(GraphError::AdmissionRejected {
+                operation: "open_graph_scopes",
+                ..
+            })
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while runtime.scope_closure(&first).is_some()
+                || runtime.scope_open_reservations.load(Ordering::Acquire) != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(runtime.cluster_for_scope(&third).await.unwrap());
+        runtime.close().await.unwrap();
+        println!("cancelled_eviction_reserved={reserved} replacement_rejected={rejected}");
+        assert_eq!(
+            reserved, 1,
+            "cancelled request must not free a still-closing scope slot"
+        );
+        assert!(rejected);
+    }
+
+    #[tokio::test]
+    async fn client_scope_admission_waits_for_an_active_scope_to_become_evictable() {
+        let runtime = runtime_at_capacity("graph/client-scope-capacity-wait", 1);
+        let first = tenant_scope(&runtime, "first");
+        let release = runtime.scope_capacity_release_guard();
+        let held = runtime.cluster_for_scope(&first).await.unwrap();
+        let second = tenant_scope(&runtime, "second");
+        let cancellation = crate::QueryCancellationToken::new();
+        let mut waiting =
+            std::pin::pin!(cancellation.scope(runtime.cluster_for_scope_wait(&second)));
+
+        assert!(
+            futures::poll!(waiting.as_mut()).is_pending(),
+            "client admission must apply backpressure while every retained scope is active"
+        );
+        drop(held);
+        drop(release);
+
+        let opened = tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("released capacity wakes the client wait")
+            .expect("the waiting scope opens instead of returning admission failure");
+        assert_eq!(opened.scope(), &second);
+        drop(opened);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_scope_admission_wait_honors_query_cancellation() {
+        let runtime = runtime_at_capacity("graph/client-scope-capacity-cancel", 1);
+        let first = tenant_scope(&runtime, "first");
+        let held = runtime.cluster_for_scope(&first).await.unwrap();
+        let second = tenant_scope(&runtime, "second");
+        let cancellation = crate::QueryCancellationToken::new();
+        let mut waiting =
+            std::pin::pin!(cancellation.scope(runtime.cluster_for_scope_wait(&second)));
+
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        cancellation.cancel();
+        assert!(matches!(
+            waiting.await,
+            Err(GraphError::QueryTimeout {
+                operation: "client_query_cancelled",
+                ..
+            })
+        ));
+
+        drop(held);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_scope_writes_register_once_and_retry_failure() {
+        let store = crate::tests::ReadCountingObjectStore::new();
+        let runtime = ScopedRoutedGraphCluster::new(
+            "graph/register-once",
+            NamespacePath::root(NamespaceId::new("production").unwrap()),
+            GraphId::new("hydradb").unwrap(),
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+            store.clone(),
+            GraphOpenOptions::default(),
+            GraphMemoryConfig::default(),
+            1,
+        )
+        .unwrap();
+        let scope = tenant_scope(&runtime, "tenant-a");
+        store.fail_scope_put.store(true, Ordering::Release);
+        assert!(runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .is_err());
+        assert_eq!(store.scope_puts.load(Ordering::Acquire), 1);
+        let requests = (0..16).map(|_| runtime.cluster_for_scope_write(&scope, "cell-0"));
+        for result in futures::future::join_all(requests).await {
+            drop(result.unwrap());
+        }
+        let puts = store.scope_puts.load(Ordering::Acquire);
+        println!("scope_registration_attempts_for_16_writes_after_one_failure={puts}");
+        assert_eq!(
+            puts, 2,
+            "failed registration retries; successful registration is shared"
+        );
+        assert_eq!(
+            runtime.scope_directory.list().await.unwrap(),
+            vec![scope.clone()]
+        );
+
+        let other = tenant_scope(&runtime, "tenant-b");
+        drop(runtime.cluster_for_scope(&other).await.unwrap());
+        drop(
+            runtime
+                .cluster_for_scope_write(&scope, "cell-0")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            store.scope_puts.load(Ordering::Acquire),
+            3,
+            "reopened scope revalidates its marker"
+        );
+        runtime.close().await.unwrap();
     }
 
     /// Fill the map to `max_open_scopes`, returning the scopes in map order.
@@ -3256,13 +3644,13 @@ mod cell_writer_record_tests {
 
     use async_trait::async_trait;
     use futures::stream::BoxStream;
+    use hydradb_placement::cell_writer::{read_cell_writer, CellWriterRecord, CELL_WRITER_PREFIX};
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
     use slatedb::object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use hydradb_placement::cell_writer::{read_cell_writer, CellWriterRecord, CELL_WRITER_PREFIX};
 
     const CELL: &str = "cell-a";
     const FLEET: &[&str] = &["node-a", "node-b", "node-c"];

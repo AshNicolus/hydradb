@@ -1,9 +1,16 @@
 use super::*;
 
 #[cfg(feature = "opencypher")]
+use futures::{stream, StreamExt as _, TryStreamExt as _};
+
+#[cfg(feature = "opencypher")]
 use super::query::{
-    ordered_string_vertex_index_spec, row_predicate_relationship_property_constraint,
+    ordered_string_vertex_index_spec, row_predicate_property_equality_constraints,
+    RowPredicatePropertyEqualityConstraint,
 };
+
+#[cfg(feature = "opencypher")]
+use crate::core::metrics::QueryPlanShapes;
 
 #[cfg(feature = "opencypher")]
 use tracing::Instrument as _;
@@ -117,11 +124,15 @@ impl GraphShard {
                 return Err(err);
             }
         };
-        RowQueryPlanSummary::from_groups(planned.iter().map(|group| &group.plan)).record(
-            &span,
-            cell_id,
-            started.elapsed(),
-        );
+        let summary = RowQueryPlanSummary::from_groups(planned.iter().map(|group| &group.plan));
+        summary.record(&span, cell_id, started.elapsed());
+        // The one place a plan is counted. `optimize_row_patterns_with_stats`
+        // re-plans each group once per input row inside the match loop, and
+        // `explain_row_query_plan_with_stats` plans without executing; counting
+        // either would make the denominator scale with result size or with
+        // EXPLAIN traffic instead of with queries.
+        self.operation_metrics
+            .record_query_plan(summary.plan_shapes());
         Ok(planned.into_iter().map(|group| group.group).collect())
     }
 
@@ -184,7 +195,7 @@ impl GraphShard {
         let mut required_segment = Vec::<(usize, RowMatchGroup)>::new();
         let mut available_bindings = BTreeSet::new();
 
-        for (idx, group) in groups.iter().cloned().enumerate() {
+        for (idx, mut group) in groups.iter().cloned().enumerate() {
             if !group.optional && group.predicate.is_none() {
                 required_segment.push((idx, group));
                 continue;
@@ -197,6 +208,15 @@ impl GraphShard {
                 &mut output,
             )
             .await?;
+
+            // Fold the WHERE equality into the node pattern *before* planning
+            // it. `best_row_node_access` reads only labels and properties, and
+            // `candidate_vertex_ids` re-derives the access path from the
+            // pattern again at execution time, so rewriting the plan alone
+            // would change EXPLAIN and nothing else. Doing it first also means
+            // the cardinality estimate below is the index's, not the scan's.
+            let pushed_equality =
+                push_down_vertex_equality_predicate(&mut group, &available_bindings);
 
             let mut optimized_patterns = self
                 .optimize_row_pattern_plans_with_stats(
@@ -216,6 +236,10 @@ impl GraphShard {
             let mut plan = row_query_plan_group(&group, &optimized_patterns);
             plan.optimizer_passes
                 .push(RowQueryOptimizerPass::PreserveOptionalBoundary);
+            if pushed_equality {
+                plan.optimizer_passes
+                    .push(RowQueryOptimizerPass::EqualityPredicatePushdown);
+            }
             available_bindings.extend(row_match_group_bindings(&group));
             output.push(OptimizedRowMatchGroup {
                 group: RowMatchGroup {
@@ -307,53 +331,57 @@ impl GraphShard {
         predicate: Option<&RowPredicate>,
         patterns: &mut [OptimizedRowPattern],
     ) -> Result<()> {
-        let Some(constraint) = predicate.and_then(row_predicate_relationship_property_constraint)
-        else {
+        let Some(predicate) = predicate else {
             return Ok(());
         };
         if read_epoch != self.current_epoch(cell_id).await? {
             return Ok(());
         }
-        let Some(pattern) = patterns.iter_mut().find(|pattern| {
-            matches!(
-                (&pattern.pattern, &pattern.plan.access),
-                (
-                    RowPattern::Edge(edge),
-                    RowQueryAccess::FullEdgeScan { .. }
-                ) if edge.binding.as_deref() == Some(constraint.binding.as_str())
-                    && edge.hop_range.is_none()
-                    && edge.properties.is_empty()
-            )
-        }) else {
+        // Rank every relationship equality rather than depending on predicate
+        // order. Execution uses the same estimator, keeping EXPLAIN and the
+        // physical seed scan aligned when several indexed properties exist.
+        let mut best = None::<(RowPredicatePropertyEqualityConstraint, usize, u64)>;
+        for constraint in row_predicate_property_equality_constraints(predicate) {
+            let Some(index) = patterns.iter().position(|pattern| {
+                matches!(
+                    (&pattern.pattern, &pattern.plan.access),
+                    (
+                        RowPattern::Edge(edge),
+                        RowQueryAccess::FullEdgeScan { .. }
+                    ) if edge.binding.as_deref() == Some(constraint.binding.as_str())
+                        && edge.hop_range.is_none()
+                        && edge.properties.is_empty()
+                )
+            }) else {
+                continue;
+            };
+            let RowPattern::Edge(edge) = &patterns[index].pattern else {
+                continue;
+            };
+            let estimate = self
+                .edge_property_equality_estimate(
+                    cell_id,
+                    &edge.edge_type,
+                    &constraint.property,
+                    &constraint.values,
+                    16,
+                )
+                .await?;
+            let replace = best
+                .as_ref()
+                .is_none_or(|(_, _, current_estimate)| estimate < *current_estimate);
+            if replace {
+                best = Some((constraint, index, estimate));
+            }
+        }
+        let Some((constraint, index, estimate)) = best else {
             return Ok(());
         };
+        let pattern = &mut patterns[index];
         let RowPattern::Edge(edge) = &pattern.pattern else {
             return Ok(());
         };
 
-        let mut estimate = 0_u64;
-        for value in &constraint.values {
-            let encoded = encode_vertex_property_value_key(value);
-            estimate = estimate.saturating_add(
-                self.query_stats_estimate(
-                    cell_id,
-                    &keys::query_stats_edge_property(
-                        cell_id,
-                        &edge.edge_type,
-                        &constraint.property,
-                        &encoded,
-                    ),
-                    Some(&keys::query_stats_edge_property_histogram(
-                        cell_id,
-                        &edge.edge_type,
-                        &constraint.property,
-                    )),
-                    16,
-                )
-                .await?
-                .unwrap_or(16),
-            );
-        }
         pattern.plan.access = RowQueryAccess::EdgePropertyIndex {
             edge_type: edge.edge_type.clone(),
             property: constraint.property,
@@ -563,55 +591,63 @@ impl GraphShard {
             return Ok(AccessEstimate::new(RowQueryAccess::VertexIdSeek, 1));
         }
 
-        let mut best = None::<AccessEstimate>;
-        for (property, value) in node
+        let properties = node
             .properties
             .iter()
             .filter(|(property, _)| property.as_str() != "id")
-        {
-            let encoded = encode_vertex_property_value_key(value);
-            let estimate = self
-                .query_stats_estimate(
-                    cell_id,
-                    &keys::query_stats_vertex_property(cell_id, property, &encoded),
-                    Some(&keys::query_stats_vertex_property_histogram(
+            .map(|(property, value)| {
+                (
+                    keys::query_stats_vertex_property(
+                        cell_id,
+                        property,
+                        &encode_vertex_property_value_key(value),
+                    ),
+                    Some(keys::query_stats_vertex_property_histogram(
                         cell_id, property,
                     )),
-                    8,
+                    AccessEstimate::new(
+                        RowQueryAccess::VertexPropertyIndex {
+                            property: property.clone(),
+                        },
+                        8,
+                    )
+                    .with_pass(RowQueryOptimizerPass::UtilizeVertexIndex),
                 )
-                .await?
-                .unwrap_or(8);
-            choose_best_access(
-                &mut best,
-                AccessEstimate::new(
-                    RowQueryAccess::VertexPropertyIndex {
-                        property: property.clone(),
-                    },
-                    estimate,
-                )
-                .with_pass(RowQueryOptimizerPass::UtilizeVertexIndex),
-            );
-        }
-        for label in &node.labels {
-            let estimate = self
-                .query_stats_estimate(
-                    cell_id,
-                    &keys::query_stats_vertex_label(cell_id, label),
-                    None,
-                    64,
-                )
-                .await?
-                .unwrap_or(64);
-            choose_best_access(
-                &mut best,
+            });
+        let labels = node.labels.iter().map(|label| {
+            (
+                keys::query_stats_vertex_label(cell_id, label),
+                None,
                 AccessEstimate::new(
                     RowQueryAccess::VertexLabelScan {
                         label: label.clone(),
                     },
-                    estimate,
+                    64,
                 )
                 .with_pass(RowQueryOptimizerPass::CostBasedLabelScan),
-            );
+            )
+        });
+        // Preserve candidate/tie order while overlapping only bounded, read-only
+        // statistics I/O. No task is spawned and no extra candidates are fetched.
+        let candidates = properties.chain(labels).collect::<Vec<_>>();
+        let mut estimates = stream::iter(candidates)
+            .map(|(key, histogram, mut access)| async move {
+                access.estimated_cardinality = self
+                    .query_stats_estimate(
+                        cell_id,
+                        &key,
+                        histogram.as_deref(),
+                        access.estimated_cardinality,
+                    )
+                    .await?
+                    .unwrap_or(access.estimated_cardinality);
+                Ok::<_, GraphError>(access)
+            })
+            .buffered(8)
+            .boxed();
+        let mut best = None::<AccessEstimate>;
+        while let Some(access) = estimates.try_next().await? {
+            choose_best_access(&mut best, access);
         }
         Ok(best.unwrap_or_else(|| {
             AccessEstimate::new(RowQueryAccess::AllVertexScan, 1_000_000)
@@ -770,15 +806,50 @@ impl GraphShard {
         Ok(None)
     }
 
+    pub(crate) async fn edge_property_equality_estimate(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        values: &[VertexPropertyValue],
+        fallback: u64,
+    ) -> Result<u64> {
+        let mut estimate = 0_u64;
+        for value in values {
+            let encoded = encode_vertex_property_value_key(value);
+            estimate = estimate.saturating_add(
+                self.query_stats_estimate(
+                    cell_id,
+                    &keys::query_stats_edge_property(cell_id, edge_type, property, &encoded),
+                    Some(&keys::query_stats_edge_property_histogram(
+                        cell_id, edge_type, property,
+                    )),
+                    fallback,
+                )
+                .await?
+                .unwrap_or(fallback),
+            );
+        }
+        Ok(estimate.max(1))
+    }
+
     pub(crate) async fn query_stats_record(&self, key: &str) -> Result<Option<QueryStatsRecord>> {
+        if let Some(record) = GraphStore::snapshot_query_stats(key) {
+            return Ok(record);
+        }
         let record_key = keys::query_stats_record_key(key);
-        if let Some(value) = self.read_remote(&record_key).await? {
-            return decode_query_stats_record(&record_key, &value).map(Some);
-        }
-        match self.read_remote(key).await? {
-            Some(value) => decode_query_stats_record(key, &value).map(Some),
-            None => Ok(None),
-        }
+        let record = if let Some(value) = self.read_remote(&record_key).await? {
+            Some(decode_query_stats_record(&record_key, &value)?)
+        } else {
+            self.read_remote(key)
+                .await?
+                .map(|value| decode_query_stats_record(key, &value))
+                .transpose()?
+        };
+        // Replanning within one immutable snapshot must not repeat remote point
+        // reads, including missing statistics. This memo dies with the snapshot scope.
+        GraphStore::remember_snapshot_query_stats(key, record.clone());
+        Ok(record)
     }
 }
 
@@ -956,13 +1027,39 @@ fn row_node_bindings(node: &RowNodePattern) -> BTreeSet<String> {
 /// Read once. The value is a logging threshold, not a limit, so a process that
 /// starts before the variable is set simply logs at the default.
 #[cfg(feature = "opencypher")]
-fn slow_query_threshold_ms() -> u64 {
+pub(super) fn slow_query_threshold_ms() -> u64 {
     static THRESHOLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *THRESHOLD_MS.get_or_init(|| {
         std::env::var("GRAPH_SLOW_QUERY_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(1_000)
+    })
+}
+
+/// The estimated-row count at which a plan is worth a WARN on its own.
+///
+/// Dimensioned in rows rather than in access-path variants because the variant
+/// test already exists and already missed the case that reached production: a
+/// `VertexLabelScan` is not a full scan, so a plan that hydrated 13,008
+/// vertices to return one row raised nothing at all. The estimate is the number
+/// that saw it — 13,008 against 1 for the same query written with the property
+/// in the pattern — and a rule written on the estimate catches the next shape
+/// without having to name it first.
+///
+/// 10,000 is chosen to sit above the row counts a healthy plan reaches and
+/// below the engine's own admission limits (`max_query_intermediate_rows` is
+/// 250,000), so it fires while the query still succeeds. That is the whole
+/// point: a plan estimating 13,008 rows returns in 40 ms on a small tenant and
+/// times out after that tenant grows, and this is the rule that sees it coming.
+#[cfg(feature = "opencypher")]
+pub(super) fn wide_plan_threshold_rows() -> u64 {
+    static THRESHOLD_ROWS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *THRESHOLD_ROWS.get_or_init(|| {
+        std::env::var("GRAPH_WIDE_PLAN_ROWS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(10_000)
     })
 }
 
@@ -1013,6 +1110,30 @@ impl RowQueryPlanSummary {
         for arm in &plan.union_arms {
             self.absorb_plan(arm);
         }
+    }
+
+    /// The four watched shapes, for [`GraphOperationalMetrics::record_query_plan`].
+    ///
+    /// Derived from the same fields the span reports, so a counter and a trace
+    /// cannot disagree about what a plan contained. `access_paths` is scanned
+    /// by prefix because its entries are qualified — `VertexLabelScan:Source`
+    /// carries the label the operator needs on the span, and the counter wants
+    /// only the variant.
+    fn plan_shapes(&self) -> QueryPlanShapes {
+        QueryPlanShapes {
+            label_scan: self.has_access_kind("VertexLabelScan"),
+            property_index: self.has_access_kind("VertexPropertyIndex"),
+            full_scan: self.full_scan,
+            equality_pushdown: self.optimizer_passes.contains(&optimizer_pass_label(
+                &RowQueryOptimizerPass::EqualityPredicatePushdown,
+            )),
+        }
+    }
+
+    fn has_access_kind(&self, kind: &str) -> bool {
+        self.access_paths
+            .iter()
+            .any(|path| path.split(':').next() == Some(kind))
     }
 
     fn absorb_pass(&mut self, pass: &RowQueryOptimizerPass) {
@@ -1072,18 +1193,30 @@ impl RowQueryPlanSummary {
         span.record("hydradb.query.optimizer_passes", optimizer_passes.as_str());
         span.record("hydradb.query.rows_estimated", self.rows_estimated);
         span.record("hydradb.query.full_scan", self.full_scan);
-        if self.full_scan {
+
+        // The two plan-shape rules, most specific first. `full_scan` names the
+        // access-path variants that read everything; `wide_plan` catches the
+        // ones that merely read far too much, which is the same failure without
+        // a variant to match on.
+        let plan_alarm = if self.full_scan {
+            Some("full_scan")
+        } else if self.rows_estimated >= wide_plan_threshold_rows() {
+            Some("wide_plan")
+        } else {
+            None
+        };
+        if let Some(alarm) = plan_alarm {
             // Not a head-sampling decision and cannot be made into one: the
             // verdict does not exist until the planner has run, and `query.plan`
             // is a child of `client.query`, whose fate was settled when the
             // request arrived. This marks the trace for the collector's tail
             // sampler — see `hydradb_telemetry::sampling`.
-            span.record("hydradb.sampling.tail_keep", "full_scan");
+            span.record("hydradb.sampling.tail_keep", alarm);
         }
 
         let elapsed_ms = elapsed.as_millis() as u64;
         let slow = elapsed_ms >= slow_query_threshold_ms();
-        if !slow && !self.full_scan {
+        if !slow && plan_alarm.is_none() {
             return;
         }
         tracing::warn!(
@@ -1093,10 +1226,116 @@ impl RowQueryPlanSummary {
             hydradb.query.rows_estimated = self.rows_estimated,
             hydradb.query.full_scan = self.full_scan,
             planning_elapsed_ms = elapsed_ms,
-            reason = if self.full_scan { "full_scan" } else { "slow" },
+            // The plan verdict outranks the clock: a slow *and* wide plan is
+            // reported as wide, because that is the half an operator can fix.
+            reason = plan_alarm.unwrap_or("slow"),
             "query plan warrants attention"
         );
     }
+}
+
+/// Fold a WHERE equality into the node pattern it constrains.
+///
+/// `MATCH (s:Source) WHERE s.app_external_id = 'x'` and
+/// `MATCH (s:Source {app_external_id: 'x'})` mean the same thing, but only the
+/// second is anchorable. `best_row_node_access` derives an access path from a
+/// pattern's labels and properties; a predicate lives in
+/// `RowMatchGroup.predicate` and never reaches it, so the WHERE form plans
+/// `VertexLabelScan`, hydrates every vertex carrying the label and filters
+/// afterwards. On 13,008 `:Source` vertices that is ~800x the indexed form with
+/// no object store in the path — `examples/where_vs_inline_bench.rs` measures
+/// it, and `docs/plans/2026-08-20-vertex-equality-predicate-pushdown.md`
+/// records the numbers.
+///
+/// The rewrite is exact rather than an approximation. Both forms end in
+/// `compare_vertex_property_values(.., Eq, ..)` — the pattern through
+/// `vertex_metadata_matches`, the predicate through `row_predicate_matches` —
+/// and `scan_vertex_property_index_at` probes every encoding in
+/// `equivalent_property_index_keys`, so a seek finds the same int/float
+/// spellings the comparison accepts. The predicate stays in place and still
+/// filters the matched rows, so a pattern this declines to touch costs
+/// correctness nothing.
+///
+/// Returns whether any pattern was rewritten.
+#[cfg(feature = "opencypher")]
+fn push_down_vertex_equality_predicate(
+    group: &mut RowMatchGroup,
+    bound: &BTreeSet<String>,
+) -> bool {
+    let Some(predicate) = group.predicate.as_ref() else {
+        return false;
+    };
+
+    let mut pushed = false;
+    // Every constraint the predicate proves, not the first one it proves.
+    // Taking the first made the plan depend on the order the terms were
+    // written, and let a term this pass cannot use hide one it can. Pushing
+    // all of them hands `best_row_node_access` the whole set, and it already
+    // compares estimates across a pattern's properties and picks the most
+    // selective.
+    for constraint in row_predicate_property_equality_constraints(predicate) {
+        // A node pattern carries one value per property, so `p = a OR p = b`
+        // has nowhere to go. Anchoring on either half alone would drop the
+        // other half's rows, and the surviving predicate cannot put back what
+        // the seek never read. `continue`, not `return`: the terms beside it
+        // may still be usable.
+        let [value] = constraint.values.as_slice() else {
+            continue;
+        };
+        // `id` is not a property here. `RowNodePattern.id` is its own field,
+        // the index search filters the name out, and
+        // `node_has_metadata_constraints` does not count it — so writing it
+        // into the map would assert a metadata constraint that vertex records
+        // do not carry. Unreachable from Cypher as it stands, because
+        // `node_id_expression_binding` routes every `x.id` to
+        // `RowExpression::NodeId` before a property constraint can be built;
+        // it stays because the invariant is about the pattern, not about
+        // today's lowering.
+        if constraint.property == "id" || bound.contains(&constraint.binding) {
+            continue;
+        }
+
+        for pattern in &mut group.patterns {
+            match pattern {
+                RowPattern::Node(node) => {
+                    pushed |= constrain_row_node_property(node, &constraint, value);
+                }
+                // A binding can be an edge endpoint rather than a standalone
+                // node, and that is the shape worth anchoring: it is the
+                // difference between seeking one source and expanding from
+                // every one of them. Endpoint metadata is hydrated for every
+                // bound value regardless of the pattern
+                // (`hydrate_binding_metadata`), so the added constraint has
+                // something to match against.
+                RowPattern::Edge(edge) => {
+                    pushed |= constrain_row_node_property(&mut edge.src, &constraint, value);
+                    pushed |= constrain_row_node_property(&mut edge.dst, &constraint, value);
+                }
+            }
+        }
+    }
+    pushed
+}
+
+/// Add one `property = value` constraint to a node pattern, if it is the
+/// pattern the constraint names and does not already say something about that
+/// property.
+#[cfg(feature = "opencypher")]
+fn constrain_row_node_property(
+    node: &mut RowNodePattern,
+    constraint: &RowPredicatePropertyEqualityConstraint,
+    value: &VertexPropertyValue,
+) -> bool {
+    if node.binding.as_deref() != Some(constraint.binding.as_str()) {
+        return false;
+    }
+    // An id already seeks a single vertex; nothing beats that.
+    if node.id.is_some() || node.properties.contains_key(&constraint.property) {
+        return false;
+    }
+    node.properties
+        .insert(constraint.property.clone(), value.clone());
+    true
 }
 
 /// A bounded, schema-derived label for one access path.
@@ -1143,6 +1382,7 @@ fn optimizer_pass_label(pass: &RowQueryOptimizerPass) -> &'static str {
     match pass {
         RowQueryOptimizerPass::UtilizeVertexIndex => "UtilizeVertexIndex",
         RowQueryOptimizerPass::OrderedLimitPushdown => "OrderedLimitPushdown",
+        RowQueryOptimizerPass::EqualityPredicatePushdown => "EqualityPredicatePushdown",
         RowQueryOptimizerPass::UtilizeEdgeIndex => "UtilizeEdgeIndex",
         RowQueryOptimizerPass::CostBasedLabelScan => "CostBasedLabelScan",
         RowQueryOptimizerPass::ConnectivityOrder => "ConnectivityOrder",
@@ -1325,6 +1565,60 @@ mod tests {
             "the head-sampling key was recorded after the span started, where \
              it can never be read: {recorded:?}"
         );
+    }
+
+    /// The rule that would have caught the WHERE-equality label scan.
+    ///
+    /// `VertexLabelScan` is not a full scan, and planning one is fast, so
+    /// neither of the two pre-existing triggers fired on the plan that read
+    /// 13,008 vertices to return one row — the pathology
+    /// `docs/plans/2026-08-20-vertex-equality-predicate-pushdown.md` records.
+    /// A rule dimensioned by the estimate sees it, and still leaves an
+    /// ordinary indexed plan silent.
+    #[test]
+    fn a_wide_plan_marks_the_trace_even_when_no_access_path_is_a_full_scan() {
+        let label_scan = |rows: u64| {
+            let mut pattern = plan_pattern(
+                RowQueryAccess::VertexLabelScan {
+                    label: "Source".to_string(),
+                },
+                vec![RowQueryOptimizerPass::CostBasedLabelScan],
+            );
+            pattern.estimated_cardinality = rows;
+            pattern
+        };
+
+        let tail_keep_for = |rows: u64| {
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = RecordedFields(captured.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                let span = query_plan_span("cell-7", 42);
+                let entered = span.enter();
+                RowQueryPlanSummary::from_patterns(&[label_scan(rows)]).record(
+                    &span,
+                    "cell-7",
+                    std::time::Duration::from_millis(1),
+                );
+                drop(entered);
+            });
+            let recorded = captured
+                .lock()
+                .expect("field capture mutex is not poisoned");
+            recorded
+                .iter()
+                .find(|(name, _)| name == "hydradb.sampling.tail_keep")
+                .map(|(_, value)| value.clone())
+        };
+
+        let summary = RowQueryPlanSummary::from_patterns(&[label_scan(13_008)]);
+        assert!(
+            !summary.full_scan,
+            "a label scan is not a full scan, which is exactly why rule 2 missed it"
+        );
+        assert_eq!(tail_keep_for(13_008).as_deref(), Some("wide_plan"));
+        // The indexed form of the same query estimates one row and must stay
+        // silent, or the rule is noise rather than a signal.
+        assert_eq!(tail_keep_for(1), None);
     }
 
     #[test]

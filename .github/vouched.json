@@ -1,0 +1,12 @@
+{
+  "_comment": "Contribution roster. 'maintainers' can run /approved and override the PR gates. Anyone with write access to this repository is also a maintainer. See CONTRIBUTING.md.",
+  "maintainers": [
+    "arrry-hydraDB",
+    "abhishekt-hydra",
+    "vixhal-baraiya",
+    "SohamRatnaparkhi",
+    "vyomgoyal",
+    "saivenu-hydradb",
+    "tushar-hydradb"
+  ]
+}

@@ -4,7 +4,7 @@
 //!
 //! This crate answers one question — *which node should own this cell's
 //! writer* — and deliberately knows nothing about graphs, shards or queries.
-//! It does not depend on `slatedb-graph-kernel`; the dependency runs the other
+//! It does not depend on `hydradb`; the dependency runs the other
 //! way, which is what keeps it testable in isolation and keeps the kernel's
 //! types out of the routing layer.
 //!

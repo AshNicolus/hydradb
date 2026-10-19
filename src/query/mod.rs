@@ -3,6 +3,8 @@ pub(crate) mod algebra;
 pub(crate) mod coordination;
 #[cfg(feature = "opencypher")]
 pub(crate) mod corpus;
+#[cfg(feature = "experimental-cypher-engine")]
+pub(crate) mod experimental_cypher;
 #[cfg(feature = "opencypher")]
 pub(crate) mod opencypher;
 #[cfg(feature = "opencypher")]

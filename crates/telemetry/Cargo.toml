@@ -6,7 +6,7 @@ rust-version = "1.91"
 description = "OpenTelemetry logs and traces for the HydraDB graph-node and graph-indexer binaries"
 publish = false
 
-# No dependency on `slatedb-graph-kernel`, and the kernel must not gain one on
+# No dependency on `hydradb`, and the kernel must not gain one on
 # this crate. The kernel emits through the plain `tracing` facade, which is a
 # no-op with no subscriber installed; this crate owns only the *subscriber*
 # side. Keeping the arrow pointing this way is what lets OTel land without

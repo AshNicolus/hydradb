@@ -1,4 +1,4 @@
-//! Build script for `slatedb-graph-kernel`.
+//! Build script for `hydradb`.
 //!
 //! Its only job is to teach the linker where SuiteSparse:GraphBLAS lives.
 //! Without this, a Homebrew install on macOS fails with
@@ -6,8 +6,7 @@
 //! `RUSTFLAGS="-L /opt/homebrew/lib"` by hand.
 //!
 //! Resolution order (first hit wins):
-//!   1. `GRAPHBLAS_LIB_DIR` — explicit override, also used by the docs in
-//!      `docs/plans/optimisation-phases.md`.
+//!   1. `GRAPHBLAS_LIB_DIR` — explicit override.
 //!   2. `pkg-config --libs-only-L GraphBLAS` (or `graphblas`), which Homebrew and
 //!      most distro packages ship.
 //!   3. `brew --prefix suite-sparse`/lib on macOS.

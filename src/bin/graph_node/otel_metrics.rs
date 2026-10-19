@@ -6,7 +6,7 @@
 //! The kernel enumerates its metrics by **Rust identifier** — `read_latency`,
 //! `query_rows_latency`, `write_attempts` — and knows nothing about either
 //! exposition vocabulary
-//! (`slatedb_graph_kernel::ClientQueryMetricsSnapshot::histogram_fields`,
+//! (`hydradb::ClientQueryMetricsSnapshot::histogram_fields`,
 //! `::counter_fields`, `::class_counter_fields` and their siblings). The two
 //! vocabularies live here and in [`crate::admin`]: this module holds the OTel
 //! names, `admin.rs` holds the Prometheus names, and
@@ -18,9 +18,10 @@
 //!
 //! # One counter snapshot reaches the meter; the other two reach `/metrics` only
 //!
-//! All 65 kernel counters are exported through `/metrics`. Thirty-four are also
-//! registered as OTel instruments: `GraphOperationalMetricsSnapshot`'s
-//! thirty-five scalars, less the one that restates a histogram's sum.
+//! All 69 scalar kernel counters are exported through `/metrics`. Sixty-eight
+//! are also registered as OTel instruments:
+//! `GraphOperationalMetricsSnapshot`'s scalars less the one that restates a
+//! histogram's sum.
 //! [`METERED_COUNTER_SOURCES`] is that decision as a value rather than a
 //! paragraph — one variant long — and [`otel_counter_instruments`] is what
 //! [`NodeCounters::register`] iterates. `ClientQueryMetricsSnapshot` and
@@ -122,9 +123,12 @@
 //! disagreeing about where a bucket ends. See that module for the full
 //! argument.
 
+#[path = "otel_metrics/memory_diagnostics.rs"]
+pub(crate) mod memory_diagnostics;
+
 // Only the recording half names a snapshot, and that half is behind `otlp`.
 #[cfg(feature = "otlp")]
-use slatedb_graph_kernel::DurationHistogramSnapshot;
+use hydradb::DurationHistogramSnapshot;
 
 /// The export proof, in its own file because a stand-in collector is a hundred
 /// lines that have nothing to say about metric names.
@@ -264,7 +268,7 @@ pub struct OtelHistogram {
     /// metric measured over two populations; what makes them two series rather
     /// than one is [`OtelHistogram::operation`], and a shared name with no
     /// operation is a build failure over in
-    /// [`tests::rows_sharing_a_name_are_told_apart_by_the_operation_label`].
+    /// [`tests::rows_sharing_a_name_are_told_apart_by_the_operation_and_engine_labels`].
     pub name: &'static str,
     /// Instrument description.
     pub description: &'static str,
@@ -297,8 +301,12 @@ pub struct OtelHistogram {
 /// [`tests::only_the_transport_histograms_declare_no_graph_node_source`] for the
 /// assertion that keeps the three-of-five accounting honest.
 pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
+    // Four rows, one instrument: the operation label splits reads from writes
+    // and `hydradb.cypher_engine` splits the two engines, which the kernel
+    // keeps apart at the point of recording. See
+    // `crate::admin::cypher_engine_label`.
     OtelHistogram {
-        field: "read_latency",
+        field: "read_latency_legacy",
         name: "db.client.operation.duration",
         description: "End-to-end client operation execution",
         unit: ExportUnit::Seconds,
@@ -306,7 +314,15 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         source: FieldSource::GraphNode,
     },
     OtelHistogram {
-        field: "write_latency",
+        field: "read_latency_experimental",
+        name: "db.client.operation.duration",
+        description: "End-to-end client operation execution",
+        unit: ExportUnit::Seconds,
+        operation: Some(hydradb_telemetry::semconv::DB_OPERATION_READ),
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "write_latency_legacy",
         name: "db.client.operation.duration",
         description: "End-to-end client operation execution",
         unit: ExportUnit::Seconds,
@@ -314,9 +330,94 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         source: FieldSource::GraphNode,
     },
     OtelHistogram {
+        field: "write_latency_experimental",
+        name: "db.client.operation.duration",
+        description: "End-to-end client operation execution",
+        unit: ExportUnit::Seconds,
+        operation: Some(hydradb_telemetry::semconv::DB_OPERATION_WRITE),
+        source: FieldSource::GraphNode,
+    },
+    // `hydradb.*`, not `db.*`: there is no semantic convention for a
+    // causal-consistency wait, and the one stable database histogram
+    // (`db.client.operation.duration`) is already claimed above by the two
+    // rows that genuinely mean it. Change 4 of
+    // `docs/plans/2026-08-21-cell-affine-read-routing.md`.
+    OtelHistogram {
+        field: "bookmark_wait_latency",
+        name: "hydradb.client.bookmark_wait.duration",
+        description: "Causal-consistency bookmark wait before a read is admitted",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
         field: "query_rows_latency",
         name: "hydradb.query.rows.duration",
         description: "Shard row-query execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "query_property_fetch_latency",
+        name: "hydradb.query.property_fetch.duration",
+        description: "Stored-property reads issued while materialising row-query results",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "create_relationships_batch_latency",
+        name: "hydradb.write.create_relationships_batch.duration",
+        description: "End-to-end create-relationships-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "delete_relationship_mutations_batch_latency",
+        name: "hydradb.write.delete_relationship_mutations_batch.duration",
+        description: "End-to-end delete-relationship-mutations-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "delete_vertices_and_isolated_candidates_batch_latency",
+        name: "hydradb.write.delete_vertices_and_isolated_candidates_batch.duration",
+        description: "End-to-end delete-vertices-and-isolated-candidates-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "detach_delete_vertices_batch_latency",
+        name: "hydradb.write.detach_delete_vertices_batch.duration",
+        description: "End-to-end detach-delete-vertices-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "merge_relationships_batch_latency",
+        name: "hydradb.write.merge_relationships_batch.duration",
+        description: "End-to-end merge-relationships-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "merge_vertex_metadata_batch_latency",
+        name: "hydradb.write.merge_vertex_metadata_batch.duration",
+        description: "End-to-end merge-vertex-metadata-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "reserve_edge_delete_noops_batch_latency",
+        name: "hydradb.write.reserve_edge_delete_noops_batch.duration",
+        description: "End-to-end reserve-edge-delete-noops-batch execution",
         unit: ExportUnit::Microseconds,
         operation: None,
         source: FieldSource::GraphNode,
@@ -510,7 +611,7 @@ impl OtelCounterExport {
 /// Derived from the kernel's field identifier rather than declared per row, and
 /// the derivation is the `_us` suffix: every cumulative microsecond total the
 /// kernel keeps is named for it — `gc_duration_us`, `bulk_import_commit_us`,
-/// `graph_compute_queue_us` — and nothing else is. A column would be sixty-seven
+/// `graph_compute_queue_us` — and nothing else is. A column would be seventy-six
 /// values to distinguish two cases, and it would be free to drift from the names
 /// the *other* export already derives from the same convention: every one of
 /// these rows is spelled `_microseconds` in [`crate::admin::PROMETHEUS_COUNTERS`].
@@ -557,7 +658,7 @@ impl CounterQuantity {
 /// There is no `description` field, and its absence is a decision rather than an
 /// omission. Registration needs one — [`NodeCounters::register`] passes
 /// [`OtelCounter::field`] — and the kernel identifier is the better string than a
-/// sentence would be: sixty-seven generated sentences would each restate the
+/// sentence would be: seventy-six generated sentences would each restate the
 /// metric name in longer words, whereas the identifier is the one thing the name
 /// does *not* carry, and it is the key `/metrics`, the kernel's enumeration and
 /// both name tables are joined on. An operator who finds
@@ -637,6 +738,49 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
         field: "prepare_duration_us",
         export: OtelCounterExport::Global("hydradb.client.prepare.duration.sum"),
     },
+    // The bookmark-wait family. `Global` for the same reason its Prometheus
+    // twin is: the wait is a property of the node the read landed on, and a
+    // per-cell split would divide the one ratio worth alerting on.
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "bookmark_waits",
+        export: OtelCounterExport::Global("hydradb.client.bookmark_wait.requests"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "bookmark_waits_polled",
+        export: OtelCounterExport::Global("hydradb.client.bookmark_wait.polled"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "bookmark_waits_declined",
+        export: OtelCounterExport::Global("hydradb.client.bookmark_wait.declined"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "bookmark_waits_on_cell_writer",
+        export: OtelCounterExport::Global("hydradb.client.bookmark_wait.on_cell_writer"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "bookmark_waits_off_cell_writer",
+        export: OtelCounterExport::Global("hydradb.client.bookmark_wait.off_cell_writer"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "admission_wait_us",
+        export: OtelCounterExport::Global("hydradb.client.admission_wait.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "serialize_duration_us",
+        export: OtelCounterExport::Global("hydradb.client.serialize.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "serialized_rows",
+        export: OtelCounterExport::Global("hydradb.client.serialized_rows"),
+    },
     // Derived: the kernel builds it from `read_latency.sum_us +
     // write_latency.sum_us`, and both instruments already publish a `.sum`.
     OtelCounter {
@@ -684,6 +828,156 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
         source: CounterSource::Shard,
         field: "bulk_import_commit_us",
         export: OtelCounterExport::PerCell("hydradb.shard.bulk_import.commit.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_batches_profiled",
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.batches_profiled"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_endpoint_check_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.relationship_import.endpoint_check.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_identity_scan_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.relationship_import.identity_scan.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_identity_pointer_hits",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.relationship_import.identity_pointer.hits",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_identity_pointer_misses",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.relationship_import.identity_pointer.misses",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_record_read_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.relationship_import.record_read.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_structural_check_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.relationship_import.structural_check.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_segment_scans",
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.segment_scans"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_segment_neighbors",
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.segment_neighbors"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_counter_read_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.relationship_import.counter_read.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_commit_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.commit.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "relationship_import_idempotency_replays",
+        export: OtelCounterExport::PerCell("hydradb.shard.relationship_import.idempotency_replays"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "merge_vertex_metadata_nochange_exits",
+        export: OtelCounterExport::PerCell("hydradb.shard.merge_vertex_metadata.nochange_exits"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "delete_vertex_batch_all_replays",
+        export: OtelCounterExport::PerCell("hydradb.shard.delete_vertex_batch.all_replays"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "merge_vertex_metadata_batches_profiled",
+        export: OtelCounterExport::PerCell("hydradb.shard.merge_vertex_metadata.batches_profiled"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "merge_vertex_metadata_batch_items",
+        export: OtelCounterExport::PerCell("hydradb.shard.merge_vertex_metadata.batch_items"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "merge_vertex_metadata_read_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.merge_vertex_metadata.read.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "merge_vertex_metadata_txn_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.merge_vertex_metadata.txn.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "delete_vertex_batch_batches_profiled",
+        export: OtelCounterExport::PerCell("hydradb.shard.delete_vertex_batch.batches_profiled"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "delete_vertex_batch_items",
+        export: OtelCounterExport::PerCell("hydradb.shard.delete_vertex_batch.batch_items"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "delete_vertex_batch_read_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.delete_vertex_batch.read.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "delete_vertex_batch_txn_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.delete_vertex_batch.txn.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "reserve_edge_delete_noops_batches_profiled",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.reserve_edge_delete_noops.batches_profiled",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "reserve_edge_delete_noops_batch_items",
+        export: OtelCounterExport::PerCell("hydradb.shard.reserve_edge_delete_noops.batch_items"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "reserve_edge_delete_noops_read_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.reserve_edge_delete_noops.read.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "reserve_edge_delete_noops_txn_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.reserve_edge_delete_noops.txn.duration.sum",
+        ),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -778,6 +1072,116 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     },
     OtelCounter {
         source: CounterSource::Shard,
+        field: "query_experimental_property_seek_requests",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.property_seek.requests",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_relationship_expand_requests",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.relationship_expand.requests",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_ordered_property_scan_requests",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.ordered_property_scan.requests",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_requests",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.requests"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_parse_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.parse.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_lower_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.lower.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_bind_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.bind.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_snapshot_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.snapshot.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_statistics_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.statistics.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_plan_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.plan.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_execute_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.execute.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_storage_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.storage.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_storage_calls",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.storage.calls"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_result_us",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.result.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_sampled_plans",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.sampled_plans"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_route_legacy_requests",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.route.legacy.requests"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_route_experimental_requests",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.route.experimental.requests"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_route_native_path_fallbacks",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.route.native_path.fallbacks"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_route_mutation_fallbacks",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.route.mutation.fallbacks"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_property_fetches",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.property_fetches"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
         field: "query_artifact_lookup_us",
         export: OtelCounterExport::PerCell("hydradb.shard.query.artifact_lookup.duration.sum"),
     },
@@ -795,6 +1199,34 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
         source: CounterSource::Shard,
         field: "query_graphblas_rebuilt_snapshots",
         export: OtelCounterExport::PerCell("hydradb.shard.query.graphblas.rebuilt_snapshots"),
+    },
+    // The plan-shape family. `hydradb.shard.query.plans` is the denominator the
+    // other four are read against; one plan can contribute to more than one of
+    // them, so they do not sum to it.
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_plans_total",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.plans"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_plans_with_label_scan",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.plans.label_scan"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_plans_with_property_index",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.plans.property_index"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_plans_with_full_scan",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.plans.full_scan"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_plans_with_equality_pushdown",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.plans.equality_pushdown"),
     },
     OtelCounter {
         source: CounterSource::Shard,
@@ -880,9 +1312,7 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::ShardCache,
         field: "relationship_property_rows_misses",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.cache.relationship_property_rows.misses",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.cache.relationship_property_rows.misses"),
     },
     OtelCounter {
         source: CounterSource::ShardCache,
@@ -945,11 +1375,28 @@ pub const OTEL_CLASS_COUNTERS: &[OtelCounter] = &[
     },
 ];
 
-/// The OTel row for a `(source, field)` pair, over both counter tables.
+/// The OTel names for the counters dimensioned by stage, error class and
+/// failure reason. Named, like every client row, so the two exports cannot
+/// disagree about the family once `CounterSource::Client` is recorded.
+pub const OTEL_FAILURE_COUNTERS: &[OtelCounter] = &[
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "queries_failed_by_reason_legacy",
+        export: OtelCounterExport::Global("hydradb.client.queries.failed.by_reason"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "queries_failed_by_reason_experimental",
+        export: OtelCounterExport::Global("hydradb.client.queries.failed.by_reason"),
+    },
+];
+
+/// The OTel row for a `(source, field)` pair, over every counter table.
 pub fn otel_counter(source: CounterSource, field: &str) -> Option<&'static OtelCounter> {
     OTEL_COUNTERS
         .iter()
         .chain(OTEL_CLASS_COUNTERS)
+        .chain(OTEL_FAILURE_COUNTERS)
         .find(|export| export.source == source && export.field == field)
 }
 
@@ -1026,7 +1473,7 @@ pub fn otel_counter_instruments() -> Vec<&'static OtelCounter> {
 /// but a deterministic order is what lets a test assert on the whole return value
 /// instead of searching it.
 pub fn shard_counter_totals(
-    shards: &[slatedb_graph_kernel::ScopedGraphShardRuntimeMetrics],
+    shards: &[hydradb::ScopedGraphShardRuntimeMetrics],
 ) -> Vec<(&str, Vec<(&'static str, u64)>)> {
     let mut totals: std::collections::BTreeMap<&str, Vec<(&'static str, u64)>> =
         std::collections::BTreeMap::new();
@@ -1082,7 +1529,7 @@ impl NodeHistograms {
     /// conflict. The grouping is [`otel_instrument_groups`].
     ///
     /// The ladder comes from the kernel
-    /// ([`slatedb_graph_kernel::DURATION_BUCKET_BOUNDS_US`]) rather than being
+    /// ([`hydradb::DURATION_BUCKET_BOUNDS_US`]) rather than being
     /// restated here, so the Prometheus rendering in [`crate::admin`] and this
     /// one cannot disagree about where a bucket ends.
     pub fn register(
@@ -1096,7 +1543,7 @@ impl NodeHistograms {
             // Every row in a group shares the instrument, so its unit and
             // description have to be the group's, not the row's. A group whose
             // rows disagree about either is caught by
-            // `rows_sharing_a_name_are_told_apart_by_the_operation_label`.
+            // `rows_sharing_a_name_are_told_apart_by_the_operation_and_engine_labels`.
             let first = rows.first().expect("a group has at least one row");
             let histogram = std::sync::Arc::new(ObservableHistogram::register(
                 &meter,
@@ -1105,7 +1552,7 @@ impl NodeHistograms {
                     description: first.description,
                     unit: first.unit.meter_unit(),
                 },
-                &slatedb_graph_kernel::DURATION_BUCKET_BOUNDS_US,
+                &hydradb::DURATION_BUCKET_BOUNDS_US,
             )?);
             for row in rows {
                 registered.insert(
@@ -1150,34 +1597,50 @@ impl NodeHistograms {
     /// database view keys on, and putting `db.*` names on the wire while
     /// omitting it would pay the cost of §1.9's vocabulary split and collect
     /// none of the benefit. `db.operation.name` is added by [`Self::record`]
-    /// from the name table, which is what makes `read_latency` and
-    /// `write_latency` two series of the one semconv instrument.
+    /// from the name table, which is what makes the read and write fields two
+    /// series of the one semconv instrument.
     ///
     /// It carries no `scope`, and therefore no `db.namespace`: that is §1.4's
     /// whole point, and the label registry makes it a type error rather than a
     /// review comment.
+    ///
+    /// `hydradb.cypher_engine` is the engine that ran the statements in the
+    /// field being recorded, `legacy` or `experimental`, and comes from the
+    /// field rather than from the service: a node the kill switch has flipped
+    /// holds both populations, and labelling them by the node's current engine
+    /// would move a whole history between engines at the next collection. What
+    /// it buys is the ability to overlay legacy and experimental on one latency
+    /// panel and read the gap without a join on the instance.
     pub fn record_client(
         &self,
-        snapshot: &slatedb_graph_kernel::ClientQueryMetricsSnapshot,
+        snapshot: &hydradb::ClientQueryMetricsSnapshot,
     ) -> Result<(), hydradb_telemetry::meter::HistogramError> {
-        use hydradb_telemetry::semconv::{DB_SYSTEM_NEO4J, L_DB_SYSTEM_NAME};
+        use hydradb_telemetry::semconv::{DB_SYSTEM_NEO4J, L_CYPHER_ENGINE, L_DB_SYSTEM_NAME};
 
+        let system = (L_DB_SYSTEM_NAME, DB_SYSTEM_NEO4J);
         for (field, histogram) in snapshot.histogram_fields() {
-            self.record(field, &[(L_DB_SYSTEM_NAME, DB_SYSTEM_NEO4J)], histogram)?;
+            // Same split as `/metrics`: the execution families carry the
+            // engine, the bookmark-wait family does not.
+            match crate::admin::cypher_engine_label(field) {
+                Some(engine) => {
+                    self.record(field, &[system, (L_CYPHER_ENGINE, engine)], histogram)?
+                }
+                None => self.record(field, &[system], histogram)?,
+            }
         }
         Ok(())
     }
 
     /// One shard's operational histograms, labelled by `cell_id` alone.
     ///
-    /// Never `cell_id × edge_type`: an 18-bucket family times 96 is 1,728
+    /// Never `cell_id × edge_type`: a 21-bucket family times 96 is 2,016
     /// series per instrument per node, which is where §1.3's cardinality
     /// arithmetic stops being affordable. And never `scope`, which `/metrics`
     /// does carry — that divergence is deliberate and is the reason both
     /// exports exist.
     pub fn record_shard(
         &self,
-        metrics: &slatedb_graph_kernel::ScopedGraphShardRuntimeMetrics,
+        metrics: &hydradb::ScopedGraphShardRuntimeMetrics,
     ) -> Result<(), hydradb_telemetry::meter::HistogramError> {
         use hydradb_telemetry::semconv::L_CELL_ID;
 
@@ -1204,7 +1667,7 @@ impl NodeHistograms {
     /// snapshot it will never see.
     pub fn record_transport(
         &self,
-        snapshot: &slatedb_graph_kernel::QueryTransportMetricsSnapshot,
+        snapshot: &hydradb::QueryTransportMetricsSnapshot,
     ) -> Result<(), hydradb_telemetry::meter::HistogramError> {
         for (field, histogram) in snapshot.histogram_fields() {
             self.record(field, &[], histogram)?;
@@ -1321,7 +1784,7 @@ impl NodeCounters {
     /// in the registry at all.
     pub fn record_shard_totals(
         &self,
-        shards: &[slatedb_graph_kernel::ScopedGraphShardRuntimeMetrics],
+        shards: &[hydradb::ScopedGraphShardRuntimeMetrics],
     ) -> Result<(), hydradb_telemetry::meter::CounterError> {
         use hydradb_telemetry::semconv::L_CELL_ID;
 
@@ -1399,8 +1862,8 @@ impl MetricCollection {
     pub fn start(
         telemetry: &hydradb_telemetry::TelemetryGuard,
         interval: std::time::Duration,
-        query: slatedb_graph_kernel::ClientQueryService,
-        node: std::sync::Arc<slatedb_graph_kernel::ScopedRoutedGraphCluster>,
+        query: hydradb::ClientQueryService,
+        node: std::sync::Arc<hydradb::ScopedRoutedGraphCluster>,
     ) -> Self {
         let Some(providers) = telemetry.providers() else {
             // No endpoint: there is no metrics pipeline to feed, so taking the
@@ -1414,7 +1877,15 @@ impl MetricCollection {
                 return Self { running: None };
             }
         };
+        let memory = match memory_diagnostics::Instruments::register(providers) {
+            Ok(memory) => memory,
+            Err(error) => {
+                tracing::warn!(%error, "memory diagnostics did not register; no metrics will be exported");
+                return Self { running: None };
+            }
+        };
         let instruments = std::sync::Arc::new(NodeInstruments {
+            memory,
             histograms,
             counters: NodeCounters::register(providers),
         });
@@ -1436,8 +1907,8 @@ impl MetricCollection {
     pub fn start(
         _telemetry: &hydradb_telemetry::TelemetryGuard,
         _interval: std::time::Duration,
-        _query: slatedb_graph_kernel::ClientQueryService,
-        _node: std::sync::Arc<slatedb_graph_kernel::ScopedRoutedGraphCluster>,
+        _query: hydradb::ClientQueryService,
+        _node: std::sync::Arc<hydradb::ScopedRoutedGraphCluster>,
     ) -> Self {
         Self {}
     }
@@ -1473,6 +1944,7 @@ impl std::fmt::Debug for MetricCollection {
 #[cfg(feature = "otlp")]
 #[derive(Debug)]
 struct NodeInstruments {
+    memory: memory_diagnostics::Instruments,
     histograms: NodeHistograms,
     counters: NodeCounters,
 }
@@ -1491,14 +1963,16 @@ struct NodeInstruments {
 #[cfg(feature = "otlp")]
 async fn collect_once(
     instruments: &NodeInstruments,
-    query: &slatedb_graph_kernel::ClientQueryService,
-    node: &slatedb_graph_kernel::ScopedRoutedGraphCluster,
+    query: &hydradb::ClientQueryService,
+    node: &hydradb::ScopedRoutedGraphCluster,
     shard_budget: std::time::Duration,
 ) {
     let NodeInstruments {
         histograms,
         counters,
+        memory,
     } = instruments;
+    memory.record();
     if let Err(error) = histograms.record_client(&query.metrics()) {
         tracing::warn!(error = %error, "client query histograms were not published");
     }
@@ -1546,8 +2020,8 @@ async fn collect_once(
 #[cfg(feature = "otlp")]
 async fn collect_forever(
     instruments: std::sync::Arc<NodeInstruments>,
-    query: slatedb_graph_kernel::ClientQueryService,
-    node: std::sync::Arc<slatedb_graph_kernel::ScopedRoutedGraphCluster>,
+    query: hydradb::ClientQueryService,
+    node: std::sync::Arc<hydradb::ScopedRoutedGraphCluster>,
     interval: std::time::Duration,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -1579,7 +2053,7 @@ async fn collect_forever(
 
 #[cfg(test)]
 mod tests {
-    use slatedb_graph_kernel::{
+    use hydradb::{
         ClientQueryMetricsSnapshot, GraphCacheMetricsSnapshot, GraphId,
         GraphOperationalMetricsSnapshot, GraphScope, GraphShardRuntimeMetrics, NamespaceId,
         QueryTransportMetricsSnapshot, ScopedGraphShardRuntimeMetrics, DURATION_BUCKET_BOUNDS_US,
@@ -1589,7 +2063,8 @@ mod tests {
     use super::*;
     use crate::admin::{
         prometheus_counter, prometheus_histogram, PrometheusCounterExport,
-        PROMETHEUS_CLASS_COUNTERS, PROMETHEUS_COUNTERS, PROMETHEUS_HISTOGRAMS,
+        PROMETHEUS_CLASS_COUNTERS, PROMETHEUS_COUNTERS, PROMETHEUS_FAILURE_COUNTERS,
+        PROMETHEUS_HISTOGRAMS,
     };
 
     /// Every histogram field the kernel enumerates, from every snapshot type
@@ -1675,6 +2150,11 @@ mod tests {
                 .map(|(field, _, _)| (CounterSource::Client, field)),
         );
         fields.extend(
+            client
+                .failure_counter_fields()
+                .map(|(field, ..)| (CounterSource::Client, field)),
+        );
+        fields.extend(
             operational
                 .counter_fields()
                 .map(|(field, _)| (CounterSource::Shard, field)),
@@ -1695,11 +2175,12 @@ mod tests {
 
     /// §1.6, for counters. The same property
     /// [`every_histogram_field_reaches_both_exports`] holds for the five
-    /// duration histograms, over the sixty-five counters that are the actual
+    /// duration histograms, over the sixty-nine operational counters that are
+    /// part of the actual
     /// gap: `/metrics` exported eight of them before M2.
     ///
     /// The reverse direction matters more here than it did for histograms. A
-    /// name table with sixty-five rows can grow a row for a field that was
+    /// name table can grow a row for a field that was
     /// renamed or deleted and nothing else will ever notice, and a dead row
     /// reads exactly like a live counter whose recording site is missing.
     #[test]
@@ -1707,9 +2188,10 @@ mod tests {
         let enumerated = enumerated_counter_fields();
         assert_eq!(
             enumerated.len(),
-            67,
-            "35 operational + 19 cache + 11 client counters, plus the two \
-             error-class breakdowns: {enumerated:#?}"
+            128,
+            "86 operational + 19 cache + 19 client counters, plus the two \
+             error-class breakdowns and the two failure-reason breakdowns, one \
+             per engine: {enumerated:#?}"
         );
 
         for (source, field) in &enumerated {
@@ -1723,7 +2205,11 @@ mod tests {
             );
         }
 
-        for export in OTEL_COUNTERS.iter().chain(OTEL_CLASS_COUNTERS) {
+        for export in OTEL_COUNTERS
+            .iter()
+            .chain(OTEL_CLASS_COUNTERS)
+            .chain(OTEL_FAILURE_COUNTERS)
+        {
             assert!(
                 enumerated.contains(&(export.source, export.field)),
                 "OTEL_COUNTERS names {:?}::{}, which no snapshot enumerates",
@@ -1731,7 +2217,11 @@ mod tests {
                 export.field
             );
         }
-        for export in PROMETHEUS_COUNTERS.iter().chain(PROMETHEUS_CLASS_COUNTERS) {
+        for export in PROMETHEUS_COUNTERS
+            .iter()
+            .chain(PROMETHEUS_CLASS_COUNTERS)
+            .chain(PROMETHEUS_FAILURE_COUNTERS)
+        {
             assert!(
                 enumerated.contains(&(export.source, export.field)),
                 "PROMETHEUS_COUNTERS names {:?}::{}, which no snapshot enumerates",
@@ -1827,9 +2317,9 @@ mod tests {
     ///   counter added to `QueryTransportMetricsSnapshot` fails here instead of
     ///   joining a silent gap — and a counter *removed* from it leaves a dead
     ///   entry that also fails.
-    /// - Every counter the kernel declares is accounted for: the sixty-seven rows
+    /// - Every counter the kernel declares is accounted for: the 108 rows
     ///   `every_counter_field_reaches_both_exports` covers plus these
-    ///   twenty-three is the whole of it, so "sixty-five exported" is a complete
+    ///   twenty-three is the whole of it, so "108 exported" is a complete
     ///   statement rather than a count of what somebody got round to.
     /// - Where a transport identifier *does* have a name-table row, a `graph-node`
     ///   snapshot must also enumerate it. Otherwise the row would be exporting a
@@ -1852,7 +2342,7 @@ mod tests {
         let exported = enumerated_counter_fields();
         assert_eq!(
             exported.len() + TRANSPORT_ONLY_COUNTERS.len(),
-            67 + 23,
+            128 + 23,
             "every counter the kernel declares is either exported or pinned here"
         );
 
@@ -1980,11 +2470,31 @@ mod tests {
     /// the test that made [`PrometheusCounterExport::Derived`] exist.
     #[test]
     fn no_two_metrics_share_an_exported_name() {
+        // A histogram family may be exported by more than one field — the two
+        // engines are two series of one family, told apart by a label and not
+        // by a name — so the family names are deduplicated before the check.
+        // What this test is about is a *counter* and a *histogram* colliding,
+        // which is a rejected scrape rather than an extra series.
+        let mut histogram_names: Vec<&str> = PROMETHEUS_HISTOGRAMS
+            .iter()
+            .map(|export| export.name)
+            .collect();
+        histogram_names.sort_unstable();
+        histogram_names.dedup();
+        // Same deduplication, same reason: the failure family is one name per
+        // engine, told apart by `cypher_engine`.
+        let mut failure_names: Vec<&str> = PROMETHEUS_FAILURE_COUNTERS
+            .iter()
+            .filter_map(|export| export.export.name())
+            .collect();
+        failure_names.sort_unstable();
+        failure_names.dedup();
         let mut prometheus: Vec<&str> = PROMETHEUS_COUNTERS
             .iter()
             .chain(PROMETHEUS_CLASS_COUNTERS)
             .filter_map(|export| export.export.name())
-            .chain(PROMETHEUS_HISTOGRAMS.iter().map(|export| export.name))
+            .chain(failure_names)
+            .chain(histogram_names)
             .collect();
         let before = prometheus.len();
         prometheus.sort_unstable();
@@ -2002,10 +2512,19 @@ mod tests {
         let mut histograms: Vec<&str> = OTEL_HISTOGRAMS.iter().map(|export| export.name).collect();
         histograms.sort_unstable();
         histograms.dedup();
+        // And the failure family is one name per engine, told apart by
+        // `hydradb.cypher_engine`.
+        let mut failures: Vec<&str> = OTEL_FAILURE_COUNTERS
+            .iter()
+            .filter_map(|export| export.export.name())
+            .collect();
+        failures.sort_unstable();
+        failures.dedup();
         let mut otel: Vec<&str> = OTEL_COUNTERS
             .iter()
             .chain(OTEL_CLASS_COUNTERS)
             .filter_map(|export| export.export.name())
+            .chain(failures)
             .chain(histograms)
             .collect();
         let before = otel.len();
@@ -2079,18 +2598,30 @@ mod tests {
     /// record of each interval simply overwrites the first.
     ///
     /// So the uniqueness this asserts is over the *series identity*, not over
-    /// the name: `(name, operation)`. `db.client.operation.duration` is
-    /// deliberately two rows; both taking the bare name with `operation: None`
-    /// is the failure.
+    /// the name: `(name, operation, cypher_engine)`. `db.client.operation.duration`
+    /// is deliberately four rows — read and write, each on two engines; two of
+    /// them taking the same name, operation and engine is the failure.
     #[test]
     fn no_two_fields_share_an_exported_series_identity() {
-        let otel: Vec<(&str, Option<&str>)> = OTEL_HISTOGRAMS
+        let otel: Vec<(&str, Option<&str>, Option<&str>)> = OTEL_HISTOGRAMS
             .iter()
-            .map(|export| (export.name, export.operation))
+            .map(|export| {
+                (
+                    export.name,
+                    export.operation,
+                    crate::admin::cypher_engine_label(export.field),
+                )
+            })
             .collect();
-        let prometheus: Vec<(&str, Option<&str>)> = PROMETHEUS_HISTOGRAMS
+        let prometheus: Vec<(&str, Option<&str>, Option<&str>)> = PROMETHEUS_HISTOGRAMS
             .iter()
-            .map(|export| (export.name, None))
+            .map(|export| {
+                (
+                    export.name,
+                    None,
+                    crate::admin::cypher_engine_label(export.field),
+                )
+            })
             .collect();
         for table in [otel, prometheus] {
             let mut sorted = table.clone();
@@ -2114,12 +2645,12 @@ mod tests {
     /// exactly the case where every row must carry a distinct
     /// `db.operation.name`.
     #[test]
-    fn rows_sharing_a_name_are_told_apart_by_the_operation_label() {
+    fn rows_sharing_a_name_are_told_apart_by_the_operation_and_engine_labels() {
         let groups = otel_instrument_groups();
         assert_eq!(
             groups.len(),
-            4,
-            "read and write share one instrument; the three hydradb.* metrics do not: {groups:#?}"
+            13,
+            "read and write share one instrument; the twelve hydradb.* metrics do not: {groups:#?}"
         );
 
         for (name, rows) in &groups {
@@ -2137,12 +2668,16 @@ mod tests {
             if rows.len() == 1 {
                 continue;
             }
-            let mut operations: Vec<&str> = rows
+            let mut operations: Vec<(&str, Option<&str>)> = rows
                 .iter()
                 .map(|row| {
-                    row.operation.unwrap_or_else(|| {
+                    let operation = row.operation.unwrap_or_else(|| {
                         panic!("{} shares the name {name} but carries no operation label, so its series would merge", row.field)
-                    })
+                    });
+                    // The engine is the second half of the identity: the read
+                    // rows share `operation: read` and are kept apart by
+                    // `hydradb.cypher_engine` alone.
+                    (operation, crate::admin::cypher_engine_label(row.field))
                 })
                 .collect();
             let before = operations.len();
@@ -2151,7 +2686,7 @@ mod tests {
             assert_eq!(
                 before,
                 operations.len(),
-                "{name} has two rows claiming the same operation"
+                "{name} has two rows claiming the same operation and engine"
             );
         }
 
@@ -2161,7 +2696,15 @@ mod tests {
             .expect("the one metric with a stable semantic convention");
         let mut fields: Vec<&str> = client.1.iter().map(|row| row.field).collect();
         fields.sort_unstable();
-        assert_eq!(fields, vec!["read_latency", "write_latency"]);
+        assert_eq!(
+            fields,
+            vec![
+                "read_latency_experimental",
+                "read_latency_legacy",
+                "write_latency_experimental",
+                "write_latency_legacy",
+            ]
+        );
     }
 
     /// The semconv name is the *whole* name. A suffix would make it a HydraDB
@@ -2189,8 +2732,9 @@ mod tests {
                 .any(|label| label.key() == "db.namespace"),
             "db.namespace became a metric label"
         );
-        assert!(hydradb_telemetry::semconv::SPAN_ONLY_KEYS
-            .contains(&hydradb_telemetry::semconv::SCOPE));
+        assert!(
+            hydradb_telemetry::semconv::SPAN_ONLY_KEYS.contains(&hydradb_telemetry::semconv::SCOPE)
+        );
     }
 
     /// `le` is the join between the two exports. The seconds rendering is the
@@ -2202,14 +2746,14 @@ mod tests {
             .map(|bound| ExportUnit::Microseconds.render_bound(*bound))
             .collect();
         assert_eq!(microseconds.first().map(String::as_str), Some("100"));
-        assert_eq!(microseconds.last().map(String::as_str), Some("30000000"));
+        assert_eq!(microseconds.last().map(String::as_str), Some("300000000"));
 
         let seconds: Vec<String> = DURATION_BUCKET_BOUNDS_US
             .iter()
             .map(|bound| ExportUnit::Seconds.render_bound(*bound))
             .collect();
         assert_eq!(seconds.first().map(String::as_str), Some("0.0001"));
-        assert_eq!(seconds.last().map(String::as_str), Some("30"));
+        assert_eq!(seconds.last().map(String::as_str), Some("300"));
         assert_eq!(ExportUnit::Seconds.render_sum(2_500_000), "2.5");
         assert_eq!(ExportUnit::Microseconds.render_sum(2_500_000), "2500000");
     }
@@ -2250,6 +2794,7 @@ mod tests {
                     cache: GraphCacheMetricsSnapshot::default(),
                     cache_entries: Default::default(),
                     cache_resident_bytes: Default::default(),
+                    storage: Default::default(),
                 },
             },
         )
@@ -2280,7 +2825,7 @@ mod tests {
             .collect();
         assert_eq!(
             enumerated.len(),
-            35,
+            86,
             "the operational snapshot's scalar counters changed: {enumerated:#?}"
         );
 
@@ -2330,7 +2875,7 @@ mod tests {
         );
 
         let instruments = otel_counter_instruments();
-        for row in OTEL_CLASS_COUNTERS {
+        for row in OTEL_CLASS_COUNTERS.iter().chain(OTEL_FAILURE_COUNTERS) {
             assert!(
                 !instruments
                     .iter()

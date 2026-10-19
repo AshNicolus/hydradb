@@ -11,6 +11,10 @@ spec:
   podManagementPolicy: Parallel
   updateStrategy:
     type: {{ .Values.node.updateStrategy }}
+    {{- if eq .Values.node.updateStrategy "RollingUpdate" }}
+    rollingUpdate:
+      partition: {{ .Values.node.rollingUpdatePartition }}
+    {{- end }}
   selector:
     matchLabels:
       {{- include "hydradb.componentLabels" (dict "root" . "component" "node") | nindent 6 }}
@@ -83,6 +87,14 @@ spec:
         - name: graph-node
           image: {{ include "hydradb.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.node.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.node.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "hydradb.fullname" . }}-runtime

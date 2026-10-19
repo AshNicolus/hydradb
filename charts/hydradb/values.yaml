@@ -52,6 +52,10 @@ tls:
       name: ""
       sourceSecretName: ""
       sourceSecretKey: tls.crt
+      # Extra trust-manager Bundle sources used for CA overlap during rotation
+      # or migration. Every source must exist in trust-manager's configured
+      # trust namespace.
+      additionalSources: []
       namespaceSelector: {}
   certManager:
     enabled: false
@@ -73,6 +77,10 @@ node:
   priorityClassName: ""
   terminationGracePeriodSeconds: 60
   updateStrategy: RollingUpdate
+  rollingUpdatePartition: 0
+  # Optional entrypoint override; empty lists preserve the image defaults.
+  command: []
+  args: []
   resources:
     requests:
       cpu: "2"
@@ -105,6 +113,9 @@ indexer:
   enabled: true
   replicaCount: 1
   intervalMs: 5000
+  # Poll durable post-write scope hints independently of the fair full sweep.
+  # This controls changed-graph discovery latency, not build frequency.
+  dirtyPollIntervalMs: 250
   retainPreviousGenerations: 1
   # "full" preserves the pre-incremental behavior. Set "incremental" after
   # validating the workload; unavailable or oversized WAL tails still fall
@@ -121,9 +132,9 @@ indexer:
   # advances the durable fair-scan cursor.
   scopesPerCycle: 256
   # Maximum read-only scope handles retained between indexing cycles. Reusing
-  # a hot handle avoids replaying the same durable SlateDB WAL. Idle one-time
-  # scan readers are closed instead of polluting this cache. Must be at least
-  # scopeConcurrency.
+  # a handle avoids reopening its SlateDB reader and replaying durable state.
+  # Size this for the registered scope population when memory permits; excess
+  # scopes use bounded one-cycle readers. Must be at least scopeConcurrency.
   maxOpenScopes: 128
   # Keep serving readiness across isolated object-store failures. Consecutive
   # failed bounded cycles at this threshold mark the Pod unready.
@@ -172,8 +183,16 @@ service:
   adminPort: 9090
 
 runtime:
-  rustLog: info,slatedb_graph_kernel=info
+  rustLog: info,hydradb=info
   maxOpenScopes: 8
+  # One process-wide SlateDB RAM cache shared by every open reader and writer.
+  # This is separate from node.cache.memoryLimitBytes, which budgets the
+  # disposable on-disk object-store cache. Set to 0 to disable RAM admission.
+  slatedbCacheBytes: 671088640
+  # Process-wide limit for file handles retained by SlateDB's disposable disk
+  # caches. It must provide at least one handle for each possible scope/cell
+  # reader and writer; the runtime partitions this value across those handles.
+  dataCacheMaxOpenFiles: 512
   # Parallel immutable WAL reads used to establish or refresh a cold SlateDB
   # reader. This bounds object-store fan-out independently for each open scope.
   readerWalReplayConcurrency: 16
@@ -189,6 +208,9 @@ runtime:
   boltMaxConnectionAgeMs: 3600000
   defaultPageSize: 1024
   gracefulShutdownMs: 30000
+  # Maximum time a non-empty SlateDB WAL may wait before durable object-store
+  # flush. Concurrent writes arriving inside this window share one WAL object.
+  walFlushIntervalMs: 50
   l0SstSizeBytes: 16777216
   maxUnflushedBytes: 67108864
   # Consolidate sparse durable writes before thousands of tiny WAL objects can
@@ -237,7 +259,7 @@ serviceMonitor:
   labels: {}
 
 tests:
-  enabled: true
+  enabled: false
   image:
     repository: curlimages/curl
     tag: "8.14.1"

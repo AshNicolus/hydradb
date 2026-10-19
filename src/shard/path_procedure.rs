@@ -10,6 +10,7 @@ use crate::query::path_procedure::{
     NativePathDirection, NativePathNodeSelector, NativePathProcedure, NativePathProcedureKind,
     NativePathProjection,
 };
+use crate::QueryFailureReason;
 use crate::{
     QueryCursorToken, QueryPath, QueryPathNode, QueryPathRelationship, QueryResultPage,
     QueryResultSet, QueryRow, QueryValue,
@@ -69,6 +70,7 @@ impl GraphShard {
     ) -> Result<QueryResultPage> {
         if page_size == 0 {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "OpenCypher",
                 feature: "native path page size must be greater than zero".to_string(),
             });
@@ -153,6 +155,7 @@ impl GraphShard {
         purge_native_path_page_cursors(&mut store);
         let Some(stored) = store.cursors.get(&cursor.offset) else {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "OpenCypher",
                 feature: "native path cursor is unknown or expired".to_string(),
             });
@@ -163,6 +166,7 @@ impl GraphShard {
             || stored.parameters != context.parameters
         {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "OpenCypher",
                 feature: "native path cursor does not belong to this query".to_string(),
             });
@@ -206,6 +210,7 @@ impl GraphShard {
             hydradb.read_epoch = tracing::field::Empty,
             hydradb.query.rows_returned = tracing::field::Empty,
             error.class = tracing::field::Empty,
+            error.operation = tracing::field::Empty,
             hydradb.sampling.tail_keep = tracing::field::Empty,
         );
         let result = self
@@ -231,6 +236,9 @@ impl GraphShard {
             Err(error) => {
                 self.operation_metrics.record_query_rows_failure(error);
                 span.record("error.class", error.class());
+                if let Some(operation) = error.limit_operation() {
+                    span.record("error.operation", operation);
+                }
                 span.record("hydradb.sampling.tail_keep", "error");
             }
         }
@@ -244,6 +252,7 @@ impl GraphShard {
     ) -> Result<QueryResultSet> {
         if context.read_epoch.is_some() && context.validated_read_epoch().is_none() {
             return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
                 dialect: "OpenCypher",
                 feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot"
                     .to_string(),

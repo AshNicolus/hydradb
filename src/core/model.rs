@@ -36,6 +36,11 @@ pub struct GraphCorrectnessReport {
     pub relationship_records: u64,
     pub relationship_count_counters: u64,
     pub relationship_property_indexes: u64,
+    /// `rmerge_idx` identity pointers present for this edge type. Verified
+    /// against the invariant that a pointer names the single live
+    /// relationship carrying its identity; a missing pointer is never a
+    /// mismatch because heal-on-read earns them lazily.
+    pub relationship_merge_indexes: u64,
     pub matrix_edges_checked: u64,
     pub traversal_roots_checked: u64,
     pub mismatch_count: u64,
@@ -335,6 +340,14 @@ pub struct RelationshipImportResult {
     pub relationships_already_existed: u64,
     pub structural_edges_inserted: u64,
     pub structural_edges_already_existed: u64,
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RelationshipDeleteBatchResult {
+    pub(crate) deleted: u64,
+    pub(crate) already_deleted: u64,
+    pub(crate) topology_sequence: Option<StorageSequence>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

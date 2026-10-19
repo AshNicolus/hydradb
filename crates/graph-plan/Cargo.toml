@@ -1,0 +1,13 @@
+[package]
+name = "hydradb-graph-plan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Semantic graph IR and KV physical plans for HydraDB"
+publish = false
+
+[dependencies]
+hydradb-cypher-ast = { path = "../cypher-ast" }
+
+[dev-dependencies]
+hydradb-cypher-parser-antlr = { path = "../cypher-parser-antlr" }

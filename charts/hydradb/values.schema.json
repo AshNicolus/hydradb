@@ -94,6 +94,61 @@
                 "name": { "type": "string" },
                 "sourceSecretName": { "type": "string" },
                 "sourceSecretKey": { "type": "string", "minLength": 1 },
+                "additionalSources": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["secret"],
+                        "properties": {
+                          "secret": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["name", "key"],
+                            "properties": {
+                              "name": { "type": "string", "minLength": 1 },
+                              "key": { "type": "string", "minLength": 1 }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["configMap"],
+                        "properties": {
+                          "configMap": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["name", "key"],
+                            "properties": {
+                              "name": { "type": "string", "minLength": 1 },
+                              "key": { "type": "string", "minLength": 1 }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["inLine"],
+                        "properties": {
+                          "inLine": { "type": "string", "minLength": 1 }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["useDefaultCAs"],
+                        "properties": {
+                          "useDefaultCAs": { "const": true }
+                        }
+                      }
+                    ]
+                  }
+                },
                 "namespaceSelector": { "type": "object" }
               }
             }
@@ -143,6 +198,8 @@
       "properties": {
         "rustLog": { "type": "string" },
         "maxOpenScopes": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "slatedbCacheBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "dataCacheMaxOpenFiles": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "readerWalReplayConcurrency": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "maxConcurrentQueries": { "$ref": "#/definitions/unsignedDecimal" },
         "maxQueryScanEdges": { "$ref": "#/definitions/unsignedDecimal" },
@@ -156,9 +213,22 @@
         "boltMaxConnectionAgeMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "defaultPageSize": { "$ref": "#/definitions/unsignedDecimal" },
         "gracefulShutdownMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "walFlushIntervalMs": { "type": "integer", "minimum": 1, "maximum": 1000 },
         "l0SstSizeBytes": { "$ref": "#/definitions/unsignedDecimal" },
         "maxUnflushedBytes": { "$ref": "#/definitions/unsignedDecimal" },
-        "maxWalFlushesBeforeL0Flush": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "maxWalFlushesBeforeL0Flush": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            {
+              "type": "string",
+              "pattern": "^0*(?:[1-9][0-9]{0,2}|[1-3][0-9]{3}|40(?:[0-8][0-9]|9[0-6]))$"
+            }
+          ]
+        },
         "l0FlushParallelism": { "$ref": "#/definitions/unsignedDecimal" },
         "maxMatrixAdjacencies": { "$ref": "#/definitions/unsignedDecimal" },
         "maxMatrixAdjacencyBytes": { "$ref": "#/definitions/unsignedDecimal" },
@@ -183,6 +253,10 @@
       "required": ["replicaCount", "cache", "resources"],
       "properties": {
         "replicaCount": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "updateStrategy": { "enum": ["RollingUpdate", "OnDelete"] },
+        "rollingUpdatePartition": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "command": { "type": "array", "items": { "type": "string" } },
+        "args": { "type": "array", "items": { "type": "string" } },
         "resources": { "type": "object" },
         "cache": {
           "type": "object",
@@ -199,17 +273,18 @@
     "indexerWorkload": {
       "type": "object",
       "$comment": "templates/validate.yaml enforces maxOpenScopes and scopesPerCycle >= scopeConcurrency because JSON Schema draft-07 cannot compare sibling numeric values",
-      "required": ["enabled", "replicaCount", "intervalMs", "retainPreviousGenerations", "buildMode", "incrementalMinEdges", "scopeConcurrency", "scopesPerCycle", "maxOpenScopes", "readinessFailureThreshold", "maxWalTailFiles", "walTailFetchConcurrency", "resources", "serviceAccount"],
+      "required": ["enabled", "replicaCount", "intervalMs", "dirtyPollIntervalMs", "retainPreviousGenerations", "buildMode", "incrementalMinEdges", "scopeConcurrency", "scopesPerCycle", "maxOpenScopes", "readinessFailureThreshold", "maxWalTailFiles", "walTailFetchConcurrency", "resources", "serviceAccount"],
       "properties": {
         "enabled": { "type": "boolean" },
         "replicaCount": { "type": "integer", "minimum": 1, "maximum": 100 },
         "intervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "dirtyPollIntervalMs": { "type": "integer", "minimum": 50, "maximum": 60000 },
         "retainPreviousGenerations": { "$ref": "#/definitions/unsignedDecimal" },
         "buildMode": { "enum": ["full", "incremental"] },
         "incrementalMinEdges": { "$ref": "#/definitions/unsignedDecimal" },
         "scopeConcurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
         "scopesPerCycle": { "type": "integer", "minimum": 1, "maximum": 16384 },
-        "maxOpenScopes": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "maxOpenScopes": { "type": "integer", "minimum": 1, "maximum": 16384 },
         "readinessFailureThreshold": { "type": "integer", "minimum": 1, "maximum": 100 },
         "maxWalTailFiles": { "$ref": "#/definitions/unsignedDecimal" },
         "walTailFetchConcurrency": { "$ref": "#/definitions/positiveUnsignedDecimal" },

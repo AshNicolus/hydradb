@@ -1,0 +1,9 @@
+[package]
+name = "hydradb-cypher-ast"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Parser-independent Cypher abstract syntax tree for HydraDB"
+publish = false
+
+[dependencies]

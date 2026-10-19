@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use slatedb_graph_kernel::{
+use hydradb::{
     BoltRoutingServer, BoltServerConfig, ClientBoltServer, ClientQueryService,
     ClientQueryServiceConfig, ClientQueryTarget, GraphScope, QueryCellClient, QueryColumn,
     QueryContext, QueryCursorToken, QueryResultPage, QueryResultSet, QueryRow,
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     let addr = std::env::var("BOLT_COMPAT_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:17687".to_string())
         .parse::<std::net::SocketAddr>()
-        .map_err(|err| slatedb_graph_kernel::GraphError::CorruptValue {
+        .map_err(|err| hydradb::GraphError::CorruptValue {
             key: "BOLT_COMPAT_ADDR".to_string(),
             reason: err.to_string(),
         })?;

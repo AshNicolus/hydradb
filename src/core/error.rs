@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+pub use hydradb_cypher_ast::QueryFailureReason;
 use thiserror::Error;
 
 use crate::StorageSequence;
@@ -195,8 +196,33 @@ pub enum GraphError {
         elapsed_ms: u64,
         limit_ms: u64,
     },
+    #[error("{operation} could not allocate query working memory: {reason}")]
+    QueryAllocation {
+        operation: &'static str,
+        reason: String,
+    },
+    /// Also carries request misuse and evaluation failures that predate a
+    /// dedicated variant; `reason` is what tells them apart for metrics, and
+    /// never appears in the message.
     #[error("{dialect} query is not supported yet: {feature}")]
     UnsupportedQuery {
+        dialect: &'static str,
+        feature: String,
+        reason: QueryFailureReason,
+    },
+    /// A failure that has always surfaced as `UnsupportedQuery` but whose real
+    /// cause is unknown here, so it carries no [`QueryFailureReason`]: a
+    /// failure another node reported over the query transport without one (a
+    /// timeout, admission, storage, or a peer too old to send one), or a
+    /// storage error the experimental engine received from its adapter as a
+    /// string (a timeout while reading, among others).
+    ///
+    /// Worded, classed and mapped to clients exactly as `UnsupportedQuery`, so
+    /// nothing a client or an existing series sees changes. It exists only so
+    /// the query-failure counter can leave it out rather than file a timeout
+    /// under `unsupported_other`.
+    #[error("{dialect} query is not supported yet: {feature}")]
+    UnclassifiedQuery {
         dialect: &'static str,
         feature: String,
     },
@@ -275,6 +301,34 @@ impl GraphError {
         Self::CLASSES[self.class_index()]
     }
 
+    /// Why a `query`-class failure happened, as a closed metric label.
+    ///
+    /// `Some` only when [`Self::class`] is `query`, and for every query-class
+    /// variant except [`Self::UnclassifiedQuery`], whose cause is unknown --
+    /// and which is usually not a query failure at all.
+    pub fn failure_reason(&self) -> Option<QueryFailureReason> {
+        match self {
+            Self::UnsupportedQuery { reason, .. } => Some(*reason),
+            Self::QueryParse { .. } => Some(QueryFailureReason::ParseError),
+            Self::MissingQueryParameter { .. } => Some(QueryFailureReason::Parameter),
+            Self::QueryAllocation { .. } => Some(QueryFailureReason::Other),
+            _ => None,
+        }
+    }
+
+    /// The bounded work or timeout operation carried by limit failures.
+    ///
+    /// Every producer supplies a static name, so this is safe to attach to
+    /// telemetry. Other error classes have no equivalent field.
+    pub fn limit_operation(&self) -> Option<&'static str> {
+        match self {
+            Self::AdmissionRejected { operation, .. } | Self::QueryTimeout { operation, .. } => {
+                Some(operation)
+            }
+            _ => None,
+        }
+    }
+
     /// The same classification as [`Self::class`], as a position in
     /// [`Self::CLASSES`].
     ///
@@ -313,6 +367,8 @@ impl GraphError {
 
             Self::QueryParse { .. }
             | Self::UnsupportedQuery { .. }
+            | Self::UnclassifiedQuery { .. }
+            | Self::QueryAllocation { .. }
             | Self::MissingQueryParameter { .. } => Self::CLASS_QUERY,
 
             Self::GraphScopeMismatch { .. } | Self::GraphScopeAccessDenied { .. } => {

@@ -1,6 +1,4 @@
-use slatedb_graph_kernel::{
-    object_store_from_env, EdgeMutation, GraphShard, Result, SparseKernelBackend,
-};
+use hydradb::{object_store_from_env, EdgeMutation, GraphShard, Result, SparseKernelBackend};
 
 #[tokio::main]
 async fn main() -> Result<()> {
