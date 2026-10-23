@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+  omp="$(brew --prefix libomp 2>/dev/null || true)"
+  if [[ -d "$omp/include" ]]; then
+    export CPATH="$omp/include${CPATH:+:$CPATH}"
+  fi
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STORE_ROOT="${GRAPH_LOCAL_OBJECT_ROOT:-$(mktemp -d)}"
 DB_BASE="${GRAPH_DB_BASE:-graph-multiprocess-$(date +%s)-$$}"
@@ -23,6 +30,25 @@ if [[ "${GRAPH_ENABLE_GRAPHBLAS:-0}" == "1" ]]; then
   export GRAPH_MATRIX_KERNEL="${GRAPH_MATRIX_KERNEL:-graphblas}"
 fi
 
+# --- portability shims (macOS has neither timeout nor setsid by default) ---
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then   # brew coreutils without gnubin on PATH
+  TIMEOUT_BIN=gtimeout
+else
+  echo "error: GNU timeout not found (macOS: brew install coreutils)" >&2
+  exit 1
+fi
+
+if command -v setsid >/dev/null 2>&1; then
+  SETSID=(setsid)
+elif command -v perl >/dev/null 2>&1; then
+  SETSID=(perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!"' --)
+else
+  echo "error: need setsid or perl" >&2
+  exit 1
+fi
+
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dgraph-target}"
 export GRAPH_OP_DELAY_MICROS="${GRAPH_OP_DELAY_MICROS:-1000}"
 export GRAPH_BULK_CHUNK="${GRAPH_BULK_CHUNK:-50}"
@@ -38,15 +64,15 @@ run_worker_for() {
   local src_id="$2"
   shift 2
   GRAPH_CELL_ID="$cell_id" GRAPH_SRC_ID="$src_id" GRAPH_INDEX_POLICY="${GRAPH_INDEX_POLICY:-}" \
-    timeout "$TIMEOUT_SECONDS" "$WORKER_BIN" "$@"
+    "$TIMEOUT_BIN" "$TIMEOUT_SECONDS" "$WORKER_BIN" "$@"
 }
 
 start_worker_group_for() {
   local cell_id="$1"
   local src_id="$2"
   shift 2
-  setsid env GRAPH_CELL_ID="$cell_id" GRAPH_SRC_ID="$src_id" GRAPH_INDEX_POLICY="${GRAPH_INDEX_POLICY:-}" \
-    timeout "$TIMEOUT_SECONDS" "$WORKER_BIN" "$@" &
+   "${SETSID[@]}" env GRAPH_CELL_ID="$cell_id" GRAPH_SRC_ID="$src_id" GRAPH_INDEX_POLICY="${GRAPH_INDEX_POLICY:-}" \
+    "$TIMEOUT_BIN" "$TIMEOUT_SECONDS" "$WORKER_BIN" "$@" &
   RUN_WORKER_PID="$!"
 }
 
@@ -74,7 +100,7 @@ kill_mode_then_recover() {
 
 cd "$ROOT"
 mkdir -p "$STORE_ROOT"
-cargo build "${FEATURE_ARGS[@]}" --example stress_worker >/dev/null
+cargo build ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} --example stress_worker >/dev/null
 
 echo "graph multiprocess stress: store=$STORE_ROOT db_base=$DB_BASE ops=$OPS"
 

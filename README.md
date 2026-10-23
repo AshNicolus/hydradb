@@ -103,7 +103,7 @@ macOS with Homebrew:
 
 ```bash
 xcode-select --install
-brew install just cmake pkg-config llvm suite-sparse
+brew install just cmake pkg-config llvm suite-sparse coreutils
 brew install cleishm/neo4j/libcypher-parser
 
 # Rust, only if `rustup toolchain list` does not already show a stable toolchain:

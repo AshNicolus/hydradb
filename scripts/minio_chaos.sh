@@ -137,7 +137,7 @@ pause_mode_then_recover() {
 }
 
 cd "$ROOT"
-cargo build "${FEATURE_ARGS[@]}" --example stress_worker >/dev/null
+cargo build ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} --example stress_worker >/dev/null
 echo "graph MinIO chaos: bucket=$BUCKET db=$DB_PATH ops=$OPS"
 
 pause_mode_then_recover reddit-home 1 writer writer 100000
