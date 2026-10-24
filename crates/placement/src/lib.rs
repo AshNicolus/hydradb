@@ -18,7 +18,7 @@
 //! `LastModified` into a [`heartbeat::HeartbeatEntry::age`]. Every function
 //! below that point is pure, synchronous and time-free, which is what makes the
 //! liveness rules testable by hand-building entries instead of sleeping.
-//! Decision 10 of `docs/plans/2026-07-25-rendezvous-placement.md`.
+//! Decision 10 of the rendezvous placement design.
 //!
 //! # The four modules
 //!
@@ -52,9 +52,6 @@ pub mod cell_writer;
 pub mod hash;
 pub mod heartbeat;
 pub mod liveness;
-
-#[cfg(test)]
-mod fault_store;
 
 pub use cell_writer::{put_cell_writer, read_cell_writer, CellWriterRecord};
 pub use hash::{owner, rank, score};

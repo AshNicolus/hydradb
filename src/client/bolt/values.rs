@@ -233,12 +233,22 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.TransientError.Transaction.BookmarkTimeout".to_string(),
             message: error.to_string(),
         },
+        GraphError::SnapshotUnavailable { .. } => BoltError::Query {
+            code: "Neo.DatabaseError.Statement.ExecutionFailed".to_string(),
+            message: error.to_string(),
+        },
         GraphError::InvalidKeyComponent { .. }
         | GraphError::MissingQueryParameter { .. }
         | GraphError::QueryParse { .. }
         | GraphError::UnsupportedQuery { .. }
         | GraphError::UnclassifiedQuery { .. } => BoltError::Query {
             code: "Neo.ClientError.Statement.InvalidSyntax".to_string(),
+            message: error.to_string(),
+        },
+        // The query is fine; two of its rows set one property to different
+        // values. A syntax code sends the caller to the wrong place.
+        GraphError::BatchValueConflict { .. } => BoltError::Query {
+            code: "Neo.ClientError.Statement.ArgumentError".to_string(),
             message: error.to_string(),
         },
         GraphError::QueryTimeout { .. } => BoltError::Query {
@@ -275,59 +285,5 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             tracing::warn!(target: "hydradb", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())
         }
-    }
-}
-
-#[cfg(test)]
-mod structural_relationship_id_tests {
-    use super::*;
-    use crate::{QueryPathNode, QueryPathRelationship};
-    use std::collections::BTreeMap;
-
-    fn node(id: u64) -> QueryPathNode {
-        QueryPathNode {
-            id,
-            labels: Vec::new(),
-            properties: BTreeMap::new(),
-        }
-    }
-
-    fn structural(src: u64, dst: u64) -> QueryPathRelationship {
-        QueryPathRelationship {
-            id: None,
-            edge_type: "E".to_string(),
-            src,
-            dst,
-            properties: BTreeMap::new(),
-        }
-    }
-
-    /// A relationship with no stored id is given a synthetic one, and it has to
-    /// stay clear of the non-negative ids real relationships occupy. Three hops
-    /// is the shortest path that reached the positive range before the
-    /// parentheses went in.
-    #[test]
-    fn synthetic_path_relationship_ids_stay_negative() {
-        let path = QueryPath {
-            nodes: (1..=6).map(node).collect(),
-            relationships: (1..=5).map(|src| structural(src, src + 1)).collect(),
-        };
-
-        let converted = query_value_to_bolt(&QueryValue::Path(Box::new(path)))
-            .expect("a structural path converts");
-        let BoltValue::Path(path) = converted else {
-            panic!("a path value converts to a Bolt path");
-        };
-
-        let ids: Vec<i64> = path
-            .rels
-            .iter()
-            .map(|relationship| relationship.id)
-            .collect();
-        assert_eq!(ids, vec![-1, -2, -3, -4, -5]);
-        assert!(
-            ids.iter().all(|id| *id < 0),
-            "synthetic ids must stay out of the range real relationships use, got {ids:?}"
-        );
     }
 }

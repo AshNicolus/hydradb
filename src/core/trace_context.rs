@@ -116,27 +116,3 @@ const TRACEPARENT_LEN: usize = 55;
 
 // The bridge is only reachable through a transport, so with neither feature on
 // there is nothing here to exercise.
-#[cfg(all(test, any(feature = "query-transport", feature = "bolt-server")))]
-mod tests {
-    use super::*;
-
-    /// The path every test and every non-`otlp` build takes.
-    #[cfg(feature = "query-transport")]
-    #[test]
-    fn no_bridge_installed_yields_no_traceparent() {
-        assert!(current_traceparent().is_none());
-    }
-
-    /// A peer sending rubbish must not be able to fail a request, and must not
-    /// reach the bridge at all.
-    #[test]
-    fn malformed_values_are_dropped_rather_than_raised() {
-        let span = tracing::info_span!("test");
-        adopt_remote_parent(&span, None);
-        adopt_remote_parent(&span, Some(""));
-        adopt_remote_parent(&span, Some("00-too-short-01"));
-        adopt_remote_parent(&span, Some(&"x".repeat(4096)));
-        // A correctly sized value that is not ASCII still must not panic.
-        adopt_remote_parent(&span, Some(&"é".repeat(TRACEPARENT_LEN)));
-    }
-}

@@ -16,9 +16,6 @@ spec:
   target:
     configMap:
       key: ca.crt
-      metadata:
-        labels:
-          app.kubernetes.io/component: hydradb-client-trust
     namespaceSelector:
       {{- toYaml .Values.tls.public.trustBundle.namespaceSelector | nindent 6 }}
 {{- end }}

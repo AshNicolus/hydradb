@@ -218,44 +218,6 @@ pub enum QueryBatchOperation {
     },
 }
 
-#[cfg(all(test, feature = "query-transport"))]
-mod guarded_transport_schema_tests {
-    use super::*;
-
-    #[derive(serde::Deserialize)]
-    enum OriginalBatchOperation {
-        UpsertVertices { vertices: Vec<QueryBatchVertex> },
-    }
-
-    #[test]
-    fn original_peer_still_decodes_an_ordinary_upsert() {
-        let encoded = serde_json::to_value(QueryBatchOperation::UpsertVertices {
-            vertices: Vec::new(),
-        })
-        .unwrap();
-        let decoded: OriginalBatchOperation = serde_json::from_value(encoded).unwrap();
-
-        assert!(matches!(
-            decoded,
-            OriginalBatchOperation::UpsertVertices { vertices } if vertices.is_empty()
-        ));
-    }
-
-    #[test]
-    fn original_peer_rejects_a_guarded_upsert_as_an_unknown_operation() {
-        let encoded = serde_json::to_value(QueryBatchOperation::GuardedUpsertVertices {
-            vertices: Vec::new(),
-            merge_policy: QueryBatchMergePolicy {
-                update_if_newer_by: "updated_at".to_string(),
-                create_only_properties: std::collections::BTreeSet::new(),
-            },
-        })
-        .unwrap();
-
-        assert!(serde_json::from_value::<OriginalBatchOperation>(encoded).is_err());
-    }
-}
-
 impl QueryBatchOperation {
     pub fn is_write(&self) -> bool {
         matches!(

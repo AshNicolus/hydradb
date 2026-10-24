@@ -278,15 +278,41 @@ impl GraphShard {
         Ok(iter)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn write_strict_for_test(&self, batch: WriteBatch) -> Result<()> {
-        self.db
-            .writer()?
-            .write_with_options(batch, &WriteOptions::default())
-            .await?
-            .await_durable()
+    /// [`Self::scan_remote_prefix`] for a prefix that names one small, known
+    /// group of records -- the relationships of one `(src, dst)` pair -- whose
+    /// blocks are worth keeping. Broad scans keep blocks out of the shared
+    /// cache so they cannot evict hot data; a pair's records occupy one or two
+    /// blocks, which neighbouring pairs of the same source share. Not caching
+    /// them made every relationship hydration of a path or expansion re-read
+    /// the same block from object storage, warm or cold.
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn scan_remote_point_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<slatedb::DbIterator> {
+        let iter = self
+            .db
+            .scan_prefix_with_options(
+                prefix.as_bytes(),
+                None,
+                &remote_scan_options_for_expected_items(1),
+            )
             .await?;
-        Ok(())
+        Ok(iter)
+    }
+
+    /// [`Self::scan_remote_prefix`] starting at `start_suffix` (inclusive,
+    /// relative to `prefix`) instead of the first key under the prefix.
+    pub(crate) async fn scan_remote_prefix_from(
+        &self,
+        prefix: &str,
+        start_suffix: Option<Vec<u8>>,
+    ) -> Result<slatedb::DbIterator> {
+        let iter = self
+            .db
+            .scan_prefix_with_options(prefix.as_bytes(), start_suffix, &remote_scan_options())
+            .await?;
+        Ok(iter)
     }
 
     pub(crate) async fn write_graph_batch_strict(

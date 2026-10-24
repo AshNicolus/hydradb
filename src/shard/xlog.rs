@@ -11,8 +11,8 @@
 //! after a crash is harmless.
 //!
 //! The design and its verification live in the cost note
-//! (`interactive/incremental-build-cost.html`, §11) and the benchmark
-//! record (`docs/benchmarks/2026-08-07-xlog-incremental-index.md`).
+//! (the incremental build-cost analysis, §11) and the benchmark
+//! record (the xlog incremental-index benchmark).
 
 use super::*;
 use crate::shard::topology_tail::GraphTopologyOverlay;

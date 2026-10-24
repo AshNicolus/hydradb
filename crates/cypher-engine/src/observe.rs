@@ -29,6 +29,8 @@ pub struct OperatorProfile {
     /// [`GraphPhysicalPlan::operator_name`]: a closed vocabulary.
     pub operator: &'static str,
     pub invocations: u64,
+    /// Actual unbound all-vertex scans, excluding correlated seed reuse.
+    pub full_scans: u64,
     /// Rows the operator's inputs produced for it.
     pub rows_in: u64,
     pub rows_out: u64,
@@ -71,14 +73,22 @@ impl OperatorProfile {
     ///
     /// `None` without an estimate, and `None` where comparing would mislead:
     /// an operator that only passes its input's estimate through (a filter's
-    /// selectivity is unknown by design, so its estimate is an upper bound),
-    /// and an operator run more than once (a correlated input sees one outer
-    /// row at a time while its estimate describes the whole population).
+    /// selectivity is unknown by design, so its estimate is an upper bound;
+    /// a probe likewise carries its fallback's estimate), and an
+    /// operator run more than once (a correlated input sees one outer row at
+    /// a time while its estimate describes the whole population).
     pub fn estimate_error(&self) -> Option<f64> {
         if self.invocations != 1
             || matches!(
                 self.operator,
-                "FilterExec" | "SortExec" | "ProjectExec" | "SkipExec" | "LimitExec" | "UnionExec"
+                "FilterExec"
+                    | "SortExec"
+                    | "ProjectExec"
+                    | "SkipExec"
+                    | "LimitExec"
+                    | "UnionExec"
+                    | "RelationshipPropertyRangeProbe"
+                    | "RelationshipTypeProbe"
             )
         {
             return None;
@@ -108,6 +118,15 @@ impl ExecutionProfile {
         for (operator, estimate) in self.operators.iter_mut().zip(estimates) {
             operator.estimated_rows = estimate;
         }
+    }
+
+    /// Whether an `AllVertexScan` actually ran. Narrower than
+    /// [`GraphPhysicalPlan::contains_full_scan`]: a range probe's fallback
+    /// can hold a scan that a successful probe never executes.
+    pub fn ran_full_scan(&self) -> bool {
+        self.operators
+            .iter()
+            .any(|operator| operator.full_scans > 0)
     }
 
     /// The operator with the most own time, which is where a slow query's
@@ -231,6 +250,12 @@ impl OperatorProfiler {
             operator.storage_requests += requests;
             operator.storage_elapsed += elapsed;
             operator.storage_bytes += bytes;
+        }
+    }
+
+    pub fn record_full_scan(&mut self) {
+        if let Some(operator) = self.current() {
+            operator.full_scans += 1;
         }
     }
 

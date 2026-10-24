@@ -1,4 +1,4 @@
-//! ANTLR recognizers generated at build time from the crate's `grammar/` dir.
+//! ANTLR recognizers generated at build time from the vendored Cypher grammar.
 //!
 //! These modules are public so early parser experiments can use the complete
 //! typed parse-tree surface. Application code should prefer the stable facade

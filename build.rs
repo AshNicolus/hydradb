@@ -6,7 +6,8 @@
 //! `RUSTFLAGS="-L /opt/homebrew/lib"` by hand.
 //!
 //! Resolution order (first hit wins):
-//!   1. `GRAPHBLAS_LIB_DIR` — explicit override.
+//!   1. `GRAPHBLAS_LIB_DIR` — explicit override, also used by the docs in
+//!      the optimisation phases plan.
 //!   2. `pkg-config --libs-only-L GraphBLAS` (or `graphblas`), which Homebrew and
 //!      most distro packages ship.
 //!   3. `brew --prefix suite-sparse`/lib on macOS.

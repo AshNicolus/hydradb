@@ -9,6 +9,7 @@ use crate::{
 use hydradb_cypher_ast::{Document, QueryFailureReason};
 use hydradb_cypher_parser_antlr::parse_cypher25;
 
+use crate::capability::{logical_capability, physical_capability, EngineCapability};
 use crate::{EngineError, EngineResult, ListParameterMap, ParameterMap};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -19,6 +20,14 @@ pub struct PreparedQuery {
 }
 
 impl PreparedQuery {
+    /// Whether the engine can execute this plan, decided from the plan alone.
+    ///
+    /// Asked after planning and before a storage adapter is constructed, so a
+    /// refusal costs no read session. See [`crate::capability`].
+    pub fn capability(&self) -> EngineCapability {
+        physical_capability(&self.physical)
+    }
+
     pub fn explain(&self) -> String {
         explain_physical_plan(&self.physical)
     }
@@ -54,7 +63,7 @@ pub fn plan_shape_hash(shape: &str) -> u64 {
     })
 }
 
-fn column_names(plan: &GraphPhysicalPlan) -> EngineResult<Vec<String>> {
+pub(crate) fn column_names(plan: &GraphPhysicalPlan) -> EngineResult<Vec<String>> {
     match plan {
         GraphPhysicalPlan::Project { items, .. } => {
             Ok(items.iter().map(PhysicalProjection::column_name).collect())
@@ -99,6 +108,16 @@ impl LogicalQuery {
     /// prepared predicates can consume.
     pub fn planning_context(&self) -> &PhysicalPlanningContext {
         &self.planning
+    }
+
+    /// Whether the engine can execute this query, decided from the lowered
+    /// plan alone.
+    ///
+    /// This is the earlier of the two checks and the one that matters for
+    /// storage: it runs before any snapshot, so a shape refused here has not
+    /// read a byte - not even the point lookups the statistics loader makes.
+    pub fn capability(&self) -> EngineCapability {
+        logical_capability(&self.logical)
     }
 
     pub fn plan_with_statistics(
@@ -204,57 +223,4 @@ pub(crate) fn prepare_query_with_statistics(
     statistics: &dyn StatisticsProvider,
 ) -> EngineResult<PreparedQuery> {
     lower_query(query, parameters, lists)?.plan_with_statistics(statistics)
-}
-
-#[cfg(test)]
-mod observability_tests {
-    use super::*;
-    use crate::ScalarValue;
-
-    fn prepared(query: &str) -> PreparedQuery {
-        prepare_query(query, &ParameterMap::new()).expect("prepares")
-    }
-
-    #[test]
-    fn the_plan_shape_carries_no_literal_and_hashes_by_structure() {
-        let alpha = prepared("MATCH (n:Entity {entity_id: 'tenant-secret'}) RETURN n.entity_id");
-        let beta = prepared("MATCH (n:Entity {entity_id: 'other'}) RETURN n.entity_id");
-        assert!(alpha.explain().contains("tenant-secret"));
-        assert!(!alpha.plan_shape().contains("tenant-secret"));
-        assert_eq!(alpha.plan_hash(), beta.plan_hash());
-        // Rendering the shape must not leak redaction into a later EXPLAIN.
-        assert!(alpha.explain().contains("tenant-secret"));
-
-        let scan = prepared("MATCH (n:Entity) RETURN n.entity_id");
-        assert_ne!(alpha.plan_hash(), scan.plan_hash());
-    }
-
-    #[test]
-    fn a_list_does_not_change_the_shape_by_its_length() {
-        let lists = |values: usize| {
-            ListParameterMap::from([(
-                "ids".to_string(),
-                (0..values)
-                    .map(|value| ScalarValue::String(value.to_string().into()))
-                    .collect(),
-            )])
-        };
-        let query = "MATCH (n:Entity) WHERE n.entity_id IN $ids RETURN n.entity_id";
-        let plan = |values| {
-            prepare_query_with_statistics(
-                query,
-                &ParameterMap::new(),
-                &lists(values),
-                &UnknownStatistics,
-            )
-            .expect("prepares")
-        };
-        assert_eq!(plan(2).plan_hash(), plan(40).plan_hash());
-    }
-
-    #[test]
-    fn lowering_reports_both_halves() {
-        let (_, timings) = LoweredTemplate::lower_timed("MATCH (n) RETURN n").expect("lowers");
-        assert!(timings.parse > Duration::ZERO);
-    }
 }

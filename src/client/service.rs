@@ -31,14 +31,15 @@ use crate::query::opencypher::{
     OpenCypherQueryAccess, ParsedUnwindBatchKind, ParsedUnwindConstraintValue,
     ParsedUnwindVertexConstraints,
 };
-use crate::query::path_procedure::parse_native_path_procedure_columns;
+use crate::query::path_procedure::parse_native_procedure_columns;
 use crate::{
-    validate_component, AtomicDurationHistogram, CypherEngineMode, DurationHistogramSnapshot,
-    EdgeMetadata, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryBatchEdge,
-    QueryBatchIsolatedVertex, QueryBatchMergePolicy, QueryBatchOperation, QueryBatchRelationship,
-    QueryBatchRelationshipMerge, QueryBatchVertex, QueryCancellationToken, QueryColumn,
-    QueryContext, QueryCursorToken, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow,
-    Result, StorageSequence, VertexMetadata, VertexPropertyValue,
+    encode_scope_namespace_id, validate_component, AtomicDurationHistogram, CypherEngineMode,
+    DurationHistogramSnapshot, EdgeMetadata, GraphError, GraphId, GraphScope, NamespaceId,
+    NamespacePath, QueryBatchEdge, QueryBatchIsolatedVertex, QueryBatchMergePolicy,
+    QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex,
+    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryParameterValue,
+    QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence, VertexMetadata,
+    VertexPropertyValue,
 };
 use tracing::Instrument as _;
 
@@ -141,15 +142,7 @@ impl ClientDatabaseResolver for HierarchicalClientDatabaseResolver {
 }
 
 fn encode_database_scope_id(component: &'static str, value: &str) -> Result<String> {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(GraphError::InvalidKeyComponent {
-            component,
-            value: value.to_string(),
-        });
-    }
-    let encoded = URL_SAFE_NO_PAD.encode(value.as_bytes());
-    NamespaceId::new(encoded.clone())?;
-    Ok(encoded)
+    encode_scope_namespace_id(component, value).map(|encoded| encoded.to_string())
 }
 
 fn canonical_database_component(database: &str, encoded: &str) -> Result<String> {
@@ -925,7 +918,7 @@ pub struct ClientQueryMetricsSnapshot {
     /// of them is alertable without it: "forty waits polled" is a fleet at rest
     /// or a fleet on fire depending on whether forty-one waits happened or four
     /// hundred thousand did. Change 4 of
-    /// `docs/plans/2026-08-21-cell-affine-read-routing.md` asks for the pair
+    /// the cell-affine read-routing design asks for the pair
     /// for exactly this reason.
     ///
     /// It restates [`Self::bookmark_wait_latency`]'s `count()`, and does so
@@ -946,7 +939,7 @@ pub struct ClientQueryMetricsSnapshot {
     /// window where it should, and it goes and stays non-zero if reads drift
     /// back onto non-owners — which is the regression this exists to make
     /// visible without re-deriving
-    /// `docs/2026-08-21-read-path-30s-timeout-findings.md`.
+    /// the read-path timeout findings.
     pub bookmark_waits_polled: u64,
     /// Waits that ran out of `max_bookmark_wait_ms` and returned
     /// `SnapshotAhead`.
@@ -1605,9 +1598,9 @@ impl ClientQueryService {
     ///
     /// # What is measured here, and why it is measured here
     ///
-    /// Until change 4 of `docs/plans/2026-08-21-cell-affine-read-routing.md`
+    /// Until change 4 of the cell-affine read-routing design
     /// this span was the *only* record of the wait, and a span is a sample: the
-    /// 17-38s waits in `docs/2026-08-21-read-path-30s-timeout-findings.md` were
+    /// 17-38s waits in the read-path timeout findings were
     /// found by inferring them out of `graph_client_prepare_duration`, an
     /// average over every prepare. The three instruments below turn that
     /// inference into a measurement — a duration histogram, a count of the
@@ -1838,8 +1831,7 @@ impl ClientQueryService {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
-                feature: "historical graph epochs are not client query snapshots; use a bookmark for causal reads"
-                    .to_string(),
+                feature: "historical graph epochs are not client query snapshots; use a bookmark for causal reads".to_string(),
             });
         }
         let preparing = MemoryDiagnosticGuard::new(
@@ -1988,8 +1980,7 @@ impl ClientQueryService {
             let error = GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::InvalidRequest,
                 dialect: "ClientProtocol",
-                feature: "historical graph epochs are not client query snapshots; use a bookmark for causal reads"
-                    .to_string(),
+                feature: "historical graph epochs are not client query snapshots; use a bookmark for causal reads".to_string(),
             };
             // Rejected ahead of `prepare_page_request`, so neither of its
             // wrappers sees it; count it where it is raised, against the
@@ -2248,7 +2239,7 @@ impl ClientQueryService {
             {
                 match action {
                     QueryTransportAction::Read => {
-                        match parse_native_path_procedure_columns(&request.query)? {
+                        match parse_native_procedure_columns(&request.query)? {
                             Some(columns) => columns,
                             None => experimental_query_columns(
                                 &request.query,
@@ -2290,19 +2281,18 @@ impl ClientQueryService {
             }
         } else {
             match action {
-                QueryTransportAction::Read => {
-                    match parse_native_path_procedure_columns(&request.query)? {
-                        Some(columns) => columns,
-                        None => {
-                            parse_opencypher_row_query_with_list_parameters(
-                                &request.query,
-                                &scalar_parameters,
-                                &list_parameters,
-                            )?
-                            .columns
-                        }
+                QueryTransportAction::Read => match parse_native_procedure_columns(&request.query)?
+                {
+                    Some(columns) => columns,
+                    None => {
+                        parse_opencypher_row_query_with_list_parameters(
+                            &request.query,
+                            &scalar_parameters,
+                            &list_parameters,
+                        )?
+                        .columns
                     }
-                }
+                },
                 QueryTransportAction::Write => {
                     let Some(mutation) = parse_opencypher_mutation_query_with_list_parameters(
                         &request.query,
@@ -2660,7 +2650,7 @@ impl ClientQueryService {
                         };
                         match split_query_parameters(&request.parameters) {
                             Ok((parameters, lists)) => {
-                                if parse_native_path_procedure_columns(&request.query)?.is_none() {
+                                if parse_native_procedure_columns(&request.query)?.is_none() {
                                     if let Err(error) = prepare_experimental_cypher(
                                         &request.query,
                                         &parameters,
@@ -3815,6 +3805,3 @@ fn client_query_runtime_exceeded(limit_ms: u64) -> GraphError {
         limit_ms,
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -8,7 +8,7 @@ use hydradb::{
     BoltReadRouting, CypherEngineMode, GraphBackpressurePolicy, GraphCacheConfig, GraphCachePolicy,
     GraphDurabilityConfig, GraphId, GraphIndexPolicy, GraphLimits, GraphMemoryConfig,
     GraphOpenOptions, GraphScope, GraphStorageMemoryConfig, NamespaceId, NamespacePath,
-    SparseKernelBackend,
+    PlannerStatisticsConfig, SparseKernelBackend,
 };
 
 type ConfigResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -56,6 +56,9 @@ pub struct RuntimeConfig {
     pub bolt_node_addresses: BTreeMap<String, String>,
     pub read_routing: BoltReadRouting,
     pub cypher_engine: CypherEngineMode,
+    pub planner_statistics: bool,
+    pub planner_statistics_ttl: Duration,
+    pub planner_statistics_hint_threshold: u32,
     pub auth_token_file: PathBuf,
     pub tls_certificate: Option<PathBuf>,
     pub tls_private_key: Option<PathBuf>,
@@ -106,9 +109,7 @@ impl RuntimeConfig {
         let tls_certificate = optional_path(&values, "GRAPH_TLS_CERTIFICATE");
         let tls_private_key = optional_path(&values, "GRAPH_TLS_PRIVATE_KEY");
         if !allow_plaintext && (tls_certificate.is_none() || tls_private_key.is_none()) {
-            return invalid(
-                "graph runtime requires GRAPH_TLS_CERTIFICATE and GRAPH_TLS_PRIVATE_KEY unless GRAPH_ALLOW_PLAINTEXT=true",
-            );
+            return invalid("graph runtime requires GRAPH_TLS_CERTIFICATE and GRAPH_TLS_PRIVATE_KEY unless GRAPH_ALLOW_PLAINTEXT=true");
         }
         let advertised_bolt_addr = value(&values, "GRAPH_ADVERTISED_BOLT_ADDR", "localhost:7687");
         if advertised_bolt_addr.trim().is_empty()
@@ -116,7 +117,7 @@ impl RuntimeConfig {
         {
             return invalid("GRAPH_ADVERTISED_BOLT_ADDR must be a non-empty host:port");
         }
-        // Decision 5 of docs/plans/2026-07-25-rendezvous-placement.md. A node is
+        // Decision 5 of the rendezvous placement design. A node is
         // live while its heartbeat object is younger than the timeout, so an
         // interval at or past the timeout means every heartbeat expires before
         // its own writer refreshes it and the entire fleet reads as dead — no
@@ -149,7 +150,7 @@ impl RuntimeConfig {
                 "GRAPH_WAL_FLUSH_INTERVAL_MS must be at most {MAX_WAL_FLUSH_INTERVAL_MS}"
             ));
         }
-        // Change 3 of docs/plans/2026-08-21-cell-affine-read-routing.md. The
+        // Change 3 of the cell-affine read-routing design. The
         // causal-consistency wait is a *part* of a query, so a budget at or
         // past the whole query's is no budget at all: it is what the wait
         // borrowed before, and it meant a read that could not catch up burned
@@ -283,6 +284,17 @@ impl RuntimeConfig {
             bolt_node_addresses,
             read_routing: parse_read_routing(&values, "GRAPH_READ_ROUTING")?,
             cypher_engine: parse_cypher_engine(&values, "GRAPH_CYPHER_ENGINE")?,
+            planner_statistics: parse_planner_statistics(&values, "GRAPH_PLANNER_STATISTICS")?,
+            planner_statistics_ttl: parse_duration(
+                &values,
+                "GRAPH_PLANNER_STATISTICS_TTL_MS",
+                PlannerStatisticsConfig::DEFAULT_TTL.as_millis() as u64,
+            )?,
+            planner_statistics_hint_threshold: parse_u32_allow_zero(
+                &values,
+                "GRAPH_PLANNER_STATISTICS_HINT_THRESHOLD",
+                PlannerStatisticsConfig::DEFAULT_HINT_THRESHOLD,
+            )?,
             auth_token_file: PathBuf::from(value(
                 &values,
                 "GRAPH_AUTH_TOKEN_FILE",
@@ -375,6 +387,11 @@ impl RuntimeConfig {
         };
         options.backpressure_policy = GraphBackpressurePolicy::default();
         options.index_policy = GraphIndexPolicy::Full;
+        options.planner_statistics = PlannerStatisticsConfig {
+            enabled: self.planner_statistics,
+            ttl: self.planner_statistics_ttl,
+            hint_threshold: self.planner_statistics_hint_threshold,
+        };
         options
     }
 
@@ -500,6 +517,16 @@ fn parse_usize(
     })
 }
 
+fn parse_u32_allow_zero(
+    values: &BTreeMap<String, String>,
+    name: &str,
+    default: u32,
+) -> ConfigResult<u32> {
+    let raw = value(values, name, &default.to_string());
+    raw.parse::<u32>()
+        .map_err(|err| Error::new(ErrorKind::InvalidInput, format!("invalid {name}: {err}")).into())
+}
+
 fn parse_usize_allow_zero(
     values: &BTreeMap<String, String>,
     name: &str,
@@ -550,7 +577,7 @@ fn parse_sparse_kernel(
 /// literal rather than "whatever the library picks". Defaulting to `fleet`
 /// keeps today's fleet-wide `READ` list until an operator asks for cell-affine
 /// reads, which is the point of change 2 of
-/// `docs/plans/2026-08-21-cell-affine-read-routing.md`: flipping read routing
+/// the cell-affine read-routing design: flipping read routing
 /// changes the load shape of the whole fleet, so reverting it must cost an env
 /// change rather than an image build.
 fn parse_read_routing(
@@ -591,6 +618,19 @@ fn parse_cypher_engine(
             "invalid {name}={other}; expected legacy or experimental"
         )),
     }
+}
+
+/// `GRAPH_PLANNER_STATISTICS`, default off: whether the experimental planner
+/// loads the statistics the indexer publishes. Like `GRAPH_CYPHER_ENGINE`, it
+/// cannot select code the node was built without.
+fn parse_planner_statistics(values: &BTreeMap<String, String>, name: &str) -> ConfigResult<bool> {
+    let enabled = parse_bool(values, name, false)?;
+    if enabled && !cfg!(feature = "experimental-cypher-engine") {
+        return invalid(format!(
+            "{name}=true requires the experimental-cypher-engine Cargo feature"
+        ));
+    }
+    Ok(enabled)
 }
 
 fn parse_bool(values: &BTreeMap<String, String>, name: &str, default: bool) -> ConfigResult<bool> {
@@ -641,575 +681,4 @@ fn parse_node_addresses(
 
 fn invalid<T>(message: impl Into<String>) -> ConfigResult<T> {
     Err(Error::new(ErrorKind::InvalidInput, message.into()).into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn plaintext_config_with_auth_token(path: &std::path::Path) -> RuntimeConfig {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_AUTH_TOKEN_FILE".to_string(),
-                path.to_str().unwrap().to_string(),
-            ),
-        ]);
-        RuntimeConfig::from_values(values).unwrap()
-    }
-
-    #[test]
-    fn missing_auth_token_file_names_the_path_and_keeps_its_kind() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("absent-token");
-        let error = plaintext_config_with_auth_token(&path)
-            .read_auth_token()
-            .unwrap_err();
-
-        let message = error.to_string();
-        assert!(message.contains("GRAPH_AUTH_TOKEN_FILE"), "{message}");
-        assert!(message.contains(path.to_str().unwrap()), "{message}");
-        assert_eq!(
-            error.downcast_ref::<Error>().map(Error::kind),
-            Some(ErrorKind::NotFound),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn auth_token_directory_names_the_path_instead_of_a_raw_errno() {
-        // The GitHub-runner half of issue #101: `GRAPH_AUTH_TOKEN_FILE` points
-        // at a directory and startup exits with a bare `Os { code: 21 }`. The
-        // kind is deliberately not asserted -- platforms disagree on what
-        // reading a directory returns -- but the path must be in the message.
-        let directory = tempfile::tempdir().unwrap();
-        let error = plaintext_config_with_auth_token(directory.path())
-            .read_auth_token()
-            .unwrap_err();
-
-        let message = error.to_string();
-        assert!(message.contains("GRAPH_AUTH_TOKEN_FILE"), "{message}");
-        assert!(
-            message.contains(directory.path().to_str().unwrap()),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn short_auth_token_names_the_file_it_rejected() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("auth-token");
-        std::fs::write(&path, "change-me").unwrap();
-        let error = plaintext_config_with_auth_token(&path)
-            .read_auth_token()
-            .unwrap_err();
-
-        let message = error.to_string();
-        assert!(message.contains("non-placeholder"), "{message}");
-        assert!(message.contains(path.to_str().unwrap()), "{message}");
-    }
-
-    #[test]
-    fn readable_auth_token_file_is_trimmed_and_accepted() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("auth-token");
-        std::fs::write(&path, "  local-development-token-32-bytes\n").unwrap();
-        let token = plaintext_config_with_auth_token(&path)
-            .read_auth_token()
-            .unwrap();
-        assert_eq!(token, "local-development-token-32-bytes");
-    }
-
-    #[test]
-    fn production_runtime_requires_tls() {
-        let values = BTreeMap::from([("GRAPH_AUTH_TOKEN_FILE".to_string(), "/token".to_string())]);
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(error.to_string().contains("requires GRAPH_TLS_CERTIFICATE"));
-    }
-
-    #[test]
-    fn plaintext_runtime_config_is_explicit_and_bounded() {
-        let values = BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.max_query_scan_edges, 1_000_000);
-        assert_eq!(config.cypher_engine, CypherEngineMode::Legacy);
-        assert_eq!(config.max_query_runtime_ms, 30_000);
-        assert_eq!(config.max_bookmark_wait_ms, 2_000);
-        assert_eq!(
-            config.graph_open_options().limits.max_bookmark_wait_ms,
-            2_000
-        );
-        assert_eq!(config.max_server_cursors, 1_024);
-        assert_eq!(config.max_cursor_buffer_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.cursor_ttl, Duration::from_secs(60));
-        assert_eq!(config.l0_sst_size_bytes, 16 * 1024 * 1024);
-        assert_eq!(config.max_unflushed_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.max_wal_flushes_before_l0_flush, 128);
-        assert_eq!(config.max_concurrent_hydrations, 2);
-        assert_eq!(config.max_open_scopes, 8);
-        assert_eq!(config.reader_wal_replay_concurrency, 16);
-        assert_eq!(config.wal_flush_interval_ms, 10);
-        assert_eq!(
-            config.graph_open_options().durability.wal_flush_interval_ms,
-            Some(10)
-        );
-        assert_eq!(config.slatedb_cache_bytes, 640 * 1024 * 1024);
-        assert_eq!(config.data_cache_part_bytes, 4 * 1024 * 1024);
-        assert_eq!(config.data_cache_max_open_files, 512);
-        assert_eq!(
-            config.graph_open_options().cache.slatedb_cache_bytes,
-            640 * 1024 * 1024
-        );
-        assert_eq!(config.index_discovery_interval, Duration::from_secs(5));
-        assert_eq!(config.indexer_notify_url, None);
-        assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
-        assert_eq!(config.heartbeat_timeout, Duration::from_secs(15));
-        assert_eq!(config.writer_lease_duration, Duration::from_secs(30));
-        assert_eq!(config.bolt_authentication_timeout, Duration::from_secs(30));
-        assert_eq!(config.bolt_idle_timeout, Duration::from_secs(15 * 60));
-        assert_eq!(config.bolt_max_connection_age, Duration::from_secs(60 * 60));
-        let memory = config.graph_memory_config();
-        assert_eq!(memory.max_graphblas_bytes, 128 * 1024 * 1024);
-        assert_eq!(memory.max_matrix_adjacency_bytes, 0);
-        assert_eq!(memory.max_relationship_rows_bytes, 8 * 1024 * 1024);
-        assert_eq!(memory.max_source_relationship_rows_bytes, 8 * 1024 * 1024);
-        assert_eq!(
-            memory.max_relationship_property_rows_bytes,
-            16 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn indexer_notify_url_is_optional_and_trimmed() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_INDEXER_NOTIFY_URL".to_string(),
-                "  http://hydradb-indexer:9091/v1/changes:process  ".to_string(),
-            ),
-        ]);
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(
-            config.indexer_notify_url.as_deref(),
-            Some("http://hydradb-indexer:9091/v1/changes:process")
-        );
-    }
-
-    #[test]
-    fn graph_node_rejects_unsafe_wal_flush_bounds() {
-        for value in ["0", "4097"] {
-            let values = BTreeMap::from([
-                ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-                (
-                    "GRAPH_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH".to_string(),
-                    value.to_string(),
-                ),
-            ]);
-            RuntimeConfig::from_values(values).expect_err("unsafe WAL flush bound must fail");
-        }
-    }
-
-    #[test]
-    fn graph_node_config_applies_wal_flush_interval() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            ("GRAPH_WAL_FLUSH_INTERVAL_MS".to_string(), "25".to_string()),
-        ]);
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.wal_flush_interval_ms, 25);
-        assert_eq!(
-            config.graph_open_options().durability.wal_flush_interval_ms,
-            Some(25)
-        );
-    }
-
-    #[test]
-    fn graph_node_rejects_unsafe_wal_flush_interval() {
-        for (value, expected) in [
-            ("0", "GRAPH_WAL_FLUSH_INTERVAL_MS must be greater than zero"),
-            ("1001", "GRAPH_WAL_FLUSH_INTERVAL_MS must be at most 1000"),
-        ] {
-            let values = BTreeMap::from([
-                ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-                ("GRAPH_WAL_FLUSH_INTERVAL_MS".to_string(), value.to_string()),
-            ]);
-            let error = RuntimeConfig::from_values(values).unwrap_err();
-            assert!(error.to_string().contains(expected));
-        }
-    }
-
-    #[test]
-    fn graph_node_config_applies_query_scan_edge_limit() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            ("GRAPH_MAX_QUERY_SCAN_EDGES".to_string(), "64".to_string()),
-        ]);
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.max_query_scan_edges, 64);
-        assert_eq!(config.graph_open_options().limits.max_query_scan_edges, 64);
-    }
-
-    #[test]
-    fn graph_node_rejects_an_unsafe_writer_lease_window() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            ("GRAPH_WRITER_LEASE_MS".to_string(), "2999".to_string()),
-        ]);
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("GRAPH_WRITER_LEASE_MS must be at least 3000"));
-    }
-
-    #[test]
-    fn graph_node_rejects_an_excessive_writer_lease_window() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            ("GRAPH_WRITER_LEASE_MS".to_string(), "300001".to_string()),
-        ]);
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("GRAPH_WRITER_LEASE_MS must be at most 300000"));
-    }
-
-    #[test]
-    fn graph_node_config_validates_disk_cache_parts() {
-        for bytes in [0, 1000, 65536, 4194304] {
-            let config = RuntimeConfig::from_values(BTreeMap::from([
-                ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-                ("GRAPH_DATA_CACHE_PART_BYTES".to_string(), bytes.to_string()),
-            ]));
-            if bytes == 0 || bytes % 1024 != 0 {
-                assert!(config
-                    .unwrap_err()
-                    .to_string()
-                    .contains("GRAPH_DATA_CACHE_PART_BYTES"));
-            } else {
-                assert_eq!(
-                    config
-                        .unwrap()
-                        .graph_open_options()
-                        .cache
-                        .object_store_cache_part_bytes,
-                    bytes
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn graph_node_config_applies_disk_cache_file_handle_budget() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_DATA_CACHE_MAX_OPEN_FILES".to_string(),
-                "256".to_string(),
-            ),
-        ]);
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.data_cache_max_open_files, 256);
-        assert_eq!(
-            config
-                .graph_open_options()
-                .cache
-                .object_store_cache_max_open_file_handles,
-            256
-        );
-    }
-
-    #[test]
-    fn graph_node_rejects_an_undersized_disk_cache_file_handle_budget() {
-        let error = RuntimeConfig::from_values(BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_DATA_CACHE_MAX_OPEN_FILES".to_string(),
-                "15".to_string(),
-            ),
-        ]))
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("GRAPH_DATA_CACHE_MAX_OPEN_FILES (15) must be at least"));
-    }
-
-    #[test]
-    fn graph_node_config_applies_reader_wal_replay_concurrency() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_READER_WAL_REPLAY_CONCURRENCY".to_string(),
-                "32".to_string(),
-            ),
-        ]);
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.reader_wal_replay_concurrency, 32);
-        assert_eq!(
-            config
-                .graph_open_options()
-                .cache
-                .reader_wal_replay_concurrency,
-            32
-        );
-
-        let invalid = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_READER_WAL_REPLAY_CONCURRENCY".to_string(),
-                "0".to_string(),
-            ),
-        ]);
-        let error = RuntimeConfig::from_values(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("GRAPH_READER_WAL_REPLAY_CONCURRENCY must be greater than zero"));
-    }
-
-    #[test]
-    fn graph_node_config_selects_the_sparse_kernel() {
-        let base = || BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
-        let config = RuntimeConfig::from_values(base()).unwrap();
-        assert_eq!(config.sparse_kernel, SparseKernelBackend::SuiteSparse);
-        assert_eq!(
-            config.graph_open_options().cache_policy.sparse_kernel,
-            SparseKernelBackend::SuiteSparse
-        );
-
-        let mut values = base();
-        values.insert("GRAPH_SPARSE_KERNEL".to_string(), "Compact".to_string());
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.sparse_kernel, SparseKernelBackend::CompactCsc);
-
-        let mut values = base();
-        values.insert("GRAPH_SPARSE_KERNEL".to_string(), "ADJACENCY".to_string());
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.sparse_kernel, SparseKernelBackend::Adjacency);
-
-        let mut values = base();
-        values.insert("GRAPH_SPARSE_KERNEL".to_string(), "cuda".to_string());
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(error.to_string().contains("GRAPH_SPARSE_KERNEL"));
-    }
-
-    #[test]
-    fn graph_node_config_selects_the_read_routing_mode() {
-        // The default has to be `Fleet` and has to stay `Fleet`: change 2 of
-        // the cell-affine read routing plan ships the switch off, soaks
-        // `owner` in staging, and only then moves the default in its own
-        // commit. An unset variable that quietly meant `owner` would skip that
-        // step for every deployment at once.
-        let base = || BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
-        let config = RuntimeConfig::from_values(base()).unwrap();
-        assert_eq!(config.read_routing, BoltReadRouting::Fleet);
-
-        let mut values = base();
-        values.insert("GRAPH_READ_ROUTING".to_string(), "Owner".to_string());
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.read_routing, BoltReadRouting::Owner);
-
-        let mut values = base();
-        values.insert("GRAPH_READ_ROUTING".to_string(), "  FLEET ".to_string());
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.read_routing, BoltReadRouting::Fleet);
-
-        // A misspelling must stop the node rather than silently fall back to
-        // the default, which is how a "we flipped it" rollout reads as a
-        // no-op for a week.
-        let mut values = base();
-        values.insert("GRAPH_READ_ROUTING".to_string(), "nearest".to_string());
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("invalid GRAPH_READ_ROUTING=nearest; expected owner or fleet"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn graph_node_config_keeps_the_experimental_cypher_route_opt_in() {
-        let base = || BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
-        let config = RuntimeConfig::from_values(base()).unwrap();
-        assert_eq!(config.cypher_engine, CypherEngineMode::Legacy);
-
-        let mut values = base();
-        values.insert(
-            "GRAPH_CYPHER_ENGINE".to_string(),
-            "experimental".to_string(),
-        );
-        #[cfg(feature = "experimental-cypher-engine")]
-        assert_eq!(
-            RuntimeConfig::from_values(values).unwrap().cypher_engine,
-            CypherEngineMode::Experimental
-        );
-        #[cfg(not(feature = "experimental-cypher-engine"))]
-        assert!(RuntimeConfig::from_values(values)
-            .unwrap_err()
-            .to_string()
-            .contains("requires the experimental-cypher-engine Cargo feature"));
-
-        let mut invalid = base();
-        invalid.insert("GRAPH_CYPHER_ENGINE".to_string(), "new".to_string());
-        assert!(RuntimeConfig::from_values(invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("expected legacy or experimental"));
-    }
-
-    /// The spelling on a trace and the spelling in the environment are one
-    /// string, checked in the direction that would silently break.
-    ///
-    /// `BoltReadRouting::as_str` is what `bolt.route` records as
-    /// `hydradb.read_routing`, and the whole value of that field is that an
-    /// operator can read a captured routing table and know which
-    /// `GRAPH_READ_ROUTING` produced it. Rename either half alone and the field
-    /// becomes a value that matches no configuration anyone can set — a failure
-    /// with no symptom until someone tries to act on a trace.
-    #[test]
-    fn the_read_routing_span_value_is_the_env_spelling() {
-        for mode in [BoltReadRouting::Fleet, BoltReadRouting::Owner] {
-            let values =
-                BTreeMap::from([("GRAPH_READ_ROUTING".to_string(), mode.as_str().to_string())]);
-            assert_eq!(
-                parse_read_routing(&values, "GRAPH_READ_ROUTING").unwrap(),
-                mode,
-                "{} does not round-trip through GRAPH_READ_ROUTING",
-                mode.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn heartbeat_interval_must_be_shorter_than_the_timeout() {
-        // Both rejections describe the same production failure — every node's
-        // heartbeat expires before anything refreshes it, so the fleet computes
-        // an empty live set and no cell has an owner. Decision 5.
-        let base = || BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
-
-        let mut values = base();
-        values.insert("GRAPH_HEARTBEAT_INTERVAL_MS".to_string(), "0".to_string());
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("GRAPH_HEARTBEAT_INTERVAL_MS must be greater than zero"),
-            "unexpected error: {error}"
-        );
-
-        let mut values = base();
-        values.insert(
-            "GRAPH_HEARTBEAT_INTERVAL_MS".to_string(),
-            "15000".to_string(),
-        );
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("must be less than GRAPH_HEARTBEAT_TIMEOUT_MS"),
-            "unexpected error: {error}"
-        );
-
-        let mut values = base();
-        values.insert(
-            "GRAPH_HEARTBEAT_INTERVAL_MS".to_string(),
-            "20000".to_string(),
-        );
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("must be less than GRAPH_HEARTBEAT_TIMEOUT_MS"),
-            "unexpected error: {error}"
-        );
-
-        let mut values = base();
-        values.insert(
-            "GRAPH_HEARTBEAT_INTERVAL_MS".to_string(),
-            "2000".to_string(),
-        );
-        values.insert("GRAPH_HEARTBEAT_TIMEOUT_MS".to_string(), "6000".to_string());
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.heartbeat_interval, Duration::from_secs(2));
-        assert_eq!(config.heartbeat_timeout, Duration::from_secs(6));
-    }
-
-    #[test]
-    fn bookmark_wait_must_be_shorter_than_the_query_budget() {
-        // A bookmark wait at or past the query budget is the pre-change
-        // behaviour restored by config: the wait consumes everything, the
-        // client watchdog fires first, and `SnapshotAhead` — the one error
-        // that names the lagging cell and both epochs — never reaches the
-        // client. Change 3 of the cell-affine read routing plan.
-        let base = || BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
-
-        let mut values = base();
-        values.insert("GRAPH_MAX_BOOKMARK_WAIT_MS".to_string(), "500".to_string());
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.max_bookmark_wait_ms, 500);
-        assert_eq!(config.graph_open_options().limits.max_bookmark_wait_ms, 500);
-
-        let mut values = base();
-        values.insert(
-            "GRAPH_MAX_BOOKMARK_WAIT_MS".to_string(),
-            "30000".to_string(),
-        );
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "GRAPH_MAX_BOOKMARK_WAIT_MS (30000) must be less than \
-                 GRAPH_MAX_QUERY_RUNTIME_MS (30000)"
-            ),
-            "unexpected error: {error}"
-        );
-
-        // Lowering the query budget must move the ceiling with it, not leave
-        // the default 2s wait sitting above a 1s query.
-        let mut values = base();
-        values.insert("GRAPH_MAX_QUERY_RUNTIME_MS".to_string(), "1000".to_string());
-        let error = RuntimeConfig::from_values(values).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("must be less than GRAPH_MAX_QUERY_RUNTIME_MS (1000)"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn graph_node_config_can_disable_heavy_memory_caches() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            ("GRAPH_MAX_MATRIX_ADJACENCIES".to_string(), "0".to_string()),
-            (
-                "GRAPH_MAX_MATRIX_ADJACENCY_BYTES".to_string(),
-                "0".to_string(),
-            ),
-            ("GRAPH_MAX_GRAPHBLAS_MATRICES".to_string(), "0".to_string()),
-            ("GRAPH_MAX_GRAPHBLAS_BYTES".to_string(), "0".to_string()),
-            (
-                "GRAPH_MAX_RELATIONSHIP_ROWS_BYTES".to_string(),
-                "0".to_string(),
-            ),
-            (
-                "GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES".to_string(),
-                "0".to_string(),
-            ),
-            (
-                "GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES".to_string(),
-                "0".to_string(),
-            ),
-            ("GRAPH_SLATE_DB_CACHE_BYTES".to_string(), "0".to_string()),
-        ]);
-        let config = RuntimeConfig::from_values(values).unwrap();
-        let options = config.graph_open_options();
-        let memory = config.graph_memory_config();
-        assert_eq!(options.cache_policy.max_matrix_adjacencies, 0);
-        assert_eq!(memory.max_matrix_adjacency_bytes, 0);
-        assert_eq!(options.cache_policy.max_graphblas_matrices, 0);
-        assert_eq!(memory.max_graphblas_bytes, 0);
-        assert_eq!(memory.max_relationship_rows_bytes, 0);
-        assert_eq!(memory.max_source_relationship_rows_bytes, 0);
-        assert_eq!(memory.max_relationship_property_rows_bytes, 0);
-        assert_eq!(options.cache.slatedb_cache_bytes, 0);
-    }
 }

@@ -176,6 +176,62 @@ impl GraphShard {
         Ok(published)
     }
 
+    /// Build a generation from an already reconciled offline edge stream.
+    ///
+    /// Snapshot importers have the canonical relationships in memory before
+    /// the initial SlateDB manifest is published. Re-scanning the newly built
+    /// SSTs merely to recover those same endpoints can dominate a large import.
+    /// This path preserves the normal generation format and publication
+    /// arbitration while removing that redundant read. Callers must still run
+    /// [`GraphShard::verify_current_graph`] against the published image before
+    /// making the imported scope discoverable.
+    pub async fn build_graph_index_from_edges(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+    ) -> Result<GraphIndexGeneration> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let _permit = self
+            .acquire_artifact_build_permit("build_graph_index_from_edges")
+            .await?;
+        self.db.refresh_durable_reader().await?;
+        let durable_wal_id = self.db.last_durable_wal_id().await?;
+        let snapshot = self.db.snapshot().await?;
+        let base_sequence = snapshot.seq();
+        let last_wal_id = snapshot.last_wal_id().unwrap_or(durable_wal_id);
+        let mut adjacency = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
+        for (source, destination) in edges {
+            adjacency.entry(source).or_default().insert(destination);
+        }
+        let csc = graphblas_csc_from_adjacency(&adjacency)?;
+        let edge_count = csc.indices.len() as u64;
+        ensure_limit(
+            "build_graph_index_edges",
+            edge_count,
+            self.limits.max_artifact_build_edges,
+        )?;
+        let checksum = graphblas_csc_checksum(&csc);
+        let payload = encode_graph_index_csc(base_sequence, last_wal_id, checksum, &csc);
+        let generation = sha256_hex(&payload);
+        let manifest = GraphIndexGeneration {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            base_sequence,
+            last_wal_id,
+            edge_count,
+            checksum,
+            generation,
+        };
+        let published = self.publish_graph_index(&manifest, payload).await?;
+        self.graph_index_generations.lock().await.insert(
+            MatrixCacheKey::new(cell_id, edge_type, published.base_sequence),
+            published.clone(),
+        );
+        Ok(published)
+    }
+
     /// Incremental variant of [`GraphShard::build_graph_index`]: instead of
     /// re-scanning every canonical record for the edge type (the full build's
     /// `canonical_adjacency_at` above), load the previously published CSC
@@ -236,7 +292,7 @@ impl GraphShard {
         // reads, independent of WAL file count and write cadence, so there
         // is no cost gate and no cost-based decline: the two non-`Complete`
         // arms are one-time coverage bootstraps, not fallbacks
-        // (`interactive/incremental-build-cost.html` §11).
+        // (the incremental build-cost analysis §11).
         let overlay = match self
             .xlog_delta_since(
                 snapshot.as_ref(),

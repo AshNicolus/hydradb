@@ -96,6 +96,13 @@ pub struct RoutedGraphCluster {
     scope_registration: tokio::sync::OnceCell<()>,
     shards: BTreeMap<String, Arc<GraphShard>>,
     promotable: bool,
+    /// Closed while the object store is unverified; see [`crate::WriterGate`].
+    writer_gate: crate::WriterGate,
+    /// One per shard when the cluster belongs to a scoped runtime. Dropping the
+    /// cluster drops these, which retires each shard's final counter values
+    /// into the runtime's per-cell totals. Held for its `Drop` and never read.
+    #[allow(dead_code)]
+    operational_registrations: Vec<crate::CumulativeOperationalRegistration>,
 }
 
 #[cfg(feature = "query-transport")]
@@ -114,8 +121,12 @@ pub struct ScopedRoutedGraphCluster {
     placement: PlacementView,
     object_store: Arc<dyn ObjectStore>,
     slatedb_cache: Arc<SharedSlateDbCache>,
+    cache_totals: BTreeMap<String, Arc<crate::GraphCacheMetrics>>,
+    operational_totals: Arc<crate::CumulativeOperationalCounters>,
     writer_leases: Arc<ObjectStoreWriterLeaseDirectory>,
     writer_registry: Arc<ProcessWriterRegistry>,
+    /// Shared by every scope's cluster, so one switch covers all writers.
+    writer_gate: crate::WriterGate,
     scope_directory: ObjectStoreGraphScopeDirectory,
     indexer_change_wake: Option<Arc<tokio::sync::Notify>>,
     options: GraphOpenOptions,
@@ -229,12 +240,15 @@ mod artifact_gc;
 mod cluster;
 mod index_store;
 mod placement;
+mod planner_statistics;
 mod scope_directory;
 mod writer_lease;
 
 pub use placement::{CellOwnership, PlacementConfig, PlacementRefreshHandle, PlacementView};
 
-pub use scope_directory::{GraphScopeChange, ObjectStoreGraphScopeDirectory};
+pub use scope_directory::{
+    GraphScopeChange, ObjectStoreGraphScopeDirectory, PlannerStatisticsRequest,
+};
 pub use writer_lease::{
     ObjectStoreWriterLeaseDirectory, WriterLeaseOwner, WriterLeaseRenewalFailure,
 };
@@ -243,6 +257,12 @@ mod traversal;
 mod verify;
 
 pub use index_store::{GraphIndexBuildPath, GraphIndexGeneration};
+pub use planner_statistics::{
+    decode_planner_statistics, encode_planner_statistics, PlannerStatistics,
+    PlannerStatisticsBuildLimits, PlannerStatisticsPublish, PlannerStatisticsPublisher,
+    PropertyIndexStatistics, PropertySample, TagRange, PLANNER_STATISTICS_FORMAT_VERSION,
+    PLANNER_STATISTICS_TOP_VALUES,
+};
 
 pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(LocalFileSystem::new_with_prefix(path.as_ref())?) as Arc<dyn ObjectStore>)
@@ -447,9 +467,7 @@ fn compare_degree_maps(
         if actual_degree != *expected_degree {
             record_mismatch(
                 report,
-                format!(
-                    "{label}:mismatch vertex={vertex} expected={expected_degree} actual={actual_degree}"
-                ),
+                format!("{label}:mismatch vertex={vertex} expected={expected_degree} actual={actual_degree}"),
             );
         }
     }
@@ -474,9 +492,7 @@ fn compare_relationship_count_maps(
         if actual_count != *expected_count {
             record_mismatch(
                 report,
-                format!(
-                    "{label}:mismatch src={src} dst={dst} expected={expected_count} actual={actual_count}"
-                ),
+                format!("{label}:mismatch src={src} dst={dst} expected={expected_count} actual={actual_count}"),
             );
         }
     }
@@ -502,9 +518,7 @@ fn compare_relationship_property_index_sets(
     {
         record_mismatch(
             report,
-            format!(
-                "{label}:missing property={property} value={encoded} src={src} dst={dst} relationship_id={relationship_id}"
-            ),
+            format!("{label}:missing property={property} value={encoded} src={src} dst={dst} relationship_id={relationship_id}"),
         );
     }
     for (property, encoded, src, dst, relationship_id) in actual
@@ -513,9 +527,7 @@ fn compare_relationship_property_index_sets(
     {
         record_mismatch(
             report,
-            format!(
-                "{label}:extra property={property} value={encoded} src={src} dst={dst} relationship_id={relationship_id}"
-            ),
+            format!("{label}:extra property={property} value={encoded} src={src} dst={dst} relationship_id={relationship_id}"),
         );
     }
     let missing = expected.difference(actual).count();
@@ -598,20 +610,25 @@ fn record_mismatch(report: &mut GraphCorrectnessReport, message: String) {
 
 fn naive_reachable(adjacency: &MatrixAdjacency, root: VertexId, hops: u8) -> Vec<VertexId> {
     let mut frontier = BTreeSet::from([root]);
-    let mut reachable = BTreeSet::new();
+    let mut reachable = BTreeSet::from([root]);
     for _ in 0..hops {
         let mut next = BTreeSet::new();
         for vertex in &frontier {
             if let Some(neighbors) = adjacency.get(vertex) {
-                next.extend(neighbors.iter().copied());
+                next.extend(
+                    neighbors
+                        .iter()
+                        .copied()
+                        .filter(|neighbor| reachable.insert(*neighbor)),
+                );
             }
         }
-        reachable.extend(next.iter().copied());
         frontier = next;
         if frontier.is_empty() {
             break;
         }
     }
+    reachable.remove(&root);
     reachable.into_iter().collect()
 }
 
@@ -761,9 +778,7 @@ fn graphblas_csc_chunk_key(
     field: &str,
     chunk_id: u64,
 ) -> String {
-    format!(
-        "cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{base_epoch:020}/{field}/{chunk_id:020}"
-    )
+    format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{base_epoch:020}/{field}/{chunk_id:020}")
 }
 
 fn graph_artifact_gc_prefixes(cell_id: &str, edge_type: &str) -> Vec<String> {

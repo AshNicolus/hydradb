@@ -105,13 +105,22 @@ impl GraphShard {
 
             let started = Instant::now();
             let empty_adjacency = BTreeMap::new();
-            let traversal = if let Some(overlay) = overlay {
+            let mut traversal = if let Some(overlay) = overlay {
                 crate::shard::topology_tail::expand_range_with_overlay(
                     &compiled, &overlay, starts, 1, hops,
                 )?
             } else {
                 expand_compiled_graphblas(&compiled, &empty_adjacency, starts, hops)?
             };
+            // `matrix_reachable` is the fixed reachability API and, like the
+            // direct and compiled fixed-hop kernels, excludes its seed set.
+            // The shared overlay helper implements Cypher range semantics and
+            // may rediscover a seed through a cycle, so normalize that one
+            // semantic difference at this API boundary.
+            let start_set = starts.iter().copied().collect::<BTreeSet<_>>();
+            traversal
+                .vertices
+                .retain(|vertex| !start_set.contains(vertex));
             record_matrix_profile(
                 profile,
                 "expand_compiled_graphblas",

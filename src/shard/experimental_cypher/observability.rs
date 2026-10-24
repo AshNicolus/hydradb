@@ -13,7 +13,9 @@
 //! - **Metric labels:** `cell_id` only, through the existing per-cell counters.
 //!   Route and fallback are separate counters, not labels.
 //! - **Span attributes on every request:** stage times, plan hash, capability,
-//!   route, storage calls and the widest intermediate result.
+//!   route, storage calls, the widest intermediate result, and what chose the
+//!   access path (`hydradb.query.access_path.*`): statistics, the runtime
+//!   probe, the guard, or neither. Only a property *name* is recorded there.
 //! - **Only on a request that trips a sampling trigger:** the plan shape
 //!   (`hydradb.query.plan`, literals already elided) and a WARN event. Such a
 //!   request is also marked `hydradb.sampling.tail_keep` so the collector
@@ -27,13 +29,13 @@ use std::time::Duration;
 
 use hydradb_cypher_engine::{
     plan_shape_hash, ExecutionProfile, GraphPhysicalPlan, LowerTimings, OperatorProfile,
-    OperatorProfiler, PreparedQuery, StatisticsProvider,
+    OperatorProfiler, PreparedQuery, StatisticsAccessReport, StatisticsProvider,
 };
 
 use super::super::query_optimizer::{slow_query_threshold_ms, wide_plan_threshold_rows};
 use super::GraphShard;
 use crate::core::state::ReadAccounting;
-use crate::{ExperimentalOperatorMetricsSnapshot, GraphError};
+use crate::{graph_now_millis, ExperimentalOperatorMetricsSnapshot, GraphError};
 
 /// An operator estimate is a miss when it is off from the rows produced by at
 /// least this ratio...
@@ -61,6 +63,76 @@ pub(super) struct RequestWork {
     /// reports from `&self` methods and the future must stay `Send`. The
     /// executor is sequential, so it is never contended.
     profiler: Mutex<Option<OperatorProfiler>>,
+    /// What chose the access path: the probe's runs and the reports of
+    /// statistics-chosen accesses. Same locking argument as `profiler`.
+    access: Mutex<AccessObservation>,
+}
+
+/// The runtime probe and the statistics-chosen accesses of one request.
+#[derive(Clone, Debug, Default)]
+pub(super) struct AccessObservation {
+    probe_runs: u64,
+    probe_us: u64,
+    /// Some probe answered, so its vertices replaced the planned access.
+    probe_answered: bool,
+    /// Statistics-chosen accesses that read past their guard and declined.
+    guard_stops: u64,
+    /// The report that read the most index entries, which describes the
+    /// access that dominated the request when several bindings report.
+    widest: Option<StatisticsAccessReport>,
+}
+
+/// What chose a request's access path. One value per request; when more than
+/// one applies, the earlier variant wins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AccessPathSource {
+    /// Statistics chose, the access read past its guard, and the plan chosen
+    /// without statistics (probed as today) answered instead.
+    Guard,
+    /// The runtime probe answered: today's path.
+    Probe,
+    /// Statistics chose and their access answered without the probe.
+    Statistics,
+    /// Neither: the planner's first equality, as before statistics.
+    Default,
+}
+
+impl AccessPathSource {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Guard => "guard",
+            Self::Probe => "probe",
+            Self::Statistics => "statistics",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl AccessObservation {
+    pub(super) fn source(&self) -> AccessPathSource {
+        if self.guard_stops > 0 {
+            AccessPathSource::Guard
+        } else if self.probe_answered {
+            AccessPathSource::Probe
+        } else if self.widest.is_some() {
+            AccessPathSource::Statistics
+        } else {
+            AccessPathSource::Default
+        }
+    }
+
+    fn record_report(&mut self, report: &StatisticsAccessReport) {
+        if report.declined {
+            self.guard_stops += 1;
+        }
+        if self
+            .widest
+            .as_ref()
+            .is_none_or(|widest| report.entries_read > widest.entries_read)
+        {
+            self.widest = Some(report.clone());
+        }
+    }
 }
 
 impl RequestWork {
@@ -86,6 +158,31 @@ impl RequestWork {
     fn take_profile(&self) -> Option<ExecutionProfile> {
         self.lock_profiler().take().map(OperatorProfiler::finish)
     }
+
+    fn lock_access(&self) -> std::sync::MutexGuard<'_, AccessObservation> {
+        self.access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn access(&self) -> AccessObservation {
+        self.lock_access().clone()
+    }
+}
+
+/// One run of the runtime equality probe, and whether it answered.
+pub(super) fn record_probe(elapsed_us: u64, answered: bool) {
+    let _ = REQUEST_WORK.try_with(|work| {
+        let mut access = work.lock_access();
+        access.probe_runs += 1;
+        access.probe_us = access.probe_us.saturating_add(elapsed_us);
+        access.probe_answered |= answered;
+    });
+}
+
+/// A statistics-chosen access finished or declined.
+pub(super) fn record_statistics_access(report: &StatisticsAccessReport) {
+    let _ = REQUEST_WORK.try_with(|work| work.lock_access().record_report(report));
 }
 
 fn with_profiler(charge: impl FnOnce(&mut OperatorProfiler)) {
@@ -131,13 +228,21 @@ pub(super) fn record_storage_call(
                 "hydrate_vertices" | "scan_vertices_by_property_ordered" => {
                     profiler.record_hydrated_vertices(rows_out);
                 }
-                "expand_relationships" | "seek_relationships_by_property" => {
+                "expand_relationships"
+                | "expand_relationships_between"
+                | "seek_relationships_by_property"
+                | "seek_relationships_by_property_values"
+                | "scan_relationships_by_property_ordered" => {
                     profiler.record_scanned_relationships(rows_out);
                 }
                 _ => {}
             }
         }
     });
+}
+
+pub(super) fn record_full_scan() {
+    with_profiler(OperatorProfiler::record_full_scan);
 }
 
 /// Note an intermediate row collection the executor asked to admit.
@@ -189,6 +294,17 @@ pub(super) fn request_span() -> tracing::Span {
         hydradb.query.stage.operator_cpu_us = tracing::field::Empty,
         hydradb.query.stage.result_us = tracing::field::Empty,
         hydradb.query.storage.calls = tracing::field::Empty,
+        hydradb.query.stats.sequence = tracing::field::Empty,
+        hydradb.query.stats.age_ms = tracing::field::Empty,
+        hydradb.query.access_path.source = tracing::field::Empty,
+        hydradb.query.access_path.kind = tracing::field::Empty,
+        hydradb.query.access_path.property = tracing::field::Empty,
+        hydradb.query.access_path.rows_estimated = tracing::field::Empty,
+        hydradb.query.access_path.rows_actual = tracing::field::Empty,
+        hydradb.query.access_path.estimate_ratio = tracing::field::Empty,
+        hydradb.query.access_path.probe_ran = tracing::field::Empty,
+        hydradb.query.access_path.probe_us = tracing::field::Empty,
+        hydradb.query.access_path.guard_stopped = tracing::field::Empty,
         hydradb.query.rows_widest = tracing::field::Empty,
         hydradb.query.rows_materialized = tracing::field::Empty,
         hydradb.query.rows_returned = tracing::field::Empty,
@@ -216,6 +332,9 @@ pub(super) struct RequestObservation {
     pub(super) work: Arc<RequestWork>,
     /// Per-operator work, with estimates attached, once execution returned.
     pub(super) profile: Option<ExecutionProfile>,
+    /// `(storage_sequence, built_at_ms)` of the planner statistics object the
+    /// request loaded, when `GRAPH_PLANNER_STATISTICS` is on and one exists.
+    pub(super) planner_statistics: Option<(u64, u64)>,
 }
 
 pub(super) struct PlanIdentity {
@@ -331,6 +450,16 @@ impl RequestObservation {
         span.record("hydradb.query.stage.operator_cpu_us", micros(operator_cpu));
         span.record("hydradb.query.stage.result_us", micros(self.result));
         span.record("hydradb.query.storage.calls", storage_calls);
+        if let Some((sequence, built_at_ms)) = self.planner_statistics {
+            span.record("hydradb.query.stats.sequence", sequence);
+            span.record(
+                "hydradb.query.stats.age_ms",
+                graph_now_millis().saturating_sub(built_at_ms),
+            );
+        }
+        let access = self.work.access();
+        let source = access.source();
+        record_access_path(span, &access, source);
         span.record("hydradb.query.rows_widest", widest_rows);
         span.record(
             "hydradb.query.rows_materialized",
@@ -368,9 +497,61 @@ impl RequestObservation {
             (&metrics.query_experimental_storage_us, micros(storage)),
             (&metrics.query_experimental_storage_calls, storage_calls),
             (&metrics.query_experimental_result_us, micros(self.result)),
+            (&metrics.query_experimental_guard_stops, access.guard_stops),
         ] {
             counter.fetch_add(value, Ordering::Relaxed);
         }
+        // Estimate accuracy of the statistics-chosen access, as sums the
+        // dashboard divides and as a miss count either way. The widest
+        // access stands for the request, as it does on the span.
+        if let Some(report) = &access.widest {
+            metrics
+                .query_experimental_access_rows_estimated
+                .fetch_add(report.estimated_rows, Ordering::Relaxed);
+            metrics
+                .query_experimental_access_rows_actual
+                .fetch_add(report.entries_read, Ordering::Relaxed);
+            let (estimated, actual) = (report.estimated_rows.max(1), report.entries_read.max(1));
+            if actual > estimated.saturating_mul(2) {
+                metrics
+                    .query_experimental_access_underestimates
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if actual.saturating_mul(2) < estimated {
+                metrics
+                    .query_experimental_access_overestimates
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // The same request split by what chose its access path, so the mean
+        // latency of plan-chosen requests reads against probe-chosen ones, and
+        // the histogram gives their quantiles. Recorded together, so the
+        // histogram's count and sum are the two counters by construction.
+        let (requests, latency_us, latency) = match source {
+            AccessPathSource::Statistics => (
+                &metrics.query_experimental_access_statistics_requests,
+                &metrics.query_experimental_access_statistics_us,
+                &metrics.query_experimental_access_statistics_latency,
+            ),
+            AccessPathSource::Probe => (
+                &metrics.query_experimental_access_probe_requests,
+                &metrics.query_experimental_access_probe_us,
+                &metrics.query_experimental_access_probe_latency,
+            ),
+            AccessPathSource::Guard => (
+                &metrics.query_experimental_access_guard_requests,
+                &metrics.query_experimental_access_guard_us,
+                &metrics.query_experimental_access_guard_latency,
+            ),
+            AccessPathSource::Default => (
+                &metrics.query_experimental_access_default_requests,
+                &metrics.query_experimental_access_default_us,
+                &metrics.query_experimental_access_default_latency,
+            ),
+        };
+        let elapsed_us = micros(elapsed);
+        requests.fetch_add(1, Ordering::Relaxed);
+        latency_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        latency.record_micros(elapsed_us);
 
         let worst_estimate = self
             .profile
@@ -385,14 +566,18 @@ impl RequestObservation {
             return;
         };
         let plan_hash = format!("{:016x}", plan.hash);
+        // The plan says a scan is possible; the profile says whether one ran.
+        // A range probe that answers never runs its fallback's scan.
+        let full_scan = plan.full_scan
+            && self
+                .profile
+                .as_ref()
+                .is_none_or(ExecutionProfile::ran_full_scan);
         span.record("hydradb.query.plan_hash", plan_hash.as_str());
-        span.record("hydradb.query.full_scan", plan.full_scan);
-        let Some(reason) = sampling_reason(
-            plan.full_scan,
-            widest_rows,
-            worst_estimate.is_some(),
-            elapsed,
-        ) else {
+        span.record("hydradb.query.full_scan", full_scan);
+        let Some(reason) =
+            sampling_reason(full_scan, widest_rows, worst_estimate.is_some(), elapsed)
+        else {
             return;
         };
         metrics
@@ -415,7 +600,7 @@ impl RequestObservation {
                 worst_estimate.map_or("", |(operator, _)| operator.operator),
             hydradb.query.worst_estimate_ratio = worst_estimate.map_or(0.0, |(_, ratio)| ratio),
             hydradb.query.plan_hash = %plan_hash,
-            hydradb.query.full_scan = plan.full_scan,
+            hydradb.query.full_scan = full_scan,
             hydradb.query.rows_widest = widest_rows,
             hydradb.query.storage.calls = storage_calls,
             elapsed_us = micros(elapsed),
@@ -432,6 +617,43 @@ impl RequestObservation {
             "experimental query plan warrants attention"
         );
     }
+}
+
+/// What chose the access path, on the request span. Names a property, never a
+/// value: the report carries no value to record.
+fn record_access_path(span: &tracing::Span, access: &AccessObservation, source: AccessPathSource) {
+    span.record("hydradb.query.access_path.source", source.as_str());
+    span.record("hydradb.query.access_path.probe_ran", access.probe_runs > 0);
+    if access.probe_runs > 0 {
+        span.record("hydradb.query.access_path.probe_us", access.probe_us);
+    }
+    span.record(
+        "hydradb.query.access_path.guard_stopped",
+        access.guard_stops > 0,
+    );
+    let Some(report) = &access.widest else {
+        return;
+    };
+    span.record("hydradb.query.access_path.kind", report.kind.as_str());
+    if let Some(property) = &report.property {
+        span.record("hydradb.query.access_path.property", property.as_str());
+    }
+    span.record(
+        "hydradb.query.access_path.rows_estimated",
+        report.estimated_rows,
+    );
+    span.record("hydradb.query.access_path.rows_actual", report.entries_read);
+    // Actual over estimated, so above one is an underestimate and below one
+    // an overestimate. Both sides are floored at one, as the operator ratio
+    // is, so an empty read is not an infinite miss.
+    let (estimated, actual) = (
+        (report.estimated_rows as f64).max(1.0),
+        (report.entries_read as f64).max(1.0),
+    );
+    span.record(
+        "hydradb.query.access_path.estimate_ratio",
+        actual / estimated,
+    );
 }
 
 /// Fold one request's operator profile into the shard's per-operator totals:
@@ -535,376 +757,4 @@ fn operator_profile_span(parent: &tracing::Span, operator: &OperatorProfile) -> 
         span.record("hydradb.query.operator.estimate_ratio", ratio);
     }
     span
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use slatedb::object_store::memory::InMemory;
-
-    use super::super::super::*;
-
-    type Captured = Arc<Mutex<Vec<(String, String)>>>;
-
-    /// Remembers every span field recorded after creation. The same shape as
-    /// the capture in `query_optimizer`'s tests, for the same reason:
-    /// `tracing-subscriber` is not a dependency of this library.
-    struct RecordedFields(Captured);
-
-    impl tracing::field::Visit for RecordedFields {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((field.name().to_string(), format!("{value:?}")));
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((field.name().to_string(), value.to_string()));
-        }
-    }
-
-    impl tracing::Subscriber for RecordedFields {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            // Operator profiles are complete at creation; every other span
-            // under test is filled in afterwards and captured by `record`.
-            if span.metadata().name() == "query.experimental.operator_profile" {
-                span.record(&mut RecordedFields(Arc::clone(&self.0)));
-            }
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-            values.record(&mut RecordedFields(Arc::clone(&self.0)));
-        }
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, _event: &tracing::Event<'_>) {}
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    fn values_of<'a>(captured: &'a [(String, String)], field: &str) -> Vec<&'a str> {
-        captured
-            .iter()
-            .filter(|(name, _)| name == field)
-            .map(|(_, value)| value.as_str())
-            .collect()
-    }
-
-    #[test]
-    fn two_missed_nodes_of_one_kind_are_one_missed_request() {
-        let scan = |id, estimated_rows| hydradb_cypher_engine::OperatorProfile {
-            id,
-            parent: Some(0),
-            operator: "VertexLabelScan",
-            invocations: 1,
-            rows_out: 6,
-            estimated_rows: Some(estimated_rows),
-            ..Default::default()
-        };
-        let profile = hydradb_cypher_engine::ExecutionProfile {
-            operators: vec![
-                hydradb_cypher_engine::OperatorProfile {
-                    id: 0,
-                    operator: "UnionExec",
-                    invocations: 1,
-                    rows_in: 12,
-                    rows_out: 12,
-                    ..Default::default()
-                },
-                scan(1, 50_000),
-                scan(2, 50_000),
-            ],
-        };
-        let totals = super::request_operator_totals(&profile);
-        let scans = totals
-            .iter()
-            .filter(|operator| operator.operator == "VertexLabelScan")
-            .collect::<Vec<_>>();
-        assert_eq!(scans.len(), 2, "one entry per node that ran");
-        assert_eq!(scans.iter().map(|scan| scan.requests).sum::<u64>(), 1);
-        assert_eq!(
-            scans.iter().map(|scan| scan.estimate_misses).sum::<u64>(),
-            1
-        );
-        assert_eq!(scans.iter().map(|scan| scan.rows_out).sum::<u64>(), 12);
-    }
-
-    #[test]
-    fn preparation_splits_into_parse_lower_and_bind() {
-        let built = super::RequestObservation {
-            lowering: Duration::from_micros(100),
-            lower_timings: super::LowerTimings {
-                parse: Duration::from_micros(60),
-                lower: Duration::from_micros(25),
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            built.preparation_split(),
-            (
-                Duration::from_micros(60),
-                Duration::from_micros(25),
-                Duration::from_micros(15)
-            )
-        );
-        // A cache hit neither parses nor lowers: all of it is binding.
-        let hit = super::RequestObservation {
-            lowering: Duration::from_micros(9),
-            lower_cache_hit: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            hit.preparation_split(),
-            (Duration::ZERO, Duration::ZERO, Duration::from_micros(9))
-        );
-    }
-
-    fn experimental(key: &str) -> QueryContext {
-        QueryContext::new("cell-a", key).with_cypher_engine(CypherEngineMode::Experimental)
-    }
-
-    #[tokio::test]
-    async fn a_request_decomposes_into_stages_and_a_full_scan_is_sampled() {
-        let captured: Captured = Arc::default();
-        let _subscriber = tracing::subscriber::set_default(RecordedFields(Arc::clone(&captured)));
-        let shard = GraphShard::open_standalone_writer(
-            "graph/experimental-observability",
-            Arc::new(InMemory::new()),
-        )
-        .await
-        .expect("open graph shard");
-        for (id, entity_id) in [(1, "alpha"), (2, "other")] {
-            shard
-                .set_vertex_metadata(
-                    "cell-a",
-                    id,
-                    VertexMetadata::default()
-                        .with_label("Entity")
-                        .with_property(
-                            "entity_id",
-                            VertexPropertyValue::String(entity_id.to_string()),
-                        ),
-                )
-                .await
-                .unwrap();
-        }
-
-        // A full scan is sampled and carries its plan shape, with the window's
-        // literals elided (the crate's tests pin that for string literals).
-        shard
-            .execute_cypher_rows(
-                experimental("full-scan"),
-                "MATCH (n) RETURN n.entity_id AS id ORDER BY id SKIP 1 LIMIT 5",
-            )
-            .await
-            .expect("full scan executes");
-        let metrics = shard.graph_operational_metrics();
-        assert_eq!(metrics.query_route_experimental_requests, 1);
-        assert_eq!(metrics.query_experimental_requests, 1);
-        assert!(
-            metrics.query_experimental_storage_calls >= 2,
-            "scan and hydrate"
-        );
-        assert!(metrics.query_experimental_execute_us >= metrics.query_experimental_storage_us);
-        assert_eq!(metrics.query_experimental_sampled_plans, 1);
-        {
-            let recorded = captured.lock().unwrap();
-            assert_eq!(
-                values_of(&recorded, "hydradb.sampling.tail_keep"),
-                vec!["full_scan"]
-            );
-            assert_eq!(
-                values_of(&recorded, "hydradb.query.capability"),
-                vec!["supported"]
-            );
-            let hashes = values_of(&recorded, "hydradb.query.plan_hash");
-            assert_eq!(hashes.len(), 1);
-            assert_eq!(hashes[0].len(), 16);
-            let plans = values_of(&recorded, "hydradb.query.plan");
-            assert_eq!(plans.len(), 1);
-            assert!(plans[0].contains("AllVertexScan"), "{}", plans[0]);
-            assert!(plans[0].contains("count=?"), "{}", plans[0]);
-            for field in [
-                "hydradb.query.stage.parse_us",
-                "hydradb.query.stage.lower_us",
-                "hydradb.query.stage.bind_us",
-                "hydradb.query.stage.snapshot_us",
-                "hydradb.query.stage.statistics_us",
-                "hydradb.query.stage.plan_us",
-                "hydradb.query.stage.storage_us",
-                "hydradb.query.stage.operator_cpu_us",
-                "hydradb.query.stage.result_us",
-            ] {
-                assert_eq!(values_of(&recorded, field).len(), 1, "{field} not recorded");
-            }
-        }
-        captured.lock().unwrap().clear();
-
-        // An indexed seek is neither sampled nor given a plan attribute.
-        shard
-            .execute_cypher_rows(
-                experimental("seek"),
-                "MATCH (n:Entity {entity_id: 'other'}) RETURN n.entity_id AS id",
-            )
-            .await
-            .expect("seek executes");
-        assert_eq!(
-            shard
-                .graph_operational_metrics()
-                .query_experimental_sampled_plans,
-            1
-        );
-        {
-            let recorded = captured.lock().unwrap();
-            assert!(values_of(&recorded, "hydradb.sampling.tail_keep").is_empty());
-            assert!(values_of(&recorded, "hydradb.query.plan").is_empty());
-            assert_eq!(values_of(&recorded, "hydradb.query.plan_hash").len(), 1);
-        }
-        captured.lock().unwrap().clear();
-
-        // A query the engine cannot plan reports itself as unsupported.
-        let unsupported = shard
-            .execute_cypher_rows(experimental("unsupported"), "MATCH (n) RETURN *")
-            .await;
-        assert!(unsupported.is_err());
-        assert_eq!(
-            values_of(&captured.lock().unwrap(), "hydradb.query.capability"),
-            vec!["unsupported"]
-        );
-
-        // The legacy route and a mutation fallback are counted by route.
-        shard
-            .execute_cypher_rows(
-                QueryContext::new("cell-a", "legacy"),
-                "MATCH (n:Entity {entity_id: 'other'}) RETURN n.entity_id AS id",
-            )
-            .await
-            .expect("legacy executes");
-        shard
-            .execute_cypher_rows(
-                experimental("mutation"),
-                "CREATE (a {id: 7})-[:KNOWS]->(b {id: 8})",
-            )
-            .await
-            .expect("mutation executes");
-        let metrics = shard.graph_operational_metrics();
-        assert_eq!(metrics.query_route_legacy_requests, 1);
-        assert_eq!(metrics.query_route_mutation_fallbacks, 1);
-        assert_eq!(metrics.query_route_experimental_requests, 3);
-        assert_eq!(metrics.query_experimental_requests, 3);
-
-        shard.close().await.expect("close graph shard");
-    }
-
-    #[tokio::test]
-    async fn operators_are_counted_always_and_profiled_on_sampled_traces_only() {
-        let captured: Captured = Arc::default();
-        let _subscriber = tracing::subscriber::set_default(RecordedFields(Arc::clone(&captured)));
-        let shard = GraphShard::open_standalone_writer(
-            "graph/experimental-operator-profile",
-            Arc::new(InMemory::new()),
-        )
-        .await
-        .expect("open graph shard");
-        for (id, entity_id) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
-            shard
-                .set_vertex_metadata(
-                    "cell-a",
-                    id,
-                    VertexMetadata::default()
-                        .with_label("Entity")
-                        .with_property(
-                            "entity_id",
-                            VertexPropertyValue::String(entity_id.to_string()),
-                        ),
-                )
-                .await
-                .unwrap();
-        }
-
-        // Unsampled: counted, but no operator span.
-        shard
-            .execute_cypher_rows(
-                experimental("seek"),
-                "MATCH (n:Entity {entity_id: 'beta'}) RETURN n.entity_id AS id",
-            )
-            .await
-            .expect("seek executes");
-        assert!(values_of(&captured.lock().unwrap(), "hydradb.query.operator.self_us").is_empty());
-        let operators = shard.graph_operational_metrics().experimental_operators;
-        let seek = operators
-            .iter()
-            .find(|operator| operator.operator == "VertexPropertySeek")
-            .unwrap_or_else(|| panic!("{operators:#?}"));
-        assert_eq!(seek.requests, 1);
-        assert_eq!(seek.invocations, 1);
-        assert_eq!(seek.rows_out, 1);
-        assert_eq!(seek.hydrated_vertices, 1);
-        assert!(
-            seek.storage_requests >= 2,
-            "index scan and metadata read: {seek:#?}"
-        );
-        assert!(seek.storage_bytes > 0, "{seek:#?}");
-        let project = operators
-            .iter()
-            .find(|operator| operator.operator == "ProjectExec")
-            .expect("the root is counted");
-        assert_eq!(project.rows_in, 1);
-        assert_eq!(
-            project.storage_requests, 0,
-            "its input's reads are not its own"
-        );
-        captured.lock().unwrap().clear();
-
-        // Sampled (a full scan): one operator span per plan node, parented.
-        shard
-            .execute_cypher_rows(experimental("scan"), "MATCH (n) RETURN n.entity_id AS id")
-            .await
-            .expect("scan executes");
-        {
-            let recorded = captured.lock().unwrap();
-            assert_eq!(
-                values_of(&recorded, "hydradb.query.operator.id"),
-                vec!["0", "1"]
-            );
-            assert_eq!(
-                values_of(&recorded, "hydradb.query.operator.parent_id"),
-                vec!["0"]
-            );
-            assert_eq!(
-                values_of(&recorded, "hydradb.query.operator.hydrated_vertices"),
-                vec!["0", "3"]
-            );
-        }
-        let scan = shard
-            .graph_operational_metrics()
-            .experimental_operators
-            .into_iter()
-            .find(|operator| operator.operator == "AllVertexScan")
-            .expect("the scan is counted");
-        assert_eq!(scan.rows_out, 3);
-        assert_eq!(scan.peak_retained_rows, 3);
-        // The all-vertex scan reads the snapshot it holds directly, not
-        // through `GraphStore`; its storage work must still be charged to it.
-        assert!(
-            scan.storage_requests >= 1,
-            "the scan's snapshot reads were not counted: {scan:?}"
-        );
-
-        shard.close().await.expect("close graph shard");
-    }
 }

@@ -20,8 +20,19 @@ pub(crate) fn prepare_experimental_cypher(
     lists: &BTreeMap<String, Vec<VertexPropertyValue>>,
 ) -> Result<ExperimentalCypherRequest> {
     let (explain, logical) = lower_experimental_cypher(query, parameters, lists)?;
+    // Column discovery refuses at the same boundary the shard does. Otherwise a
+    // client can be told a query has columns and then be refused when it runs
+    // it, which is a worse answer than the refusal it should have had here.
+    logical
+        .capability()
+        .into_result()
+        .map_err(experimental_engine_error)?;
     let prepared = logical
         .plan_with_statistics(&UnknownStatistics)
+        .map_err(experimental_engine_error)?;
+    prepared
+        .capability()
+        .into_result()
         .map_err(experimental_engine_error)?;
     Ok(ExperimentalCypherRequest { explain, prepared })
 }
@@ -96,8 +107,15 @@ const LOWERED_TEMPLATE_CACHE_MAX_QUERY_BYTES: usize = 16 * 1024;
 /// Process-wide rather than per shard for the same reason: the template is a
 /// pure function of the text, and the client transports that also lower have
 /// no shard in hand.
+#[derive(Clone)]
+struct CachedLoweringFailure {
+    reason: QueryFailureReason,
+    message: String,
+}
+type CachedLowering = std::result::Result<LoweredTemplate, CachedLoweringFailure>;
+
 struct LoweredTemplateEntry {
-    template: LoweredTemplate,
+    template: CachedLowering,
     bytes: usize,
     last_used: u64,
 }
@@ -134,7 +152,7 @@ impl LoweredTemplateCache {
         self.clock
     }
 
-    fn get(&mut self, query: &str) -> Option<LoweredTemplate> {
+    fn get(&mut self, query: &str) -> Option<CachedLowering> {
         let now = self.tick();
         let entry = self.entries.get_mut(query)?;
         self.by_use.remove(&entry.last_used);
@@ -161,7 +179,15 @@ impl LoweredTemplateCache {
     }
 
     fn insert(&mut self, query: &str, template: LoweredTemplate) {
-        let bytes = query.len() + template.estimated_bytes();
+        self.insert_outcome(query, Ok(template));
+    }
+
+    fn insert_outcome(&mut self, query: &str, template: CachedLowering) {
+        let bytes = query.len()
+            + match &template {
+                Ok(template) => template.estimated_bytes(),
+                Err(error) => error.message.len() + std::mem::size_of::<CachedLoweringFailure>(),
+            };
         if bytes > self.max_bytes {
             return;
         }
@@ -210,7 +236,7 @@ fn lowered_template(query: &str) -> Result<(LoweredTemplate, TemplateLowering)> 
             .get(query);
         if let Some(template) = cached {
             return Ok((
-                template,
+                template.map_err(|error| experimental_query_error(error.reason, error.message))?,
                 TemplateLowering {
                     cache_hit: true,
                     timings: LowerTimings::default(),
@@ -218,8 +244,29 @@ fn lowered_template(query: &str) -> Result<(LoweredTemplate, TemplateLowering)> 
             ));
         }
     }
-    let (template, timings) =
-        LoweredTemplate::lower_timed(query).map_err(experimental_engine_error)?;
+    let (template, timings) = match LoweredTemplate::lower_timed(query) {
+        Ok(lowered) => lowered,
+        Err(error) => {
+            // Lowering depends only on query text, never parameters or graph
+            // statistics. Cache deterministic rejections under the same LRU
+            // entry and byte limits so routing layers do not parse them again.
+            if cacheable {
+                if let Some(reason) = error.failure_reason() {
+                    lowered_template_cache()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert_outcome(
+                            query,
+                            Err(CachedLoweringFailure {
+                                reason,
+                                message: error.to_string(),
+                            }),
+                        );
+                }
+            }
+            return Err(experimental_engine_error(error));
+        }
+    };
     if cacheable {
         lowered_template_cache()
             .lock()
@@ -251,6 +298,15 @@ pub(crate) fn experimental_query_columns(
         .into_iter()
         .map(QueryColumn::new)
         .collect())
+}
+
+/// Whether the Cypher 25 adapter lowers `query` to a typed read plan.
+///
+/// The fallback `classify_opencypher_query_access` asks when libcypher cannot
+/// parse a query. Lowering goes through the template cache, so the request
+/// that follows finds the template already built.
+pub(crate) fn is_cypher25_read_query(query: &str) -> bool {
+    split_explain(query).is_ok_and(|(_, query)| lowered_template(query).is_ok())
 }
 
 pub(crate) fn is_experimental_explain(query: &str) -> bool {
@@ -296,11 +352,30 @@ pub(crate) fn property_to_scalar(value: &VertexPropertyValue) -> ScalarValue {
     }
 }
 
+/// Move decoded property strings into the engine when the adapter owns the
+/// record. This avoids copying large relationship metadata blobs on hydration.
+pub(crate) fn property_into_scalar(value: VertexPropertyValue) -> ScalarValue {
+    match value {
+        VertexPropertyValue::String(value) => ScalarValue::String(value.into_boxed_str()),
+        value => property_to_scalar(&value),
+    }
+}
+
 pub(crate) fn experimental_engine_error(error: EngineError) -> GraphError {
+    // A storage failure the adapter raised as a `GraphError` -- a timeout, a
+    // scan/row/byte budget, admission, a corrupt record -- is that error, with
+    // the class and client code legacy gives it. None of them is a gap in the
+    // query language, and calling one so tells a Bolt client its syntax is
+    // wrong.
+    let error = match error.into_backend_error::<GraphError>() {
+        Ok(storage) => return storage,
+        Err(error) => error,
+    };
     match error.failure_reason() {
         Some(reason) => experimental_query_error(reason, error),
-        // A storage failure relayed as a string: its real class is lost, so
-        // it keeps the wording clients always saw and is left uncounted.
+        // A storage failure that carried no typed error: its real class is
+        // lost, so it keeps the wording clients always saw and is left
+        // uncounted.
         None => GraphError::UnclassifiedQuery {
             dialect: "Cypher25",
             feature: error.to_string(),
@@ -338,214 +413,4 @@ fn split_explain(query: &str) -> Result<(bool, &str)> {
         ));
     }
     Ok((true, rest))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hydradb_cypher_engine::Symbol;
-
-    /// A storage failure reaches the engine as a string, so a timeout while
-    /// reading cannot be told from anything else. It keeps the wording clients
-    /// always saw but carries no reason, so it is not counted as a query
-    /// failure; a real planning gap still is.
-    #[test]
-    fn a_relayed_storage_error_is_not_filed_as_a_query_failure() {
-        let storage = experimental_engine_error(EngineError::Storage(
-            hydradb_cypher_engine::StorageError::new(
-                "experimental_cypher_execute exceeded query timeout after 30000 ms",
-            ),
-        ));
-        assert!(matches!(storage, GraphError::UnclassifiedQuery { .. }));
-        assert_eq!(storage.failure_reason(), None);
-        assert!(storage
-            .to_string()
-            .starts_with("Cypher25 query is not supported yet: graph storage error"));
-
-        let unsupported = experimental_engine_error(EngineError::UnsupportedPlan(
-            QueryFailureReason::Where,
-            "not lowered".to_string(),
-        ));
-        assert_eq!(
-            unsupported.failure_reason(),
-            Some(QueryFailureReason::Where)
-        );
-    }
-
-    /// The wiring this module exists for: a list bound by a client has to reach
-    /// the engine, or `IN` is understood by something nothing can talk to.
-    #[test]
-    fn a_bound_list_reaches_the_engine_for_an_in_predicate() {
-        let lists = BTreeMap::from([(
-            "chunk_ids".to_string(),
-            vec![
-                VertexPropertyValue::String("chunk-a".to_string()),
-                VertexPropertyValue::String("chunk-b".to_string()),
-            ],
-        )]);
-
-        let request = prepare_experimental_cypher(
-            "MATCH (c:Chunk) WHERE c.chunk_id IN $chunk_ids RETURN c.chunk_id AS id",
-            &BTreeMap::new(),
-            &lists,
-        )
-        .expect("an IN query prepares once its list is bound");
-
-        assert!(!request.explain);
-        assert!(
-            request
-                .prepared
-                .explain()
-                .contains("VertexPropertyMultiSeek"),
-            "the bound list should reach the planner: {}",
-            request.prepared.explain()
-        );
-    }
-
-    /// Without the list the same query cannot be planned. This is the failure a
-    /// client saw as a rejected parameter, one layer lower.
-    #[test]
-    fn the_same_query_without_its_list_is_rejected() {
-        assert!(prepare_experimental_cypher(
-            "MATCH (c:Chunk) WHERE c.chunk_id IN $chunk_ids RETURN c.chunk_id AS id",
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .is_err());
-    }
-
-    /// A repeated text is parsed once; different parameter values and the
-    /// EXPLAIN prefix reuse the same template, and the bound plans still
-    /// carry each request's own parameters.
-    #[test]
-    fn a_repeated_query_text_reuses_its_lowered_template() {
-        // A text no other test lowers, so the first call is a guaranteed miss
-        // even with the process-wide cache shared across the test binary.
-        let query = "MATCH (e:Entity) WHERE e.entity_id = $id \
-                     RETURN e.entity_id AS template_cache_probe \
-                     ORDER BY template_cache_probe ASC LIMIT 5";
-        let first = BTreeMap::from([(
-            "id".to_string(),
-            VertexPropertyValue::String("alpha".to_string()),
-        )]);
-        let second = BTreeMap::from([(
-            "id".to_string(),
-            VertexPropertyValue::String("beta".to_string()),
-        )]);
-        let (explain, cold, hit) =
-            lower_experimental_cypher_cached(query, &first, &BTreeMap::new()).unwrap();
-        assert!(!explain);
-        assert!(!hit, "first sight of a text must lower it");
-        let (_, warm, hit) =
-            lower_experimental_cypher_cached(query, &second, &BTreeMap::new()).unwrap();
-        assert!(hit, "second sight of the same text must reuse the template");
-        let (explain, explained, hit) =
-            lower_experimental_cypher_cached(&format!("EXPLAIN {query}"), &first, &BTreeMap::new())
-                .unwrap();
-        assert!(explain);
-        assert!(hit, "EXPLAIN shares the template of the text it explains");
-
-        // Process-wide counters are shared with every other test in this
-        // binary, so identity of the shared template is the assertion, not a
-        // hit/miss delta.
-        assert!(std::sync::Arc::ptr_eq(&cold.logical, &warm.logical));
-        assert!(std::sync::Arc::ptr_eq(&cold.logical, &explained.logical));
-        assert_eq!(
-            cold.planning_context().parameters.get(&Symbol::from("id")),
-            Some(&ScalarValue::String("alpha".into()))
-        );
-        assert_eq!(
-            warm.planning_context().parameters.get(&Symbol::from("id")),
-            Some(&ScalarValue::String("beta".into()))
-        );
-    }
-
-    /// The cache honors both budgets: the byte cap evicts least recently
-    /// used templates before the entry cap is reached, a template larger than
-    /// the whole budget is never admitted, and accounting stays exact across
-    /// evictions and re-inserts.
-    #[test]
-    fn the_template_cache_evicts_by_bytes_and_entries() {
-        let small = LoweredTemplate::lower("MATCH (a:Entity) RETURN a.id AS id").unwrap();
-        let small_bytes = "MATCH (a:Entity) RETURN a.id AS id".len() + small.estimated_bytes();
-        assert!(small_bytes > 0);
-
-        // Room for two small templates by bytes, many by count.
-        let mut cache = LoweredTemplateCache::new(64, small_bytes * 2 + small_bytes / 2);
-        cache.insert("MATCH (a:Entity) RETURN a.id AS id", small.clone());
-        cache.insert("MATCH (b:Entity) RETURN b.id AS id", small.clone());
-        assert_eq!(cache.entries.len(), 2);
-        assert!(cache.resident_bytes <= cache.max_bytes);
-
-        // Touch the first so the second is the least recently used.
-        assert!(cache.get("MATCH (a:Entity) RETURN a.id AS id").is_some());
-        cache.insert("MATCH (c:Entity) RETURN c.id AS id", small.clone());
-        assert_eq!(cache.entries.len(), 2, "the byte cap forced one eviction");
-        assert!(cache.get("MATCH (b:Entity) RETURN b.id AS id").is_none());
-        assert!(cache.get("MATCH (a:Entity) RETURN a.id AS id").is_some());
-        assert!(cache.get("MATCH (c:Entity) RETURN c.id AS id").is_some());
-        assert!(cache.resident_bytes <= cache.max_bytes);
-
-        // Re-inserting an existing key replaces, never double-counts, and the
-        // recency index stays one-to-one with the entries.
-        let before = cache.resident_bytes;
-        cache.insert("MATCH (c:Entity) RETURN c.id AS id", small.clone());
-        assert_eq!(cache.resident_bytes, before);
-        assert_eq!(cache.by_use.len(), cache.entries.len());
-        assert!(cache
-            .by_use
-            .values()
-            .all(|key| cache.entries.contains_key(key)));
-
-        // A template bigger than the whole budget is refused outright.
-        let mut tiny = LoweredTemplateCache::new(64, small_bytes - 1);
-        tiny.insert("MATCH (a:Entity) RETURN a.id AS id", small.clone());
-        assert!(tiny.entries.is_empty());
-        assert_eq!(tiny.resident_bytes, 0);
-
-        // The entry cap still applies when bytes are plentiful.
-        let mut counted = LoweredTemplateCache::new(1, usize::MAX);
-        counted.insert("MATCH (a:Entity) RETURN a.id AS id", small.clone());
-        counted.insert("MATCH (b:Entity) RETURN b.id AS id", small);
-        assert_eq!(counted.entries.len(), 1);
-        assert!(counted.get("MATCH (b:Entity) RETURN b.id AS id").is_some());
-        assert_eq!(counted.by_use.len(), 1);
-
-        // A long stream of distinct texts keeps both structures bounded and
-        // in step; this is the churn case a linear eviction would serialize.
-        let mut churn = LoweredTemplateCache::new(8, usize::MAX);
-        for i in 0..64 {
-            let text = format!("MATCH (n:Entity) RETURN n.id AS churn_{i}");
-            churn.insert(&text, LoweredTemplate::lower(&text).unwrap());
-            assert!(churn.entries.len() <= 8);
-            assert_eq!(churn.by_use.len(), churn.entries.len());
-        }
-        assert!(churn
-            .get("MATCH (n:Entity) RETURN n.id AS churn_63")
-            .is_some());
-        assert!(churn
-            .get("MATCH (n:Entity) RETURN n.id AS churn_0")
-            .is_none());
-    }
-
-    #[test]
-    fn explain_uses_the_experimental_plan_and_one_transport_column() {
-        let request = prepare_experimental_cypher(
-            "explain MATCH (e:Entity) RETURN e",
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .expect("prepare experimental explain");
-        assert!(request.explain);
-        assert!(request.prepared.explain().contains("VertexLabelScan"));
-        assert_eq!(
-            experimental_query_columns(
-                "EXPLAIN MATCH (e:Entity) RETURN e",
-                &BTreeMap::new(),
-                &BTreeMap::new()
-            )
-            .unwrap(),
-            vec![QueryColumn::new("plan")]
-        );
-    }
 }

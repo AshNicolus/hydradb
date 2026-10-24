@@ -78,10 +78,34 @@ fn estimate_into(
                     .map_or(required, |rows| rows.min(required)),
             )
         }
+        GraphPhysicalPlan::OrderedRelationshipPropertyScan {
+            relationship_type,
+            property,
+            required,
+            ..
+        } => {
+            let required = *required as u64;
+            Some(
+                statistics
+                    .relationship_property_statistics(
+                        std::slice::from_ref(relationship_type),
+                        property,
+                    )
+                    .and_then(|stats| stats.non_null_count)
+                    .map_or(required, |rows| rows.min(required)),
+            )
+        }
         GraphPhysicalPlan::VertexLabelScan { label, labels, .. } => statistics
             .vertex_count(labels)
             .or_else(|| statistics.vertex_count(std::slice::from_ref(label))),
         GraphPhysicalPlan::AllVertexScan { .. } => statistics.vertex_count(&[]),
+        GraphPhysicalPlan::SingleRow => Some(1),
+        GraphPhysicalPlan::Unwind { expression, .. } => match expression {
+            crate::PhysicalExpression::List(items) => {
+                input.map(|rows| rows.saturating_mul(items.len() as u64))
+            }
+            _ => input,
+        },
         GraphPhysicalPlan::RelationshipPropertySeek {
             relationship_type,
             property,
@@ -98,6 +122,30 @@ fn estimate_into(
                         .and_then(equality_rows)
                 })
         }
+        GraphPhysicalPlan::RelationshipPropertyMultiSeek {
+            relationship_type,
+            property,
+            values,
+            ..
+        } => {
+            let types = std::slice::from_ref(relationship_type);
+            let histogram = statistics
+                .relationship_property_statistics(types, property)
+                .as_ref()
+                .and_then(equality_rows);
+            values.iter().try_fold(0_u64, |total, value| {
+                let rows = statistics
+                    .relationship_property_value_count(types, property, &value.value)
+                    .or(histogram)?;
+                Some(total.saturating_add(rows))
+            })
+        }
+        GraphPhysicalPlan::RelationshipPropertyRangeProbe { .. }
+        | GraphPhysicalPlan::RelationshipTypeProbe { .. } => input,
+        // The planner's own estimate for the access it chose, so a miss shows
+        // against the rows the access really produced.
+        GraphPhysicalPlan::VertexPropertyRangeSeek { estimated_rows, .. }
+        | GraphPhysicalPlan::VertexGuardedAccess { estimated_rows, .. } => Some(*estimated_rows),
         GraphPhysicalPlan::Expand {
             input: source,
             relationship_types,
@@ -112,11 +160,9 @@ fn estimate_into(
             max_hops,
             ..
         } => {
-            expand_rows(input, source, relationship_types, *direction, statistics).map(|one_hop| {
-                one_hop.saturating_mul(u64::from(
-                    max_hops.saturating_sub(*min_hops).saturating_add(1),
-                ))
-            })
+            let hops = u64::from((*max_hops)?.saturating_sub(*min_hops).saturating_add(1));
+            expand_rows(input, source, relationship_types, *direction, statistics)
+                .map(|one_hop| one_hop.saturating_mul(hops))
         }
         GraphPhysicalPlan::NaturalJoin { .. } => Some(
             inputs
@@ -191,6 +237,8 @@ fn source_labels(plan: &GraphPhysicalPlan) -> Option<&[crate::Symbol]> {
         | GraphPhysicalPlan::VertexPropertyMultiSeek { labels, .. }
         | GraphPhysicalPlan::VertexPropertyScan { labels, .. }
         | GraphPhysicalPlan::OrderedVertexPropertyScan { labels, .. }
+        | GraphPhysicalPlan::VertexPropertyRangeSeek { labels, .. }
+        | GraphPhysicalPlan::VertexGuardedAccess { labels, .. }
         | GraphPhysicalPlan::VertexLabelScan { labels, .. } => Some(labels),
         GraphPhysicalPlan::Filter { input, .. }
         | GraphPhysicalPlan::Sort { input, .. }

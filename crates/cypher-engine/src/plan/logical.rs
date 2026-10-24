@@ -133,6 +133,104 @@ pub enum AggregateFunction {
     Sum,
     Average,
     Collect,
+    /// The least non-null input under the engine's value order; null when
+    /// there is none.
+    Min,
+    /// The greatest non-null input under the engine's value order; null when
+    /// there is none.
+    Max,
+}
+
+impl AggregateFunction {
+    /// The function a Cypher name denotes, matched case-insensitively.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "count" => Some(Self::Count),
+            "sum" => Some(Self::Sum),
+            "avg" => Some(Self::Average),
+            "collect" => Some(Self::Collect),
+            "min" => Some(Self::Min),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// The name EXPLAIN and column naming print.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Average => "avg",
+            Self::Collect => "collect",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// A function that reads one row and returns one value, as opposed to an
+/// [`AggregateFunction`], which reads a group.
+///
+/// Kept apart from the aggregates on purpose: a scalar call inside RETURN does
+/// not make the projection group, and an aggregate inside a scalar call does.
+/// Treating `coalesce` as an aggregate because the lowering's function arm
+/// used to recognise only aggregates would group rows that must not be.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ScalarFunction {
+    /// Internal MATCH-clause trail constraint; not callable by Cypher name.
+    RelationshipsUnique,
+    /// `coalesce(a, b, ...)`: the first argument that is not null, else null.
+    Coalesce,
+    /// `toUpper(s)`: the string in upper case, by Unicode case mapping.
+    ToUpper,
+    /// `toLower(s)`: the string in lower case, by Unicode case mapping.
+    ToLower,
+    /// `toString(v)`: a value's string spelling.
+    ToString,
+    /// `toInteger(v)`: a value as an integer, or null when it has none.
+    ToInteger,
+    /// `size(s)`: the number of characters in a string.
+    Size,
+}
+
+impl ScalarFunction {
+    /// The function a Cypher name denotes, matched case-insensitively as
+    /// Cypher function names are.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "coalesce" => Some(Self::Coalesce),
+            "toupper" => Some(Self::ToUpper),
+            "tolower" => Some(Self::ToLower),
+            "tostring" => Some(Self::ToString),
+            "tointeger" => Some(Self::ToInteger),
+            "size" => Some(Self::Size),
+            _ => None,
+        }
+    }
+
+    /// The name EXPLAIN and column naming print.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RelationshipsUnique => "relationships_unique",
+            Self::Coalesce => "coalesce",
+            Self::ToUpper => "toUpper",
+            Self::ToLower => "toLower",
+            Self::ToString => "toString",
+            Self::ToInteger => "toInteger",
+            Self::Size => "size",
+        }
+    }
+
+    /// Whether the function accepts `count` arguments.
+    pub fn accepts_arity(self, count: usize) -> bool {
+        match self {
+            Self::RelationshipsUnique => true,
+            Self::Coalesce => count >= 1,
+            Self::ToUpper | Self::ToLower | Self::ToString | Self::ToInteger | Self::Size => {
+                count == 1
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,7 +245,25 @@ pub enum LogicalExpression {
     Literal(ScalarValue),
     Aggregate {
         function: AggregateFunction,
+        /// `count(DISTINCT x)`: the group's distinct non-null inputs only.
+        distinct: bool,
         expression: Option<Box<LogicalExpression>>,
+    },
+    /// A scalar function call; see [`ScalarFunction`].
+    Function {
+        function: ScalarFunction,
+        arguments: Vec<LogicalExpression>,
+    },
+    /// A list literal outside `IN`, such as `[1, n.name]`: a value, evaluated
+    /// per row. A list never becomes a stored property, which is why this is
+    /// an expression rather than a `ScalarValue` variant.
+    List(Vec<LogicalExpression>),
+    /// `CASE`; see `hydradb_cypher_ast::Expression::Case`. Evaluated lazily:
+    /// only the branch taken is computed.
+    Case {
+        operand: Option<Box<LogicalExpression>>,
+        branches: Vec<(LogicalExpression, LogicalExpression)>,
+        default: Option<Box<LogicalExpression>>,
     },
     Unary {
         operator: LogicalUnaryOperator,
@@ -193,6 +309,18 @@ pub struct LogicalSort {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphLogicalPlan {
+    /// One row that binds nothing: where a query that does not open with
+    /// MATCH starts. `RETURN 1`, `WITH 1 AS x` and an opening OPTIONAL MATCH
+    /// all read from it. Under a correlated input it is that input's row.
+    SingleRow,
+    /// `UNWIND expression AS binding`: each input row once per element of the
+    /// list the expression evaluates to, with `binding` holding the element.
+    /// A null list yields no rows and a non-list value one.
+    Unwind {
+        input: Box<GraphLogicalPlan>,
+        expression: LogicalExpression,
+        binding: Symbol,
+    },
     Union {
         arms: Vec<GraphLogicalPlan>,
         all: bool,
@@ -213,12 +341,17 @@ pub enum GraphLogicalPlan {
     VariableExpand {
         input: Box<GraphLogicalPlan>,
         from: Symbol,
+        /// `[rs:R*1..3]`: the path's relationships, in walk order, bound to
+        /// `rs` as a list value.
+        relationship: Option<Symbol>,
         relationship_types: Vec<Symbol>,
         direction: PatternDirection,
         to: Symbol,
         target_labels: Vec<Symbol>,
         min_hops: u8,
-        max_hops: u8,
+        /// `None` for an unbounded pattern (`*`, `*2..`): trail semantics end
+        /// every walk, and the query's row budgets bound how far it gets.
+        max_hops: Option<u8>,
     },
     NaturalJoin {
         left: Box<GraphLogicalPlan>,

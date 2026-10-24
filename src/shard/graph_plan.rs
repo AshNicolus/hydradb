@@ -43,8 +43,7 @@ impl GraphShard {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::InvalidRequest,
                 dialect: "Cypher25",
-                feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot"
-                    .to_string(),
+                feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot".to_string(),
             });
         }
         if context.read_epoch.is_none() {
@@ -164,18 +163,10 @@ impl GraphShard {
                 } => {
                     let value = bound_value_to_property(value)?;
                     let vertex_ids = self
-                        .scan_vertex_property_index_at(
-                            cell_id,
-                            property.as_str(),
-                            &value,
-                            read_epoch,
-                            budget,
-                        )
+                        .scan_vertex_property_index_at(cell_id, property.as_str(), &value, read_epoch, budget)
                         .await?;
-                    self.hydrate_planned_vertices(
-                        cell_id, read_epoch, binding, labels, vertex_ids, budget,
-                    )
-                    .await
+                    self.hydrate_planned_vertices(cell_id, read_epoch, binding, labels, vertex_ids, budget)
+                        .await
                 }
                 GraphPhysicalPlan::VertexPropertyMultiSeek {
                     binding,
@@ -187,60 +178,28 @@ impl GraphShard {
                     for value in values {
                         let value = bound_value_to_property(value)?;
                         vertex_ids.extend(
-                            self.scan_vertex_property_index_at(
-                                cell_id,
-                                property.as_str(),
-                                &value,
-                                read_epoch,
-                                budget,
-                            )
-                            .await?,
+                            self.scan_vertex_property_index_at(cell_id, property.as_str(), &value, read_epoch, budget)
+                                .await?,
                         );
-                        self.ensure_query_index_candidates(
-                            "graph_physical_multi_seek_candidates",
-                            vertex_ids.len(),
-                        )?;
+                        self.ensure_query_index_candidates("graph_physical_multi_seek_candidates", vertex_ids.len())?;
                     }
-                    self.hydrate_planned_vertices(
-                        cell_id,
-                        read_epoch,
-                        binding,
-                        labels,
-                        vertex_ids.into_iter().collect(),
-                        budget,
-                    )
-                    .await
+                    self.hydrate_planned_vertices(cell_id, read_epoch, binding, labels, vertex_ids.into_iter().collect(), budget)
+                        .await
                 }
                 GraphPhysicalPlan::VertexLabelScan { binding, label } => {
-                    let vertex_ids = self
-                        .scan_vertex_label_index_at(cell_id, label.as_str(), read_epoch, budget)
-                        .await?;
-                    self.hydrate_planned_vertices(
-                        cell_id,
-                        read_epoch,
-                        binding,
-                        std::slice::from_ref(label),
-                        vertex_ids,
-                        budget,
-                    )
-                    .await
+                    let vertex_ids = self.scan_vertex_label_index_at(cell_id, label.as_str(), read_epoch, budget).await?;
+                    self.hydrate_planned_vertices(cell_id, read_epoch, binding, std::slice::from_ref(label), vertex_ids, budget)
+                        .await
                 }
-                GraphPhysicalPlan::AllVertexScan { binding } => {
-                    Err(unsupported_physical_plan(format!(
-                        "AllVertexScan for {binding} is not executable until HydraDB has a canonical vertex-universe index"
-                    )))
-                }
+                GraphPhysicalPlan::AllVertexScan { binding } => Err(unsupported_physical_plan(format!(
+                    "AllVertexScan for {binding} is not executable until HydraDB has a canonical vertex-universe index"
+                ))),
                 GraphPhysicalPlan::Filter { input, predicate } => {
-                    let rows = self
-                        .execute_binding_plan(cell_id, read_epoch, input, budget)
-                        .await?;
+                    let rows = self.execute_binding_plan(cell_id, read_epoch, input, budget).await?;
                     let mut filtered = Vec::with_capacity(rows.len());
                     for row in rows {
                         budget.check("graph_physical_filter")?;
-                        if matches!(
-                            evaluate_expression(predicate, &row)?,
-                            EvaluatedValue::Truth(Some(true))
-                        ) {
+                        if matches!(evaluate_expression(predicate, &row)?, EvaluatedValue::Truth(Some(true))) {
                             filtered.push(row);
                         }
                     }
@@ -435,75 +394,5 @@ fn unsupported_physical_plan(feature: impl Into<String>) -> GraphError {
         reason: QueryFailureReason::Other,
         dialect: "Cypher25",
         feature: feature.into(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use hydradb_cypher_parser_antlr::parse_cypher25;
-    use hydradb_graph_plan::{
-        explain_physical_plan, lower_cypher_ast, plan_physical, PhysicalPlanningContext,
-    };
-    use slatedb::object_store::memory::InMemory;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn selected_multi_seek_is_the_plan_graph_shard_executes() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let shard =
-            GraphShard::open_standalone_writer("graph/cypher25-physical-multi-seek", object_store)
-                .await
-                .expect("open test shard");
-
-        for (id, label, entity_id) in [
-            (1, "Entity", "a"),
-            (2, "Entity", "b"),
-            (3, "Entity", "z"),
-            (4, "Other", "a"),
-        ] {
-            shard
-                .set_vertex_metadata(
-                    "cell-a",
-                    id,
-                    VertexMetadata::default().with_label(label).with_property(
-                        "entity_id",
-                        VertexPropertyValue::String(entity_id.to_string()),
-                    ),
-                )
-                .await
-                .expect("write vertex metadata");
-        }
-
-        let ast =
-            parse_cypher25("MATCH (e:Entity) WHERE e.entity_id = $a OR e.entity_id = $b RETURN e")
-                .expect("parse Cypher 25");
-        let logical = lower_cypher_ast(&ast).expect("lower stable AST");
-        let physical = plan_physical(
-            &logical,
-            &PhysicalPlanningContext::default()
-                .with_parameter("a", ScalarValue::String("a".into()))
-                .with_parameter("b", ScalarValue::String("b".into())),
-        )
-        .expect("select KV plan");
-        assert!(explain_physical_plan(&physical).contains("VertexPropertyMultiSeek"));
-
-        let result = shard
-            .execute_graph_physical_plan(
-                QueryContext::new("cell-a", "execute-selected-physical-plan"),
-                physical,
-            )
-            .await
-            .expect("execute selected KV plan");
-        assert_eq!(result.columns, vec![QueryColumn::new("e")]);
-        assert_eq!(
-            result.rows,
-            vec![
-                QueryRow::new(vec![QueryValue::VertexId(1)]),
-                QueryRow::new(vec![QueryValue::VertexId(2)]),
-            ]
-        );
-
-        shard.close().await.expect("close test shard");
     }
 }

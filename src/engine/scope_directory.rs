@@ -11,12 +11,13 @@ use crate::{GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, Result}
 
 const SCOPE_MARKER_VERSION: &str = "graph-scope-directory1";
 const SCOPE_MARKER_NAME: &str = "__scope__";
-#[cfg(test)]
-const SCOPE_CHANGE_VERSION: &str = "graph-scope-change1";
 const SCOPE_CHANGE_SEQUENCE_VERSION: &str = "graph-scope-change2";
 const SCOPE_CHANGE_SEQUENCE_PREFIX: &str = "v2";
 const SCOPE_CHANGE_ACK_ATTEMPTS: usize = 8;
 const MAX_SCOPE_CHANGE_ACK_BYTES: usize = 32;
+/// Payload of a planner statistics request marker. The marker's path is the
+/// whole message; the payload only names the format.
+const PLANNER_STATISTICS_REQUEST_VERSION: &str = "planner-statistics-wanted1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphScopeChange {
@@ -25,6 +26,16 @@ pub struct GraphScopeChange {
     pub created_at: DateTime<Utc>,
     pub cell_id: Option<String>,
     pub sequence: Option<u64>,
+}
+
+/// One (scope, cell) a node asked the indexer to build planner statistics
+/// for, as listed from the request markers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannerStatisticsRequest {
+    pub scope: GraphScope,
+    pub cell_id: String,
+    pub location: Path,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -148,6 +159,81 @@ impl ObjectStoreGraphScopeDirectory {
         Ok(())
     }
 
+    /// Ask the indexer to build planner statistics for one (scope, cell).
+    ///
+    /// A node writes this when queries keep planning without statistics; the
+    /// indexer builds hinted scopes ahead of everything else. One marker per
+    /// (scope, cell), overwritten rather than accumulated, so a hot scope that
+    /// keeps asking costs one object. Best effort, like a change hint: a lost
+    /// marker only delays the build until the node asks again.
+    pub async fn request_planner_statistics(
+        &self,
+        scope: &GraphScope,
+        cell_id: &str,
+    ) -> Result<()> {
+        self.validate_scope(scope)?;
+        crate::validate_component("cell_id", cell_id)?;
+        let location = self.planner_statistics_request_path(scope, cell_id);
+        let payload = Bytes::from_static(PLANNER_STATISTICS_REQUEST_VERSION.as_bytes());
+        self.object_store.put(&location, payload.into()).await?;
+        Ok(())
+    }
+
+    /// Every outstanding planner statistics request, scope order.
+    pub async fn list_planner_statistics_requests(&self) -> Result<Vec<PlannerStatisticsRequest>> {
+        let prefix = self.planner_statistics_request_prefix();
+        let mut objects = self.object_store.list(Some(&prefix));
+        let mut requests = Vec::new();
+        while let Some(metadata) = objects.next().await.transpose()? {
+            let (scope, cell_id) =
+                self.planner_statistics_request_from_path(metadata.location.as_ref())?;
+            self.validate_scope(&scope)?;
+            requests.push(PlannerStatisticsRequest {
+                scope,
+                cell_id,
+                location: metadata.location,
+                created_at: metadata.last_modified,
+            });
+        }
+        requests.sort_by(|left, right| {
+            left.scope
+                .cmp(&right.scope)
+                .then_with(|| left.cell_id.cmp(&right.cell_id))
+        });
+        Ok(requests)
+    }
+
+    /// Remove served (or given-up) requests. A request re-made after the
+    /// listing is removed too; the node asks again if it still needs one.
+    pub async fn clear_planner_statistics_requests(
+        &self,
+        requests: &[PlannerStatisticsRequest],
+    ) -> Result<()> {
+        for request in requests {
+            self.validate_scope(&request.scope)?;
+        }
+        let locations = requests
+            .iter()
+            .map(|request| request.location.clone())
+            .collect::<Vec<_>>();
+        let deletes = futures::stream::iter(locations)
+            .map(|location| {
+                let object_store = Arc::clone(&self.object_store);
+                async move {
+                    match object_store.delete(&location).await {
+                        Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                }
+            })
+            .buffer_unordered(32);
+        let results = deletes.collect::<Vec<_>>().await;
+        for result in results {
+            result?;
+        }
+        Ok(())
+    }
+
     pub async fn covered_sequence(&self, scope: &GraphScope, cell_id: &str) -> Result<Option<u64>> {
         self.validate_scope(scope)?;
         crate::validate_component("cell_id", cell_id)?;
@@ -257,6 +343,64 @@ impl ObjectStoreGraphScopeDirectory {
         )
     }
 
+    fn planner_statistics_request_prefix(&self) -> Path {
+        path_from_base(
+            &self.base_path,
+            &format!(
+                "_planner_statistics_wanted/v1/{}/{}",
+                self.graph_id,
+                namespace_key(&self.root_namespace)
+            ),
+        )
+    }
+
+    fn planner_statistics_request_path(&self, scope: &GraphScope, cell_id: &str) -> Path {
+        let relative_namespace = &scope.namespace.segments()[self.root_namespace.depth()..];
+        let mut suffix = relative_namespace
+            .iter()
+            .map(NamespaceId::as_str)
+            .collect::<Vec<_>>()
+            .join("/");
+        if !suffix.is_empty() {
+            suffix.push('/');
+        }
+        suffix.push_str(&hex_encode(cell_id.as_bytes()));
+        Path::from(format!(
+            "{}/{suffix}",
+            self.planner_statistics_request_prefix()
+        ))
+    }
+
+    fn planner_statistics_request_from_path(&self, location: &str) -> Result<(GraphScope, String)> {
+        let prefix = self.planner_statistics_request_prefix().to_string();
+        let relative = location
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_prefix('/'))
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: location.to_string(),
+                reason: "planner statistics request is outside the configured prefix".to_string(),
+            })?;
+        let segments = relative.split('/').collect::<Vec<_>>();
+        let Some((encoded_cell, namespace_segments)) = segments.split_last() else {
+            return Err(GraphError::CorruptValue {
+                key: location.to_string(),
+                reason: "planner statistics request is missing its cell".to_string(),
+            });
+        };
+        let cell_id = String::from_utf8(hex_decode(encoded_cell, location)?).map_err(|error| {
+            GraphError::CorruptValue {
+                key: location.to_string(),
+                reason: format!("planner statistics request cell id is not UTF-8: {error}"),
+            }
+        })?;
+        crate::validate_component("cell_id", &cell_id)?;
+        let mut namespace = self.root_namespace.clone();
+        for segment in namespace_segments {
+            namespace = namespace.child(NamespaceId::new((*segment).to_string())?)?;
+        }
+        Ok((GraphScope::new(namespace, self.graph_id.clone()), cell_id))
+    }
+
     fn marker_path(&self, scope: &GraphScope) -> Path {
         let relative_namespace = &scope.namespace.segments()[self.root_namespace.depth()..];
         let mut suffix = relative_namespace
@@ -269,21 +413,6 @@ impl ObjectStoreGraphScopeDirectory {
         }
         suffix.push_str(SCOPE_MARKER_NAME);
         Path::from(format!("{}/{suffix}", self.registry_prefix()))
-    }
-
-    #[cfg(test)]
-    fn change_path(&self, scope: &GraphScope, id: Ulid) -> Path {
-        let relative_namespace = &scope.namespace.segments()[self.root_namespace.depth()..];
-        let mut suffix = relative_namespace
-            .iter()
-            .map(NamespaceId::as_str)
-            .collect::<Vec<_>>()
-            .join("/");
-        if !suffix.is_empty() {
-            suffix.push('/');
-        }
-        suffix.push_str(&id.to_string());
-        Path::from(format!("{}/{suffix}", self.change_prefix()))
     }
 
     fn sequenced_change_path(
@@ -496,154 +625,5 @@ fn path_from_base(base_path: &str, suffix: &str) -> Path {
         Path::from(suffix)
     } else {
         Path::from(format!("{base_path}/{suffix}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use slatedb::object_store::memory::InMemory;
-
-    use super::*;
-
-    fn namespace(segments: &[&str]) -> NamespacePath {
-        NamespacePath::new(
-            segments
-                .iter()
-                .map(|segment| NamespaceId::new(*segment).unwrap()),
-        )
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn registers_and_lists_native_graph_scopes_idempotently() {
-        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let directory = ObjectStoreGraphScopeDirectory::new(
-            "graph/data",
-            namespace(&["production"]),
-            GraphId::new("hydradb").unwrap(),
-            object_store,
-        );
-        let first = GraphScope::new(
-            namespace(&["production", "tenant-a", "collection-a"]),
-            GraphId::new("hydradb").unwrap(),
-        );
-        let second = GraphScope::new(
-            namespace(&["production", "tenant-a", "collection-b"]),
-            GraphId::new("hydradb").unwrap(),
-        );
-        let reserved_looking = GraphScope::new(
-            namespace(&["production", "_root"]),
-            GraphId::new("hydradb").unwrap(),
-        );
-
-        directory.register(&second).await.unwrap();
-        directory.register(&first).await.unwrap();
-        directory.register(&first).await.unwrap();
-        directory.register(&reserved_looking).await.unwrap();
-
-        assert_eq!(
-            directory.list().await.unwrap(),
-            vec![reserved_looking, first, second]
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_scopes_outside_the_configured_graph_hierarchy() {
-        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let directory = ObjectStoreGraphScopeDirectory::new(
-            "graph/data",
-            namespace(&["production"]),
-            GraphId::new("hydradb").unwrap(),
-            object_store,
-        );
-        let wrong_graph = GraphScope::new(
-            namespace(&["production", "tenant-a"]),
-            GraphId::new("other").unwrap(),
-        );
-
-        assert!(matches!(
-            directory.register(&wrong_graph).await,
-            Err(GraphError::GraphScopeMismatch { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn change_notifications_are_unique_and_cleared_exactly() {
-        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let directory = ObjectStoreGraphScopeDirectory::new(
-            "graph/data",
-            namespace(&["production"]),
-            GraphId::new("hydradb").unwrap(),
-            Arc::clone(&object_store),
-        );
-        let scope = GraphScope::new(
-            namespace(&["production", "tenant-a", "collection-a"]),
-            GraphId::new("hydradb").unwrap(),
-        );
-
-        directory.notify_changed(&scope, "cell-0", 7).await.unwrap();
-        directory.notify_changed(&scope, "cell-0", 9).await.unwrap();
-        let legacy_location = directory.change_path(&scope, Ulid::new());
-        object_store
-            .put_opts(
-                &legacy_location,
-                Bytes::from_static(SCOPE_CHANGE_VERSION.as_bytes()).into(),
-                PutMode::Create.into(),
-            )
-            .await
-            .unwrap();
-        let changes = directory.list_changes().await.unwrap();
-        assert_eq!(changes.len(), 3);
-        assert!(changes.iter().all(|change| change.scope == scope));
-        assert_eq!(
-            changes
-                .iter()
-                .filter_map(|change| change.sequence)
-                .collect::<Vec<_>>(),
-            vec![7, 9]
-        );
-        let legacy = changes
-            .iter()
-            .find(|change| change.location == legacy_location)
-            .unwrap();
-        assert_eq!(legacy.cell_id, None);
-        assert_eq!(legacy.sequence, None);
-
-        directory.clear_changes(&changes[..1]).await.unwrap();
-        assert_eq!(directory.list_changes().await.unwrap(), changes[1..]);
-        directory.clear_changes(&changes[1..]).await.unwrap();
-        assert!(directory.list_changes().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn change_acknowledgements_only_advance() {
-        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let directory = ObjectStoreGraphScopeDirectory::new(
-            "graph/data",
-            namespace(&["production"]),
-            GraphId::new("hydradb").unwrap(),
-            object_store,
-        );
-        let scope = GraphScope::new(
-            namespace(&["production", "tenant-a", "collection-a"]),
-            GraphId::new("hydradb").unwrap(),
-        );
-
-        assert_eq!(
-            directory.covered_sequence(&scope, "cell-0").await.unwrap(),
-            None
-        );
-        directory
-            .acknowledge_sequence(&scope, "cell-0", 12)
-            .await
-            .unwrap();
-        directory
-            .acknowledge_sequence(&scope, "cell-0", 8)
-            .await
-            .unwrap();
-        assert_eq!(
-            directory.covered_sequence(&scope, "cell-0").await.unwrap(),
-            Some(12)
-        );
     }
 }

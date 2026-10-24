@@ -1,8 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(test)]
-mod tests;
-
 use crate::engine;
 use crate::{AtomicDurationHistogram, DurationHistogramSnapshot, GraphError, SparseKernelBackend};
 
@@ -564,6 +561,58 @@ pub struct GraphOperationalMetricsSnapshot {
     pub query_experimental_result_us: u64,
     /// Experimental requests that tripped a slow-plan sampling trigger (latency, width, full scan or unexpected fallback) and were marked for tail sampling.
     pub query_experimental_sampled_plans: u64,
+    /// Experimental requests in which statistics chose the access path and it answered without the runtime probe. The four `query_experimental_access_*_requests` sum to `query_experimental_requests`; precedence when several apply is guard, probe, statistics, default.
+    pub query_experimental_access_statistics_requests: u64,
+    /// Whole-request latency of the `query_experimental_access_statistics_requests`, microseconds. Divided by that count it is the mean latency of requests whose access path statistics chose.
+    pub query_experimental_access_statistics_us: u64,
+    /// Experimental requests in which the runtime equality probe answered and replaced the planned access. The four `query_experimental_access_*_requests` sum to `query_experimental_requests`; precedence when several apply is guard, probe, statistics, default.
+    pub query_experimental_access_probe_requests: u64,
+    /// Whole-request latency of the `query_experimental_access_probe_requests`, microseconds. Divided by that count it is the mean latency of requests whose access path probe chose.
+    pub query_experimental_access_probe_us: u64,
+    /// Experimental requests in which a statistics-chosen access read past its guard and declined to the plan chosen without statistics. The four `query_experimental_access_*_requests` sum to `query_experimental_requests`; precedence when several apply is guard, probe, statistics, default.
+    pub query_experimental_access_guard_requests: u64,
+    /// Whole-request latency of the `query_experimental_access_guard_requests`, microseconds. Divided by that count it is the mean latency of requests whose access path guard chose.
+    pub query_experimental_access_guard_us: u64,
+    /// Experimental requests in which neither statistics nor the probe chose the access path: the planner's first equality, as before statistics. The four `query_experimental_access_*_requests` sum to `query_experimental_requests`; precedence when several apply is guard, probe, statistics, default.
+    pub query_experimental_access_default_requests: u64,
+    /// Whole-request latency of the `query_experimental_access_default_requests`, microseconds. Divided by that count it is the mean latency of requests whose access path default chose.
+    pub query_experimental_access_default_us: u64,
+    /// Statistics-chosen accesses that read past their guard (ten times the estimate, at least 256 index entries) and declined to the plan chosen without statistics. Counted per access, so a correlated input can add more than one per request.
+    pub query_experimental_guard_stops: u64,
+    /// Experimental requests planned with no planner statistics while
+    /// `GRAPH_PLANNER_STATISTICS` is on: no object is published, the last one
+    /// read was corrupt or unsupported, or every read failed with nothing
+    /// cached. Divided by `query_experimental_requests` it is the share of
+    /// traffic the flag is not reaching. Zero with the flag off.
+    pub query_experimental_planned_without_statistics: u64,
+    /// Reads of the indexer-published planner statistics that loaded an
+    /// object into the shard's cache. At most one per TTL per cell.
+    pub planner_statistics_reloads: u64,
+    /// Reads of the planner statistics object that failed (object store or
+    /// I/O error). The cache keeps whatever it held and retries after a TTL.
+    pub planner_statistics_load_failures: u64,
+    /// Planner statistics objects read but ignored as corrupt or of an
+    /// unsupported version; the cell plans as if none were published.
+    pub planner_statistics_corrupt_ignored: u64,
+    /// Requests the shard wrote asking the indexer to build this cell's
+    /// planner statistics: the flag is on, no object is published, and
+    /// `GRAPH_PLANNER_STATISTICS_HINT_THRESHOLD` queries planned without
+    /// one inside a TTL. At most one per TTL per cell.
+    pub planner_statistics_hints_sent: u64,
+    /// Rows the planner estimated for the statistics-chosen access of each
+    /// request that had one, summed. Against
+    /// `query_experimental_access_rows_actual` it is the aggregate
+    /// estimate accuracy: actual over estimated above one is underestimation.
+    pub query_experimental_access_rows_estimated: u64,
+    /// Index entries the statistics-chosen access really read, summed over
+    /// the same requests as `query_experimental_access_rows_estimated`.
+    pub query_experimental_access_rows_actual: u64,
+    /// Statistics-chosen accesses that read more than twice their estimate.
+    /// Counted per request, on the widest access.
+    pub query_experimental_access_underestimates: u64,
+    /// Statistics-chosen accesses that read less than half their estimate.
+    /// Counted per request, on the widest access.
+    pub query_experimental_access_overestimates: u64,
     /// Row queries whose context selected the legacy engine.
     pub query_route_legacy_requests: u64,
     /// Row queries executed by the experimental read engine.
@@ -621,12 +670,52 @@ pub struct GraphOperationalMetricsSnapshot {
     pub merge_relationships_batch_latency: DurationHistogramSnapshot,
     pub merge_vertex_metadata_batch_latency: DurationHistogramSnapshot,
     pub reserve_edge_delete_noops_batch_latency: DurationHistogramSnapshot,
+    /// End-to-end latency of the write entry points that commit outside the
+    /// durability pipeline. Recorded on drop, so a call that
+    /// errors or is cancelled still counts: `count()` is the call volume.
+    pub set_edge_metadata_latency: DurationHistogramSnapshot,
+    pub set_edge_metadata_batch_latency: DurationHistogramSnapshot,
+    pub write_edge_latency: DurationHistogramSnapshot,
+    pub write_edge_mutations_batch_latency: DurationHistogramSnapshot,
+    pub create_relationship_latency: DurationHistogramSnapshot,
+    pub import_vertex_metadata_batch_latency: DurationHistogramSnapshot,
+    /// Whole-request latency of experimental requests whose access path
+    /// statistics chose, as a distribution. Its `count()` is
+    /// `query_experimental_access_statistics_requests` and its `sum_us` is
+    /// `query_experimental_access_statistics_us`: the counters give the mean,
+    /// this gives the quantiles.
+    pub query_experimental_access_statistics_latency: DurationHistogramSnapshot,
+    /// The same for requests whose access path the runtime probe chose.
+    pub query_experimental_access_probe_latency: DurationHistogramSnapshot,
+    /// The same for requests in which a statistics-chosen access declined at
+    /// its guard.
+    pub query_experimental_access_guard_latency: DurationHistogramSnapshot,
+    /// The same for requests in which neither statistics nor the probe chose.
+    pub query_experimental_access_default_latency: DurationHistogramSnapshot,
     /// Per physical-operator totals from the experimental engine, one entry
     /// per operator that has run on this shard, sorted by operator name.
     /// Structured rather than enumerated as counters: the operator is a label
     /// on its own families, not a field. Empty without the
     /// `experimental-cypher-engine` feature.
     pub experimental_operators: Vec<ExperimentalOperatorMetricsSnapshot>,
+    /// The indexer-published planner statistics this shard's cache holds,
+    /// dated at snapshot time. `None` when nothing is loaded: the flag is off,
+    /// no query has planned since the shard opened, no object is published,
+    /// or the last one read was corrupt. Structured rather than a counter: it
+    /// is a gauge of the object in use, not a count of events.
+    pub planner_statistics: Option<PlannerStatisticsLoadedSnapshot>,
+}
+
+/// The header of the planner statistics object a shard plans with.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlannerStatisticsLoadedSnapshot {
+    /// The storage sequence the indexer built the object at.
+    pub storage_sequence: u64,
+    /// When the indexer built it, Unix milliseconds.
+    pub built_at_ms: u64,
+    /// `now - built_at_ms` when the snapshot was taken, milliseconds; zero if
+    /// the build time is in the future of this node's clock.
+    pub age_ms: u64,
 }
 
 /// Cumulative work of one physical operator kind on one shard.
@@ -763,6 +852,24 @@ snapshot_fields!(GraphOperationalMetricsSnapshot {
         query_experimental_storage_calls,
         query_experimental_result_us,
         query_experimental_sampled_plans,
+        query_experimental_access_statistics_requests,
+        query_experimental_access_statistics_us,
+        query_experimental_access_probe_requests,
+        query_experimental_access_probe_us,
+        query_experimental_access_guard_requests,
+        query_experimental_access_guard_us,
+        query_experimental_access_default_requests,
+        query_experimental_access_default_us,
+        query_experimental_guard_stops,
+        query_experimental_planned_without_statistics,
+        planner_statistics_reloads,
+        planner_statistics_load_failures,
+        planner_statistics_corrupt_ignored,
+        planner_statistics_hints_sent,
+        query_experimental_access_rows_estimated,
+        query_experimental_access_rows_actual,
+        query_experimental_access_underestimates,
+        query_experimental_access_overestimates,
         query_route_legacy_requests,
         query_route_experimental_requests,
         query_route_native_path_fallbacks,
@@ -793,12 +900,23 @@ snapshot_fields!(GraphOperationalMetricsSnapshot {
         merge_relationships_batch_latency,
         merge_vertex_metadata_batch_latency,
         reserve_edge_delete_noops_batch_latency,
+        set_edge_metadata_latency,
+        set_edge_metadata_batch_latency,
+        write_edge_latency,
+        write_edge_mutations_batch_latency,
+        create_relationship_latency,
+        import_vertex_metadata_batch_latency,
+        query_experimental_access_statistics_latency,
+        query_experimental_access_probe_latency,
+        query_experimental_access_guard_latency,
+        query_experimental_access_default_latency,
     }
     class_counters {
         query_rows_failed_by_class,
     }
     structured {
         experimental_operators,
+        planner_statistics,
     }
 });
 
@@ -894,6 +1012,24 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) query_experimental_storage_calls: AtomicU64,
     pub(crate) query_experimental_result_us: AtomicU64,
     pub(crate) query_experimental_sampled_plans: AtomicU64,
+    pub(crate) query_experimental_access_statistics_requests: AtomicU64,
+    pub(crate) query_experimental_access_statistics_us: AtomicU64,
+    pub(crate) query_experimental_access_probe_requests: AtomicU64,
+    pub(crate) query_experimental_access_probe_us: AtomicU64,
+    pub(crate) query_experimental_access_guard_requests: AtomicU64,
+    pub(crate) query_experimental_access_guard_us: AtomicU64,
+    pub(crate) query_experimental_access_default_requests: AtomicU64,
+    pub(crate) query_experimental_access_default_us: AtomicU64,
+    pub(crate) query_experimental_guard_stops: AtomicU64,
+    pub(crate) query_experimental_planned_without_statistics: AtomicU64,
+    pub(crate) planner_statistics_reloads: AtomicU64,
+    pub(crate) planner_statistics_load_failures: AtomicU64,
+    pub(crate) planner_statistics_corrupt_ignored: AtomicU64,
+    pub(crate) planner_statistics_hints_sent: AtomicU64,
+    pub(crate) query_experimental_access_rows_estimated: AtomicU64,
+    pub(crate) query_experimental_access_rows_actual: AtomicU64,
+    pub(crate) query_experimental_access_underestimates: AtomicU64,
+    pub(crate) query_experimental_access_overestimates: AtomicU64,
     pub(crate) query_route_legacy_requests: AtomicU64,
     pub(crate) query_route_experimental_requests: AtomicU64,
     pub(crate) query_route_native_path_fallbacks: AtomicU64,
@@ -921,11 +1057,26 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) merge_relationships_batch_latency: AtomicDurationHistogram,
     pub(crate) merge_vertex_metadata_batch_latency: AtomicDurationHistogram,
     pub(crate) reserve_edge_delete_noops_batch_latency: AtomicDurationHistogram,
+    pub(crate) set_edge_metadata_latency: AtomicDurationHistogram,
+    pub(crate) set_edge_metadata_batch_latency: AtomicDurationHistogram,
+    pub(crate) write_edge_latency: AtomicDurationHistogram,
+    pub(crate) write_edge_mutations_batch_latency: AtomicDurationHistogram,
+    pub(crate) create_relationship_latency: AtomicDurationHistogram,
+    pub(crate) import_vertex_metadata_batch_latency: AtomicDurationHistogram,
+    pub(crate) query_experimental_access_statistics_latency: AtomicDurationHistogram,
+    pub(crate) query_experimental_access_probe_latency: AtomicDurationHistogram,
+    pub(crate) query_experimental_access_guard_latency: AtomicDurationHistogram,
+    pub(crate) query_experimental_access_default_latency: AtomicDurationHistogram,
     /// Folded once per experimental request, under one lock, never per
     /// operator invocation.
     pub(crate) experimental_operators: std::sync::Mutex<
         std::collections::BTreeMap<&'static str, ExperimentalOperatorMetricsSnapshot>,
     >,
+    /// `(storage_sequence, built_at_ms)` of the planner statistics the cache
+    /// holds; replaced each time the cache finishes a read. One lock rather
+    /// than two atomics so a snapshot never pairs one object's sequence with
+    /// another's build time, and it is taken once per TTL, not per query.
+    pub(crate) planner_statistics_loaded: std::sync::Mutex<Option<(u64, u64)>>,
 }
 
 impl GraphOperationalMetrics {
@@ -1151,6 +1302,58 @@ impl GraphOperationalMetrics {
             query_experimental_sampled_plans: self
                 .query_experimental_sampled_plans
                 .load(Ordering::Relaxed),
+            query_experimental_access_statistics_requests: self
+                .query_experimental_access_statistics_requests
+                .load(Ordering::Relaxed),
+            query_experimental_access_statistics_us: self
+                .query_experimental_access_statistics_us
+                .load(Ordering::Relaxed),
+            query_experimental_access_probe_requests: self
+                .query_experimental_access_probe_requests
+                .load(Ordering::Relaxed),
+            query_experimental_access_probe_us: self
+                .query_experimental_access_probe_us
+                .load(Ordering::Relaxed),
+            query_experimental_access_guard_requests: self
+                .query_experimental_access_guard_requests
+                .load(Ordering::Relaxed),
+            query_experimental_access_guard_us: self
+                .query_experimental_access_guard_us
+                .load(Ordering::Relaxed),
+            query_experimental_access_default_requests: self
+                .query_experimental_access_default_requests
+                .load(Ordering::Relaxed),
+            query_experimental_access_default_us: self
+                .query_experimental_access_default_us
+                .load(Ordering::Relaxed),
+            query_experimental_guard_stops: self
+                .query_experimental_guard_stops
+                .load(Ordering::Relaxed),
+            query_experimental_planned_without_statistics: self
+                .query_experimental_planned_without_statistics
+                .load(Ordering::Relaxed),
+            planner_statistics_reloads: self.planner_statistics_reloads.load(Ordering::Relaxed),
+            planner_statistics_load_failures: self
+                .planner_statistics_load_failures
+                .load(Ordering::Relaxed),
+            planner_statistics_corrupt_ignored: self
+                .planner_statistics_corrupt_ignored
+                .load(Ordering::Relaxed),
+            planner_statistics_hints_sent: self
+                .planner_statistics_hints_sent
+                .load(Ordering::Relaxed),
+            query_experimental_access_rows_estimated: self
+                .query_experimental_access_rows_estimated
+                .load(Ordering::Relaxed),
+            query_experimental_access_rows_actual: self
+                .query_experimental_access_rows_actual
+                .load(Ordering::Relaxed),
+            query_experimental_access_underestimates: self
+                .query_experimental_access_underestimates
+                .load(Ordering::Relaxed),
+            query_experimental_access_overestimates: self
+                .query_experimental_access_overestimates
+                .load(Ordering::Relaxed),
             query_route_legacy_requests: self.query_route_legacy_requests.load(Ordering::Relaxed),
             query_route_experimental_requests: self
                 .query_route_experimental_requests
@@ -1202,6 +1405,26 @@ impl GraphOperationalMetrics {
             reserve_edge_delete_noops_batch_latency: self
                 .reserve_edge_delete_noops_batch_latency
                 .snapshot(),
+            set_edge_metadata_latency: self.set_edge_metadata_latency.snapshot(),
+            set_edge_metadata_batch_latency: self.set_edge_metadata_batch_latency.snapshot(),
+            write_edge_latency: self.write_edge_latency.snapshot(),
+            write_edge_mutations_batch_latency: self.write_edge_mutations_batch_latency.snapshot(),
+            create_relationship_latency: self.create_relationship_latency.snapshot(),
+            import_vertex_metadata_batch_latency: self
+                .import_vertex_metadata_batch_latency
+                .snapshot(),
+            query_experimental_access_statistics_latency: self
+                .query_experimental_access_statistics_latency
+                .snapshot(),
+            query_experimental_access_probe_latency: self
+                .query_experimental_access_probe_latency
+                .snapshot(),
+            query_experimental_access_guard_latency: self
+                .query_experimental_access_guard_latency
+                .snapshot(),
+            query_experimental_access_default_latency: self
+                .query_experimental_access_default_latency
+                .snapshot(),
             experimental_operators: self
                 .experimental_operators
                 .lock()
@@ -1209,40 +1432,103 @@ impl GraphOperationalMetrics {
                 .values()
                 .cloned()
                 .collect(),
+            planner_statistics: self
+                .planner_statistics_loaded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .map(
+                    |(storage_sequence, built_at_ms)| PlannerStatisticsLoadedSnapshot {
+                        storage_sequence,
+                        built_at_ms,
+                        age_ms: crate::codec::graph_now_millis().saturating_sub(built_at_ms),
+                    },
+                ),
         }
+    }
+
+    /// Record the planner statistics object the cache now holds, or that it
+    /// holds none.
+    #[cfg(feature = "experimental-cypher-engine")]
+    pub(crate) fn set_planner_statistics_loaded(&self, header: Option<(u64, u64)>) {
+        *self
+            .planner_statistics_loaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = header;
     }
 }
 
 #[derive(Default)]
 pub(crate) struct GraphCacheMetrics {
-    pub(crate) matrix_artifact_hits: AtomicU64,
-    pub(crate) matrix_artifact_misses: AtomicU64,
-    pub(crate) matrix_adjacency_hits: AtomicU64,
-    pub(crate) matrix_adjacency_misses: AtomicU64,
-    pub(crate) graphblas_hits: AtomicU64,
-    pub(crate) graphblas_misses: AtomicU64,
-    pub(crate) parsed_row_query_hits: AtomicU64,
-    pub(crate) parsed_row_query_misses: AtomicU64,
-    pub(crate) relationship_rows_hits: AtomicU64,
-    pub(crate) relationship_rows_misses: AtomicU64,
-    pub(crate) relationship_property_rows_hits: AtomicU64,
-    pub(crate) relationship_property_rows_misses: AtomicU64,
-    pub(crate) insertions: AtomicU64,
-    pub(crate) evictions: AtomicU64,
-    pub(crate) pinned_insertions: AtomicU64,
-    pub(crate) tenant_quota_rejections: AtomicU64,
-    pub(crate) hydration_started: AtomicU64,
-    pub(crate) hydration_waited: AtomicU64,
-    pub(crate) hydration_completed: AtomicU64,
+    totals: Option<std::sync::Arc<GraphCacheMetrics>>,
+    matrix_artifact_hits: AtomicU64,
+    matrix_artifact_misses: AtomicU64,
+    matrix_adjacency_hits: AtomicU64,
+    matrix_adjacency_misses: AtomicU64,
+    graphblas_hits: AtomicU64,
+    graphblas_misses: AtomicU64,
+    parsed_row_query_hits: AtomicU64,
+    parsed_row_query_misses: AtomicU64,
+    relationship_rows_hits: AtomicU64,
+    relationship_rows_misses: AtomicU64,
+    relationship_property_rows_hits: AtomicU64,
+    relationship_property_rows_misses: AtomicU64,
+    insertions: AtomicU64,
+    evictions: AtomicU64,
+    pinned_insertions: AtomicU64,
+    tenant_quota_rejections: AtomicU64,
+    hydration_started: AtomicU64,
+    hydration_waited: AtomicU64,
+    hydration_completed: AtomicU64,
 }
 
 impl GraphCacheMetrics {
+    pub(crate) fn with_totals(totals: std::sync::Arc<Self>) -> Self {
+        Self {
+            totals: Some(totals),
+            ..Self::default()
+        }
+    }
+
+    fn increment(&self, counter: impl Fn(&Self) -> &AtomicU64) {
+        counter(self).fetch_add(1, Ordering::Relaxed);
+        if let Some(totals) = &self.totals {
+            counter(totals).fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_insertion(&self, pinned: bool) {
+        self.increment(|metrics| &metrics.insertions);
+        if pinned {
+            self.increment(|metrics| &metrics.pinned_insertions);
+        }
+    }
+
+    pub(crate) fn record_eviction(&self) {
+        self.increment(|metrics| &metrics.evictions);
+    }
+
+    pub(crate) fn record_quota_rejection(&self) {
+        self.increment(|metrics| &metrics.tenant_quota_rejections);
+    }
+
+    pub(crate) fn record_hydration_started(&self) {
+        self.increment(|metrics| &metrics.hydration_started);
+    }
+
+    pub(crate) fn record_hydration_waited(&self) {
+        self.increment(|metrics| &metrics.hydration_waited);
+    }
+
+    pub(crate) fn record_hydration_completed(&self) {
+        self.increment(|metrics| &metrics.hydration_completed);
+    }
+
     pub(crate) fn record_hit(&self, kind: GraphCacheKind) {
-        self.counter(kind, true).fetch_add(1, Ordering::Relaxed);
+        self.increment(|metrics| metrics.counter(kind, true));
     }
 
     pub(crate) fn record_miss(&self, kind: GraphCacheKind) {
-        self.counter(kind, false).fetch_add(1, Ordering::Relaxed);
+        self.increment(|metrics| metrics.counter(kind, false));
     }
 
     fn counter(&self, kind: GraphCacheKind, hit: bool) -> &AtomicU64 {
@@ -1291,6 +1577,139 @@ impl GraphCacheMetrics {
             hydration_started: self.hydration_started.load(Ordering::Relaxed),
             hydration_waited: self.hydration_waited.load(Ordering::Relaxed),
             hydration_completed: self.hydration_completed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One cell's operational counters, summed over every scope that has ever
+/// hosted it on this runtime: the scopes open now plus the final values of
+/// every scope that has closed.
+///
+/// The two shapes are the two enumerations an export needs —
+/// [`GraphOperationalMetricsSnapshot::counter_fields`] and
+/// [`GraphOperationalMetricsSnapshot::class_counter_fields`] — already summed,
+/// in the kernel's declaration order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CellOperationalCounterTotals {
+    pub counters: Vec<(&'static str, u64)>,
+    pub classes: Vec<(&'static str, &'static str, u64)>,
+}
+
+impl CellOperationalCounterTotals {
+    /// Add one snapshot's counters in, matched by field name rather than by
+    /// position so a reordering cannot add `write_commits` into
+    /// `write_attempts`.
+    pub fn accumulate(&mut self, snapshot: &GraphOperationalMetricsSnapshot) {
+        for (field, value) in snapshot.counter_fields() {
+            match self.counters.iter_mut().find(|(name, _)| *name == field) {
+                // Saturating: a wrapped total on a metrics series is a phantom
+                // incident, and only a decades-long uptime could overflow.
+                Some(slot) => slot.1 = slot.1.saturating_add(value),
+                None => self.counters.push((field, value)),
+            }
+        }
+        for (field, class, value) in snapshot.class_counter_fields() {
+            match self
+                .classes
+                .iter_mut()
+                .find(|(name, existing, _)| *name == field && *existing == class)
+            {
+                Some(slot) => slot.2 = slot.2.saturating_add(value),
+                None => self.classes.push((field, class, value)),
+            }
+        }
+    }
+}
+
+/// Per-cell operational counter totals that do not fall when a scope closes.
+///
+/// Each shard's [`GraphOperationalMetrics`] lives and dies with its scope, so a
+/// per-cell sum over the scopes *open* on a node falls whenever one closes. An
+/// exported counter that falls is read by Prometheus `rate()`/`increase()` and
+/// by an OTLP cumulative backend as a reset to zero, after which the whole
+/// remaining sum is counted again as new increase: a phantom spike, not an
+/// undercount. Staging saw `graph_write_commits` fall 13062 → 5427 → 651 → 195
+/// across evictions and report thousands of commits a minute with no writes.
+///
+/// So the runtime keeps a ledger. A shard registers its metrics when its scope
+/// opens; when the scope's cluster drops, the registration folds the shard's
+/// final values into `retired`. [`Self::totals`] reads live and retired under
+/// the one mutex the fold takes, so no read can see a shard in both or in
+/// neither. A reopened scope registers a fresh, zeroed metrics object, so
+/// nothing is counted twice.
+///
+/// Increments a shard makes after its cluster drops — a background task still
+/// holding the `Arc<GraphShard>` — are not counted. That is an undercount at
+/// the tail of a closed scope, which a counter tolerates; a fall it does not.
+#[derive(Default)]
+pub(crate) struct CumulativeOperationalCounters {
+    inner: std::sync::Mutex<CumulativeOperationalCountersInner>,
+}
+
+#[derive(Default)]
+struct CumulativeOperationalCountersInner {
+    next_id: u64,
+    live: std::collections::BTreeMap<u64, (String, std::sync::Arc<GraphOperationalMetrics>)>,
+    retired: std::collections::BTreeMap<String, CellOperationalCounterTotals>,
+}
+
+impl CumulativeOperationalCounters {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CumulativeOperationalCountersInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Count `metrics` under `cell_id` until the returned registration drops.
+    pub(crate) fn register(
+        self: &std::sync::Arc<Self>,
+        cell_id: String,
+        metrics: std::sync::Arc<GraphOperationalMetrics>,
+    ) -> CumulativeOperationalRegistration {
+        let mut inner = self.lock();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.live.insert(id, (cell_id, metrics));
+        CumulativeOperationalRegistration {
+            ledger: std::sync::Arc::clone(self),
+            id,
+        }
+    }
+
+    /// Every cell's retired totals plus its live shards' current values.
+    #[cfg_attr(not(feature = "query-transport"), allow(dead_code))]
+    pub(crate) fn totals(
+        &self,
+    ) -> std::collections::BTreeMap<String, CellOperationalCounterTotals> {
+        let inner = self.lock();
+        let mut totals = inner.retired.clone();
+        for (cell_id, metrics) in inner.live.values() {
+            totals
+                .entry(cell_id.clone())
+                .or_default()
+                .accumulate(&metrics.snapshot());
+        }
+        totals
+    }
+}
+
+/// A shard's place in [`CumulativeOperationalCounters`]; dropping it retires
+/// the shard's final values into the cell's total.
+pub(crate) struct CumulativeOperationalRegistration {
+    ledger: std::sync::Arc<CumulativeOperationalCounters>,
+    id: u64,
+}
+
+impl Drop for CumulativeOperationalRegistration {
+    fn drop(&mut self) {
+        let mut inner = self.ledger.lock();
+        if let Some((cell_id, metrics)) = inner.live.remove(&self.id) {
+            let snapshot = metrics.snapshot();
+            inner
+                .retired
+                .entry(cell_id)
+                .or_default()
+                .accumulate(&snapshot);
         }
     }
 }

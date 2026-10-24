@@ -24,8 +24,15 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dgr
 STORE_ARG="local:$STORE_ROOT"
 DATA_PATH="$DB_BASE/data"
 
+# macOS has no `timeout`; brew coreutils installs it as `gtimeout`.
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
+if [[ -z "$TIMEOUT_BIN" ]]; then
+  echo "error: GNU timeout not found (macOS: brew install coreutils)" >&2
+  exit 1
+fi
+
 run_worker() {
-  timeout "$TIMEOUT_SECONDS" cargo run "${FEATURE_ARGS[@]}" --example fence_worker -- "$@"
+  "$TIMEOUT_BIN" "$TIMEOUT_SECONDS" cargo run "${FEATURE_ARGS[@]}" --example fence_worker -- "$@"
 }
 
 cd "$ROOT"

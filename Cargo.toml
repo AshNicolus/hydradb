@@ -2,12 +2,18 @@
 # `[workspace]` table, so every bare `cargo test --features …` in CI, the
 # justfile and scripts/ still resolves to the root package. A virtual manifest
 # would have broken all of them.
+#
+# `exclude` covers the vendored Quint/CosmWasm sample manifests under `docs/`,
+# which are gitignored but present in working trees.
 [workspace]
 members = [
     "crates/cypher-engine",
     "crates/cypher-parser-antlr",
     "crates/cypher-ast",
     "crates/graph-plan",
+    "crates/falkordb-rdb",
+    "crates/falkor-dump-import",
+    "crates/object-publication",
     "crates/placement",
     "crates/telemetry",
 ]
@@ -20,11 +26,12 @@ members = [
 [workspace.dependencies]
 antlr-rust-codegen = "0.34.0"
 antlr-rust-runtime = "0.34.0"
-async-trait = "0.1"
+async-trait = "0.1.92"
 axum = "0.8.9"
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 boltr = "0.2.0"
+blake2 = "0.10"
 bytes = "1"
 # `serde` is declared rather than inherited. It does arrive anyway through
 # feature unification with `object_store`, but placement's heartbeat body
@@ -33,6 +40,7 @@ bytes = "1"
 # day that something else stops.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
+indexmap = "2"
 foyer = "0.22.3"
 libc = "0.2"
 libcypher-parser-sys = "0.6.1-1"
@@ -63,13 +71,15 @@ opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 rcgen = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+rmp-serde = "1"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
-slatedb = { git = "https://github.com/hydra-db/slatedb.git", rev = "4f2e0060473698bc6a8605a6718f4ff1bc691736", default-features = false, features = ["aws", "foyer"] }
-slatedb-common = { git = "https://github.com/hydra-db/slatedb.git", rev = "4f2e0060473698bc6a8605a6718f4ff1bc691736" }
+slatedb = { git = "https://github.com/hydra-db/slatedb.git", rev = "c1003496403d7c9d6613175d529381eb32e17d46", default-features = false, features = ["aws", "foyer"] }
+slatedb-common = { git = "https://github.com/hydra-db/slatedb.git", rev = "c1003496403d7c9d6613175d529381eb32e17d46" }
+slatedb-txn-obj = { git = "https://github.com/hydra-db/slatedb.git", rev = "c1003496403d7c9d6613175d529381eb32e17d46" }
 subtle = "2"
 tempfile = "3"
 thiserror = "2"
@@ -84,7 +94,7 @@ ulid = "1"
 name = "hydradb"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.99"
 description = "Object-store-native distributed graph database"
 repository = "https://github.com/hydra-db/hydradb"
 readme = "README.md"
@@ -96,7 +106,7 @@ opencypher = ["dep:libcypher-parser-sys"]
 experimental-cypher-engine = ["opencypher", "dep:hydradb-cypher-engine"]
 chaos-harness = []
 json-properties = ["dep:serde_json"]
-query-transport = ["opencypher", "dep:base64", "dep:serde", "dep:subtle", "json-properties", "tokio/io-util", "tokio/net"]
+query-transport = ["opencypher", "dep:serde", "dep:subtle", "json-properties", "tokio/io-util", "tokio/net"]
 query-transport-tls = ["query-transport", "dep:tokio-rustls"]
 query-service-discovery = ["query-transport", "dep:reqwest"]
 client-api = ["query-transport"]
@@ -120,10 +130,11 @@ indexer-runtime = [
 
 # OTLP export, off by default and never enabled by another feature. Off, the
 # binaries still initialise telemetry and still emit JSON to stdout — they just
-# install no exporter, so a build without a collector is the normal build. The
-# library needs no root `[features]` entry, but the binaries are in this package,
-# so shipping OTLP at all needs a switch here. It is additive — no existing
-# combination changes meaning.
+# install no exporter, so a build without a collector is the normal build. This
+# is the one deviation from the telemetry crate design §1,
+# which claimed no root `[features]` entry would be needed: true of the library,
+# but the binaries are in this package, so shipping OTLP at all needs a switch
+# here. It is additive — no existing combination changes meaning.
 otlp = ["hydradb-telemetry/otlp"]
 
 [[bin]]
@@ -175,7 +186,6 @@ name = "bolt_compat_server"
 path = "examples/bolt_compat_server.rs"
 required-features = ["bolt-server"]
 
-
 [dependencies]
 async-trait = { workspace = true }
 hydradb-cypher-ast = { path = "crates/cypher-ast" }
@@ -183,7 +193,7 @@ axum = { workspace = true, optional = true }
 axum-server = { workspace = true, optional = true }
 boltr = { workspace = true, optional = true }
 bytes = { workspace = true }
-base64 = { workspace = true, optional = true }
+base64 = { workspace = true }
 # Direct, not transitive. `hydradb-placement` takes `DateTime<Utc>` on its
 # heartbeat and LIST boundaries, and without this the type is not nameable in
 # the kernel at all — `object_store` does not re-export chrono. Two independent
@@ -211,6 +221,7 @@ sha2 = { workspace = true }
 subtle = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
+hydradb-object-publication = { path = "crates/object-publication" }
 hydradb-placement = { path = "crates/placement" }
 hydradb-graph-plan = { path = "crates/graph-plan" }
 hydradb-cypher-engine = { path = "crates/cypher-engine", optional = true }
@@ -227,17 +238,3 @@ ulid = { workspace = true }
 # `otlp` feature below, and nothing enables it implicitly.
 hydradb-telemetry = { path = "crates/telemetry", optional = true }
 
-[dev-dependencies]
-slatedb-common = { workspace = true, features = ["test-util"] }
-boltr = { workspace = true, features = ["client"] }
-hydradb-cypher-parser-antlr = { path = "crates/cypher-parser-antlr" }
-serde = { workspace = true }
-# `test-util` is what `#[tokio::test(start_paused = true)]` needs, and the fence
-# backoff tests in `src/core/state.rs` are built on it. It does arrive anyway
-# through feature unification with `fail-parallel`, a slatedb dependency, but
-# those tests would stop compiling the day that transitive path changes.
-tokio = { workspace = true, features = ["test-util"] }
-serde_yaml = { workspace = true }
-rcgen = { workspace = true }
-reqwest = { workspace = true }
-tempfile = { workspace = true }

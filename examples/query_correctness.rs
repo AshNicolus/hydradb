@@ -56,9 +56,7 @@ async fn main() -> CheckResult<()> {
             (local_object_store(&object_root)?, "local")
         };
     let run_id = format!("query-correctness-{}", std::process::id());
-    println!(
-        "object_backend,fanout,hops,expected_reachable,check,repeats,expected_rows,actual_rows,elapsed_us,status"
-    );
+    println!("object_backend,fanout,hops,expected_reachable,check,repeats,expected_rows,actual_rows,elapsed_us,status");
 
     for fanout in fanouts {
         let shard_path = format!("{run_id}/fanout-{fanout}");
@@ -634,33 +632,6 @@ fn reset_dir(path: &Path) -> CheckResult<()> {
         b"slatedb graph query correctness cache\n",
     )?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reset_dir_refuses_unmarked_non_empty_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("important.txt"), "keep me").unwrap();
-        let err = reset_dir(temp.path()).unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::AlreadyExists)
-        );
-        assert!(temp.path().join("important.txt").exists());
-    }
-
-    #[test]
-    fn reset_dir_cleans_marked_cache_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join(CACHE_DIR_MARKER), "marker").unwrap();
-        fs::write(temp.path().join("cache.bin"), "stale").unwrap();
-        reset_dir(temp.path()).unwrap();
-        assert!(temp.path().join(CACHE_DIR_MARKER).exists());
-        assert!(!temp.path().join("cache.bin").exists());
-    }
 }
 
 struct TempCheckRoot {

@@ -15,7 +15,22 @@ pub struct CypherTckCorpus {
 pub struct CypherTckCase {
     pub name: String,
     pub query: String,
-    pub expected: QueryResultSet,
+    pub expected: CypherTckOutcome,
+}
+
+/// What a TCK scenario says should happen.
+///
+/// The real corpus asserts rejections as often as it asserts rows - `Then a
+/// SyntaxError should be raised at compile time: ...` - and the parser used to
+/// drop those lines silently, so a scenario that tested a refusal was recorded
+/// as one missing a result table. Both outcomes are cases now, which matters
+/// here: an engine that accepts what the TCK says to reject has
+/// regressed just as surely as one that returns the wrong rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CypherTckOutcome {
+    Rows(QueryResultSet),
+    /// The error type the scenario names, e.g. `SyntaxError`.
+    Error(String),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -166,15 +181,18 @@ impl<'a> TckCorpusParser<'a> {
             if line.starts_with("Then the result should be") {
                 self.idx += 1;
                 match self.read_result_table(&name)? {
-                    Some(table) => expected = Some(table),
+                    Some(table) => expected = Some(CypherTckOutcome::Rows(table)),
                     None => {
                         unsupported.get_or_insert_with(|| {
-                            format!(
-                                "{name}: result assertions without inline tables are not row-query corpus cases"
-                            )
+                            format!("{name}: result assertions without inline tables are not row-query corpus cases")
                         });
                     }
                 }
+                continue;
+            }
+            if let Some(error) = raised_error(line) {
+                expected = Some(CypherTckOutcome::Error(error));
+                self.idx += 1;
                 continue;
             }
             if line.starts_with("Then no side effects")
@@ -286,6 +304,18 @@ impl<'a> TckCorpusParser<'a> {
     fn trimmed(&self) -> &'a str {
         self.lines[self.idx].trim()
     }
+}
+
+/// The error type in `Then a <Type> should be raised at <phase>: <detail>`.
+///
+/// Returns the type alone. The detail after the colon is the TCK's own
+/// vocabulary for a cause and does not map onto this engine's error classes,
+/// so recording it would invite a comparison that cannot be made.
+fn raised_error(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("Then a ")?;
+    let (error, rest) = rest.split_once(' ')?;
+    rest.starts_with("should be raised")
+        .then(|| error.to_string())
 }
 
 fn scenario_name(line: &str) -> Option<String> {

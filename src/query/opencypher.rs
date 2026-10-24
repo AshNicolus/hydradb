@@ -477,7 +477,14 @@ pub(crate) fn parse_opencypher_unwind_batch(query: &str) -> Result<Option<Parsed
     if starts_with_non_unwind_clause(query) {
         return Ok(None);
     }
-    with_parsed_cypher(query, ParsedCypher::lower_unwind_batch)
+    let parsed = with_parsed_cypher(query, ParsedCypher::lower_unwind_batch);
+    #[cfg(feature = "experimental-cypher-engine")]
+    if parsed.is_err() && super::experimental_cypher::is_cypher25_read_query(query) {
+        // Specialized batches keep precedence. Generic typed reads, including
+        // literal UNWIND, proceed to the engine; updates cannot pass lowering.
+        return Ok(None);
+    }
+    parsed
 }
 
 #[cfg(feature = "client-api")]
@@ -497,7 +504,32 @@ fn starts_with_non_unwind_clause(query: &str) -> bool {
     })
 }
 
+/// Whether a query reads or writes, which every layer that routes a query --
+/// client authorization, transport, cluster and shard dispatch -- asks first.
+///
+/// libcypher-parser answers it for openCypher 9. Cypher 25 adds read syntax
+/// that grammar does not have, such as `(n WHERE ...)` inside a pattern, and a
+/// query using it would otherwise fail here with a parse error before the
+/// Cypher 25 engine that can run it ever saw it. So when libcypher cannot
+/// parse the text and the experimental engine is built in, the Cypher 25
+/// adapter is asked instead: only a query it lowers to a typed read plan is
+/// classified `Read`. Its typed lowering has no form for any updating clause,
+/// so a write it cannot read stays the parse error it was, and the legacy
+/// engine, which still parses with libcypher, refuses such a read as before.
 pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
+    let classified = classify_with_libcypher(query);
+    #[cfg(feature = "experimental-cypher-engine")]
+    if matches!(
+        classified,
+        Err(GraphError::QueryParse { .. } | GraphError::UnsupportedQuery { .. })
+    ) && super::experimental_cypher::is_cypher25_read_query(query)
+    {
+        return Ok(OpenCypherQueryAccess::Read);
+    }
+    classified
+}
+
+fn classify_with_libcypher(query: &str) -> Result<OpenCypherQueryAccess> {
     if super::path_procedure::is_native_path_procedure(query) {
         return Ok(OpenCypherQueryAccess::Read);
     }
@@ -979,7 +1011,7 @@ fn normalize_query_shape(query: &str) -> String {
 
 /// Whether a byte can continue an identifier -- and so can continue a numeric
 /// token, which the lexer ends only where an identifier would end
-/// (`crates/cypher-parser-antlr/grammar/Cypher25Lexer.g4`, `PART_LETTER`). Every non-ASCII byte
+/// (the Cypher lexer grammar, `PART_LETTER`). Every non-ASCII byte
 /// counts: `PART_LETTER` is a wide Unicode class, and over-consuming a token
 /// can only elide more, never leak more.
 fn is_identifier_byte(byte: u8) -> bool {
@@ -1386,7 +1418,8 @@ impl ParsedCypher {
             }
 
             if !is_instance(second, AstKind::Match) || !(3..=5).contains(&clause_count) {
-                return unsupported(QueryFailureReason::Unwind,
+                return unsupported(
+                    QueryFailureReason::Unwind,
                     "UNWIND batches support CREATE or MATCH followed by RETURN, DELETE, CREATE, or MERGE",
                 );
             }
@@ -1527,7 +1560,8 @@ impl ParsedCypher {
                     }
                     let deleted = checked_node(sys::cypher_ast_delete_get_expression(third, 0))?;
                     if identifier_name(deleted)? != template.binding {
-                        return unsupported(QueryFailureReason::Unwind,
+                        return unsupported(
+                            QueryFailureReason::Unwind,
                             "UNWIND relationship property DELETE must delete the matched relationship",
                         );
                     }
@@ -1626,7 +1660,8 @@ impl ParsedCypher {
                 || !sys::cypher_ast_return_get_limit(third).is_null()
                 || sys::cypher_ast_return_nprojections(third) != 2
             {
-                return unsupported(QueryFailureReason::Unwind,
+                return unsupported(
+                    QueryFailureReason::Unwind,
                     "UNWIND batch read requires two unsorted projections without a destination id constraint",
                 );
             }
@@ -2369,17 +2404,16 @@ fn validate_merge_policy(
         if property_fields.get(guard).map(String::as_str) != Some(guard) {
             return unsupported(
                 QueryFailureReason::Unwind,
-                format!(
-                "UNWIND {kind} update guard must name a property assigned from the same row field"
-            ),
+                format!("UNWIND {kind} update guard must name a property assigned from the same row field"),
             );
         }
     }
     for property in create_only_properties {
         if property_fields.get(property).map(String::as_str) != Some(property.as_str()) {
-            return unsupported(QueryFailureReason::Unwind, format!(
-                "UNWIND {kind} create-only marker must name a property assigned from the same row field"
-            ));
+            return unsupported(
+                QueryFailureReason::Unwind,
+                format!("UNWIND {kind} create-only marker must name a property assigned from the same row field"),
+            );
         }
     }
     Ok(())
@@ -2643,7 +2677,8 @@ fn unwind_relationship_property_delete_template(
             || !sys::cypher_ast_rel_pattern_get_varlength(relationship).is_null()
             || sys::cypher_ast_rel_pattern_nreltypes(relationship) != 1
         {
-            return unsupported(QueryFailureReason::Unwind,
+            return unsupported(
+                QueryFailureReason::Unwind,
                 "UNWIND relationship property DELETE requires anonymous endpoints and one edge type",
             );
         }
@@ -3471,8 +3506,10 @@ fn collect_row_pattern_bindings(pattern: &RowPattern, bindings: &mut BTreeSet<St
     }
 }
 
+/// Hidden bindings stay out of scope: nothing after the MATCH can name them,
+/// so a pass-through `WITH` cannot be required to carry them.
 fn collect_row_node_bindings(node: &RowNodePattern, bindings: &mut BTreeSet<String>) {
-    if let Some(binding) = &node.binding {
+    if let Some(binding) = node.binding.as_ref().filter(|b| !is_hidden_binding(b)) {
         bindings.insert(binding.clone());
     }
 }
@@ -3503,7 +3540,8 @@ fn lower_passthrough_with(
             || !sys::cypher_ast_with_get_order_by(with_clause).is_null()
             || !sys::cypher_ast_with_get_predicate(with_clause).is_null()
         {
-            return unsupported(QueryFailureReason::Return,
+            return unsupported(
+                QueryFailureReason::Return,
                 "WITH currently supports only pass-through identifiers without DISTINCT, WHERE, or ORDER BY",
             );
         }
@@ -4766,7 +4804,9 @@ fn lower_row_patterns(
                 1 => {
                     let node = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
                     ensure_instance(node, AstKind::NodePattern, "node pattern")?;
-                    patterns.push(RowPattern::Node(lower_row_node_pattern(node, parameters)?));
+                    patterns.push(RowPattern::Node(lower_row_node_pattern(
+                        node, parameters, false,
+                    )?));
                 }
                 count if count >= 3 && count % 2 == 1 => {
                     let edge_count = (count - 1) / 2;
@@ -4866,8 +4906,11 @@ fn lower_row_edge_path_segment(
                 "variable-length relationship bindings are not executable in Query engine",
             );
         }
-        let left_node = lower_row_node_pattern(left, parameters)?;
-        let right_node = lower_row_node_pattern(right, parameters)?;
+        // Interior nodes of the path: every one except its two endpoints is a
+        // position the neighbouring hop also visits.
+        let edge_count = (sys::cypher_ast_pattern_path_nelements(path) - 1) / 2;
+        let left_node = lower_row_node_pattern(left, parameters, edge_idx > 0)?;
+        let right_node = lower_row_node_pattern(right, parameters, edge_idx + 1 < edge_count)?;
 
         match sys::cypher_ast_rel_pattern_get_direction(rel) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(RowEdgePattern {
@@ -4892,7 +4935,8 @@ fn lower_row_edge_path_segment(
                 // Variable-length undirected reachability is a different
                 // traversal, and no caller needs it yet.
                 if hop_range.is_some() {
-                    return unsupported(QueryFailureReason::Pattern,
+                    return unsupported(
+                        QueryFailureReason::Pattern,
                         "variable-length undirected relationships are not executable in Query engine",
                     );
                 }
@@ -4969,13 +5013,19 @@ fn lower_hop_range(range: *const AstNode) -> Result<(u8, u8)> {
     }
 }
 
+/// Lower one node pattern of a row MATCH.
+///
+/// `shared_position` marks a node the path visits between two relationships.
+/// Such a node needs a name even when it constrains nothing, because the name
+/// is what makes the two hops meet there -- see the binding rule below.
 fn lower_row_node_pattern(
     node: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
+    shared_position: bool,
 ) -> Result<RowNodePattern> {
     unsafe {
         ensure_instance(node, AstKind::NodePattern, "node pattern")?;
-        let binding = node_identifier(node)?;
+        let mut binding = node_identifier(node)?;
         let mut labels = BTreeSet::new();
         for idx in 0..sys::cypher_ast_node_pattern_nlabels(node) {
             let label = checked_node(sys::cypher_ast_node_pattern_get_label(node, idx))?;
@@ -4999,13 +5049,25 @@ fn lower_row_node_pattern(
             }
             None => None,
         };
+        // The executor checks labels and properties against the metadata it
+        // hydrates per binding, so an anonymous node that constrains either
+        // needs a name to hang them on — `(s)-[e:R]->(:Label)` would otherwise
+        // match every neighbour.
+        //
+        // A node the path visits between two relationships needs one too, and
+        // for a different reason: each hop is lowered into its own
+        // `RowEdgePattern`, and the shared name is the only thing that makes
+        // the two meet at that node. Without it `(a)-[:R]->()-[:R]->(c)`
+        // matched every first hop against every second hop -- on two edges,
+        // four rows where one is a path, including endpoints no two-hop path
+        // reaches. A label or a variable on the node already minted a name and
+        // hid the bug, so only the bare `()` was wrong.
         if binding.is_none()
-            && (!labels.is_empty() || properties.keys().any(|property| property != "id"))
+            && (shared_position
+                || !labels.is_empty()
+                || properties.keys().any(|property| property != "id"))
         {
-            return unsupported(
-                QueryFailureReason::Pattern,
-                "node labels and non-id properties require a named node",
-            );
+            binding = Some(anonymous_node_binding(node));
         }
         Ok(RowNodePattern {
             binding,
@@ -5435,6 +5497,23 @@ fn node_identifier(node: *const AstNode) -> Result<Option<String>> {
     }
 }
 
+/// Marks a binding lowering invented for an anonymous node pattern. libcypher
+/// hands identifiers back as C strings, so no variable a query names — not even
+/// a backtick-quoted one — can contain a NUL, let alone start with one.
+const HIDDEN_BINDING_PREFIX: &str = "\0UNNAMED";
+
+/// A hidden binding for an anonymous node pattern. The query-text offset keeps
+/// two anonymous nodes in one query from sharing a name, and so from being
+/// joined.
+fn anonymous_node_binding(node: *const AstNode) -> String {
+    let offset = unsafe { sys::cypher_astnode_range(node).start.offset };
+    format!("{HIDDEN_BINDING_PREFIX}{offset}")
+}
+
+fn is_hidden_binding(binding: &str) -> bool {
+    binding.starts_with(HIDDEN_BINDING_PREFIX)
+}
+
 fn rel_identifier(rel: *const AstNode) -> Result<Option<String>> {
     unsafe {
         let ident = sys::cypher_ast_rel_pattern_get_identifier(rel);
@@ -5571,1783 +5650,5 @@ fn parse_error(reason: impl Into<String>) -> GraphError {
     GraphError::QueryParse {
         dialect: "OpenCypher",
         reason: reason.into(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    /// The six queries `GetAuxiliaryByChunks` sends (hydradb-application,
-    /// `application/internal/platform/falkordb/relations.go`), verbatim apart
-    /// from the `HAS_CHUNK` arrowhead, which is fixed on the caller's side
-    /// because the edge is only ever written Chunk -> Source.
-    ///
-    /// All six were rejected before `IN`, list parameters and constant
-    /// projections landed. Keeping the real text here means a regression shows
-    /// up as this endpoint breaking, not as an abstract lowering failure.
-    fn auxiliary_by_chunks_queries() -> Vec<(&'static str, String)> {
-        let scope = "tenant_id: $tenant_id, sub_tenant_id: $sub_tenant_id";
-        vec![
-            (
-                "present_in",
-                format!(
-                    "MATCH (e:Entity {{{scope}}})
-                     WHERE e.entity_id IN $entity_ids
-                     MATCH (e)-[:PRESENT_IN]->(c:Chunk {{{scope}}})
-                     MATCH (c)-[:HAS_CHUNK]->(s:Source {{{scope}}})
-                     RETURN DISTINCT
-                        e.entity_id AS src_id, e.name AS src_name, e.type AS src_type,
-                        e.namespace AS src_namespace, e.identifier AS src_identifier,
-                        s.source_id AS tgt_id, s.app_external_id AS tgt_name,
-                        'SOURCE' AS tgt_type, s.app_provider AS tgt_provider,
-                        s.source_id AS tgt_source_id, s.app_provider AS tgt_app_provider,
-                        '' AS raw_predicate, NULL AS created_at
-                     ORDER BY src_id, tgt_id
-                     LIMIT $cap"
-                ),
-            ),
-            (
-                "has_comment",
-                format!(
-                    "MATCH (c:Chunk {{{scope}}})
-                     WHERE c.chunk_id IN $chunk_ids
-                     MATCH (c)-[:HAS_CHUNK]->(s:Source {{{scope}}})
-                     MATCH (s)-[e:HAS_COMMENT]->(cmt:Comment {{{scope}}})
-                     RETURN DISTINCT
-                        s.source_id AS src_id, s.app_external_id AS src_name,
-                        'SOURCE' AS src_type, s.app_provider AS src_provider,
-                        s.source_id AS src_source_id, s.app_provider AS src_app_provider,
-                        cmt.comment_id AS tgt_id, cmt.author_display AS tgt_name,
-                        'COMMENT' AS tgt_type, s.app_provider AS tgt_provider,
-                        '' AS raw_predicate, e.created_at AS created_at
-                     ORDER BY src_id, tgt_id
-                     LIMIT $cap"
-                ),
-            ),
-            (
-                "has_attachment",
-                format!(
-                    "MATCH (c:Chunk {{{scope}}})
-                     WHERE c.chunk_id IN $chunk_ids
-                     MATCH (c)-[:HAS_CHUNK]->(s:Source {{{scope}}})
-                     MATCH (s)-[e:HAS_ATTACHMENT]->(a:Attachment {{{scope}}})
-                     RETURN DISTINCT
-                        s.source_id AS src_id, s.app_external_id AS src_name,
-                        'SOURCE' AS src_type, s.app_provider AS src_provider,
-                        s.source_id AS src_source_id, s.app_provider AS src_app_provider,
-                        a.attachment_id AS tgt_id, a.file_name AS tgt_name,
-                        'ATTACHMENT' AS tgt_type, s.app_provider AS tgt_provider,
-                        '' AS raw_predicate, e.created_at AS created_at
-                     ORDER BY src_id, tgt_id
-                     LIMIT $cap"
-                ),
-            ),
-            (
-                "acted_on",
-                format!(
-                    "MATCH (c:Chunk {{{scope}}})
-                     WHERE c.chunk_id IN $chunk_ids
-                     MATCH (c)-[:HAS_CHUNK]->(s:Source {{{scope}}})
-                     MATCH (act:Actor {{{scope}}})-[e:ACTED_ON]->(s)
-                     RETURN DISTINCT
-                        act.actor_id AS src_id, act.email AS src_name,
-                        'ACTOR' AS src_type, s.app_provider AS src_provider,
-                        s.source_id AS tgt_id, s.app_external_id AS tgt_name,
-                        'SOURCE' AS tgt_type, s.app_provider AS tgt_provider,
-                        s.source_id AS tgt_source_id, s.app_provider AS tgt_app_provider,
-                        e.role AS raw_predicate, e.created_at AS created_at
-                     ORDER BY src_id, tgt_id
-                     LIMIT $cap"
-                ),
-            ),
-            (
-                "authored_comment",
-                format!(
-                    "MATCH (c:Chunk {{{scope}}})
-                     WHERE c.chunk_id IN $chunk_ids
-                     MATCH (c)-[:HAS_CHUNK]->(s:Source {{{scope}}})
-                     MATCH (s)-[:HAS_COMMENT]->(cmt:Comment {{{scope}}})
-                     MATCH (act:Actor {{{scope}}})-[e:AUTHORED_COMMENT]->(cmt)
-                     RETURN DISTINCT
-                        act.actor_id AS src_id, act.email AS src_name,
-                        'ACTOR' AS src_type, s.app_provider AS src_provider,
-                        cmt.comment_id AS tgt_id, cmt.author_display AS tgt_name,
-                        'COMMENT' AS tgt_type, s.app_provider AS tgt_provider,
-                        '' AS raw_predicate, e.created_at AS created_at
-                     ORDER BY src_id, tgt_id
-                     LIMIT $cap"
-                ),
-            ),
-            (
-                "relates_to",
-                format!(
-                    "MATCH (c:Chunk {{{scope}}})
-                     WHERE c.chunk_id IN $chunk_ids
-                     MATCH (c)-[:HAS_CHUNK]->(s:Source {{{scope}}})
-                     MATCH (s)-[e:RELATES_TO]->(t:Source {{{scope}}})
-                     RETURN DISTINCT
-                        s.source_id AS src_id, s.app_external_id AS src_name,
-                        'SOURCE' AS src_type, s.app_provider AS src_provider,
-                        s.source_id AS src_source_id, s.app_provider AS src_app_provider,
-                        t.source_id AS tgt_id, t.app_external_id AS tgt_name,
-                        'SOURCE' AS tgt_type, t.app_provider AS tgt_provider,
-                        t.source_id AS tgt_source_id, t.app_provider AS tgt_app_provider,
-                        e.relation_type AS raw_predicate, e.created_at AS created_at
-                     ORDER BY src_id, tgt_id
-                     LIMIT $cap"
-                ),
-            ),
-        ]
-    }
-
-    fn auxiliary_scalar_parameters() -> BTreeMap<String, VertexPropertyValue> {
-        BTreeMap::from([
-            (
-                "tenant_id".to_string(),
-                VertexPropertyValue::String("acme".to_string()),
-            ),
-            (
-                "sub_tenant_id".to_string(),
-                VertexPropertyValue::String("marketing".to_string()),
-            ),
-            ("cap".to_string(), VertexPropertyValue::Integer(5001)),
-        ])
-    }
-
-    fn auxiliary_list_parameters() -> ListParameters {
-        ListParameters::from([
-            (
-                "chunk_ids".to_string(),
-                (0..40)
-                    .map(|index| VertexPropertyValue::String(format!("c{index}")))
-                    .collect(),
-            ),
-            (
-                "entity_ids".to_string(),
-                (0..40)
-                    .map(|index| VertexPropertyValue::String(format!("e{index}")))
-                    .collect(),
-            ),
-        ])
-    }
-
-    #[test]
-    fn auxiliary_by_chunks_queries_lower() {
-        let scalars = auxiliary_scalar_parameters();
-        let lists = auxiliary_list_parameters();
-        for (kind, query) in auxiliary_by_chunks_queries() {
-            let parsed = parse_opencypher_row_query_with_list_parameters(&query, &scalars, &lists)
-                .unwrap_or_else(|err| panic!("auxiliary {kind} must lower: {err}"));
-            assert!(parsed.distinct, "{kind} keeps RETURN DISTINCT");
-            assert_eq!(parsed.window.limit, Some(5001), "{kind} keeps LIMIT $cap");
-            assert_eq!(parsed.order_by.len(), 2, "{kind} keeps ORDER BY");
-            let names: Vec<&str> = parsed.columns.iter().map(|c| c.name.as_str()).collect();
-            assert!(
-                names.contains(&"src_id") && names.contains(&"tgt_id"),
-                "{kind} projects the triplet endpoints, got {names:?}"
-            );
-            assert!(
-                parsed
-                    .projections
-                    .iter()
-                    .any(|p| matches!(p, RowProjection::Literal(_))),
-                "{kind} projects at least one constant column"
-            );
-        }
-    }
-
-    /// The list bound to `IN` must survive as a multi-value predicate rather
-    /// than collapsing to the first element or to a single-value seek.
-    #[test]
-    fn in_list_parameter_lowers_to_every_value() {
-        let query = "MATCH (c:Chunk) WHERE c.chunk_id IN $chunk_ids RETURN c.chunk_id AS chunk_id";
-        let lists = ListParameters::from([(
-            "chunk_ids".to_string(),
-            vec![
-                VertexPropertyValue::String("a".to_string()),
-                VertexPropertyValue::String("b".to_string()),
-                VertexPropertyValue::String("c".to_string()),
-            ],
-        )]);
-        let parsed =
-            parse_opencypher_row_query_with_list_parameters(query, &BTreeMap::new(), &lists)
-                .expect("IN over a list parameter must lower");
-        let Some(RowPredicate::In { expression, values }) = parsed.predicate else {
-            panic!("expected a flat In predicate, got {:?}", parsed.predicate);
-        };
-        assert_eq!(
-            expression,
-            RowExpression::Property {
-                binding: "c".to_string(),
-                property: "chunk_id".to_string(),
-            }
-        );
-        assert_eq!(values.len(), 3);
-    }
-
-    #[test]
-    fn in_accepts_an_inline_collection() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (c:Chunk) WHERE c.chunk_id IN ['a', 'b'] RETURN c.chunk_id AS chunk_id",
-        )
-        .expect("IN over an inline list must lower");
-        let Some(RowPredicate::In { values, .. }) = parsed.predicate else {
-            panic!("expected an In predicate");
-        };
-        assert_eq!(
-            values,
-            vec![
-                VertexPropertyValue::String("a".to_string()),
-                VertexPropertyValue::String("b".to_string()),
-            ]
-        );
-    }
-
-    /// FalkorDB returns no rows for `IN []` rather than failing, and callers
-    /// page id sets down to empty routinely. Erroring here would be a parity
-    /// bug that only shows up on the last page.
-    #[test]
-    fn in_over_an_empty_list_matches_nothing_without_erroring() {
-        let lists = ListParameters::from([("chunk_ids".to_string(), Vec::new())]);
-        let parsed = parse_opencypher_row_query_with_list_parameters(
-            "MATCH (c:Chunk) WHERE c.chunk_id IN $chunk_ids RETURN c.chunk_id AS chunk_id",
-            &BTreeMap::new(),
-            &lists,
-        )
-        .expect("an empty IN list is a predicate, not an error");
-        let Some(RowPredicate::In { values, .. }) = parsed.predicate else {
-            panic!("expected an In predicate");
-        };
-        assert!(values.is_empty());
-    }
-
-    #[test]
-    fn in_list_beyond_the_value_ceiling_is_rejected() {
-        let lists = ListParameters::from([(
-            "chunk_ids".to_string(),
-            (0..=MAX_IN_LIST_VALUES)
-                .map(|index| VertexPropertyValue::Integer(index as u64))
-                .collect(),
-        )]);
-        let error = parse_opencypher_row_query_with_list_parameters(
-            "MATCH (c:Chunk) WHERE c.chunk_id IN $chunk_ids RETURN c.chunk_id AS chunk_id",
-            &BTreeMap::new(),
-            &lists,
-        )
-        .expect_err("a list past the ceiling must fail with a clear message");
-        assert!(
-            format!("{error}").contains("exceeds"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn in_accepts_dollar_prefixed_list_parameter_keys() {
-        let lists = ListParameters::from([(
-            "$chunk_ids".to_string(),
-            vec![VertexPropertyValue::String("a".to_string())],
-        )]);
-        let parsed = parse_opencypher_row_query_with_list_parameters(
-            "MATCH (c:Chunk) WHERE c.chunk_id IN $chunk_ids RETURN c.chunk_id AS chunk_id",
-            &BTreeMap::new(),
-            &lists,
-        )
-        .expect("list parameter keys may retain their leading dollar sign");
-        let Some(RowPredicate::In { values, .. }) = parsed.predicate else {
-            panic!("expected an In predicate");
-        };
-        assert_eq!(values, vec![VertexPropertyValue::String("a".to_string())]);
-    }
-
-    #[test]
-    fn in_prefers_a_list_over_a_scalar_with_the_same_name() {
-        let parameters = BTreeMap::from([("ids".to_string(), VertexPropertyValue::Integer(1))]);
-        let lists =
-            ListParameters::from([("ids".to_string(), vec![VertexPropertyValue::Integer(2)])]);
-        let parsed = parse_opencypher_row_query_with_list_parameters(
-            "MATCH (n:Node) WHERE n.id IN $ids RETURN n.id AS id",
-            &parameters,
-            &lists,
-        )
-        .expect("the list namespace takes precedence for IN");
-        let Some(RowPredicate::In { values, .. }) = parsed.predicate else {
-            panic!("expected an In predicate");
-        };
-        assert_eq!(values, vec![VertexPropertyValue::Integer(2)]);
-    }
-
-    #[test]
-    fn in_accepts_parameters_inside_inline_collections() {
-        let parameters = BTreeMap::from([("id".to_string(), VertexPropertyValue::Integer(2))]);
-        let parsed = parse_opencypher_row_query_with_parameters(
-            "MATCH (n:Node) WHERE n.id IN [1, $id] RETURN n.id AS id",
-            &parameters,
-        )
-        .expect("inline IN lists may contain scalar parameters");
-        let Some(RowPredicate::In { values, .. }) = parsed.predicate else {
-            panic!("expected an In predicate");
-        };
-        assert_eq!(
-            values,
-            vec![
-                VertexPropertyValue::Integer(1),
-                VertexPropertyValue::Integer(2),
-            ]
-        );
-    }
-
-    #[test]
-    fn in_rejects_null_and_nested_inline_values() {
-        for query in [
-            "MATCH (n:Node) WHERE n.id IN [NULL] RETURN n.id AS id",
-            "MATCH (n:Node) WHERE n.id IN [[1]] RETURN n.id AS id",
-        ] {
-            let error = parse_opencypher_row_query(query)
-                .expect_err("IN values must be representable scalar property values");
-            assert!(
-                matches!(error, GraphError::UnsupportedQuery { .. }),
-                "unexpected error: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn inline_in_list_beyond_the_value_ceiling_is_rejected() {
-        let values = (0..=MAX_IN_LIST_VALUES)
-            .map(|index| index.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let query = format!("MATCH (n:Node) WHERE n.id IN [{values}] RETURN n.id AS id");
-        let error = parse_opencypher_row_query(&query)
-            .expect_err("an inline list past the ceiling must fail before lowering elements");
-        assert!(
-            format!("{error}").contains("exceeds"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn constant_and_null_projections_lower() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (s:Source) RETURN DISTINCT s.source_id AS id, 'SOURCE' AS kind, \
-             '' AS raw_predicate, NULL AS created_at",
-        )
-        .expect("constant and NULL projections must lower");
-        assert_eq!(
-            parsed.projections[1],
-            RowProjection::Literal(Some(VertexPropertyValue::String("SOURCE".to_string())))
-        );
-        assert_eq!(
-            parsed.projections[2],
-            RowProjection::Literal(Some(VertexPropertyValue::String(String::new())))
-        );
-        assert_eq!(parsed.projections[3], RowProjection::Literal(None));
-        let names: Vec<&str> = parsed.columns.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["id", "kind", "raw_predicate", "created_at"]);
-    }
-
-    // Regression: `cypher_uparse`'s refill callback never advances its
-    // read pointer, so past the parser's ~1 KiB input buffer it re-copies the
-    // head of the query instead of continuing through it. A longer statement is
-    // silently corrupted: the parser sees the opening bytes REPEATED, and the
-    // tail never arrives. `ParsedCypher::parse` therefore streams via
-    // `fmemopen` + `cypher_fparse` instead — see the comment on that function.
-    //
-    // If this test starts failing with "row execution supports MATCH ... RETURN
-    // queries ending in RETURN", the parse entry point has been changed back:
-    // the trailing RETURN never reached the parser, the re-copied opening MATCH
-    // took its place as the final clause, and the error is describing that
-    // corruption rather than the query.
-    #[test]
-    fn statements_longer_than_the_uparse_buffer_parse_intact() {
-        let predicates: Vec<String> = (0..50)
-            .map(|index| format!("e.entity_id = $entity_id_{index}"))
-            .collect();
-        let query = format!(
-            "MATCH (e:Entity)-[:PRESENT_IN]->(c:Chunk)-[:HAS_CHUNK]->(s:Source)\n\
-             WHERE {}\n\
-             RETURN e.entity_id AS entity_id, c.chunk_id AS chunk_id, s.source_id AS source_id",
-            predicates.join(" OR ")
-        );
-        assert!(
-            query.len() > 1024,
-            "the regression only appears past ~1 KiB; this query is {} bytes",
-            query.len()
-        );
-
-        let parameters: BTreeMap<String, VertexPropertyValue> = (0..50)
-            .map(|index| {
-                (
-                    format!("entity_id_{index}"),
-                    VertexPropertyValue::String(format!("e{index}")),
-                )
-            })
-            .collect();
-
-        let parsed = parse_opencypher_row_query_with_parameters(&query, &parameters)
-            .expect("a >1 KiB MATCH ... WHERE ... RETURN must parse intact");
-        assert_eq!(
-            parsed.columns,
-            vec![
-                QueryColumn::new("entity_id"),
-                QueryColumn::new("chunk_id"),
-                QueryColumn::new("source_id"),
-            ]
-        );
-    }
-
-    #[test]
-    fn lowers_row_query_with_multiple_projections_where_and_order() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) \
-             WHERE v.id >= 10 AND v.id <> 12 \
-             RETURN u.id AS src, v.id AS dst ORDER BY dst DESC SKIP 1 LIMIT 2",
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.columns,
-            vec![QueryColumn::new("src"), QueryColumn::new("dst")]
-        );
-        assert_eq!(
-            parsed.projections,
-            vec![
-                RowProjection::NodeId {
-                    binding: "u".to_string(),
-                },
-                RowProjection::NodeId {
-                    binding: "v".to_string(),
-                },
-            ]
-        );
-        assert_eq!(
-            parsed.order_by,
-            vec![RowSort {
-                expression: RowSortExpression::Column {
-                    name: "dst".to_string(),
-                },
-                ascending: false,
-            }]
-        );
-        assert_eq!(
-            parsed.window,
-            QueryWindow {
-                skip: 1,
-                limit: Some(2),
-            }
-        );
-    }
-
-    #[test]
-    fn lowers_starts_with_string_predicate() {
-        let parameters = BTreeMap::from([(
-            "prefix".to_string(),
-            VertexPropertyValue::String("thread-".to_string()),
-        )]);
-        let parsed = parse_opencypher_row_query_with_parameters(
-            "MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix RETURN s.id",
-            &parameters,
-        )
-        .unwrap();
-        assert!(matches!(
-            parsed.predicate,
-            Some(RowPredicate::StartsWith {
-                expression: RowExpression::Property { ref binding, ref property },
-                ref prefix,
-            }) if binding == "s" && property == "thread_id" && prefix == "thread-"
-        ));
-    }
-
-    #[test]
-    fn cached_cypher_ast_lowers_each_requests_parameters() {
-        let query = "MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix RETURN s.id";
-        for expected in ["first-", "second-"] {
-            let parameters = BTreeMap::from([(
-                "prefix".to_string(),
-                VertexPropertyValue::String(expected.to_string()),
-            )]);
-            let parsed = parse_opencypher_row_query_with_parameters(query, &parameters).unwrap();
-            assert!(matches!(
-                parsed.predicate,
-                Some(RowPredicate::StartsWith { ref prefix, .. }) if prefix == expected
-            ));
-        }
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_unwind_detach_delete_vertex_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $vertices AS row MATCH (n {id: row.vertex}) DETACH DELETE n",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.parameter, "vertices");
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::DeleteVertices {
-                vertex_field: "vertex".to_string(),
-                detach: true,
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_unwind_delete_isolated_vertices_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row MATCH (n {id: row.vertex}) \
-             WHERE NOT (n)--() DELETE n RETURN count(n) AS deleted",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.parameter, "rows");
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::DeleteIsolatedVertices {
-                vertex_field: "vertex".to_string(),
-                path_node_constraints: ParsedUnwindVertexConstraints {
-                    labels: BTreeSet::new(),
-                    properties: BTreeMap::new(),
-                },
-                deleted_column: QueryColumn::new("deleted"),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn preserves_isolated_vertex_bound_node_constraints() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row MATCH (n {id: row.vertex}) \
-             WHERE NOT (n:Location {kind: row.kind, region: $region, active: true})--() \
-             DELETE n RETURN count(n) AS deleted",
-        )
-        .unwrap()
-        .unwrap();
-        let ParsedUnwindBatchKind::DeleteIsolatedVertices {
-            path_node_constraints,
-            ..
-        } = parsed.kind
-        else {
-            panic!("expected isolated vertex deletion");
-        };
-        assert_eq!(
-            path_node_constraints,
-            ParsedUnwindVertexConstraints {
-                labels: BTreeSet::from(["Location".to_string()]),
-                properties: BTreeMap::from([
-                    (
-                        "active".to_string(),
-                        ParsedUnwindConstraintValue::Literal(VertexPropertyValue::Bool(true)),
-                    ),
-                    (
-                        "kind".to_string(),
-                        ParsedUnwindConstraintValue::RowField("kind".to_string()),
-                    ),
-                    (
-                        "region".to_string(),
-                        ParsedUnwindConstraintValue::Parameter("region".to_string()),
-                    ),
-                ]),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_atomic_detach_and_isolated_vertex_cleanup() {
-        let query = "UNWIND $detach_rows AS row MATCH (n {id: row.vertex}) \
-                     DETACH DELETE n WITH count(n) AS detached \
-                     UNWIND $candidate_rows AS candidate \
-                     MATCH (e {id: candidate.vertex}) WHERE NOT (e)--() \
-                     DELETE e RETURN count(e) AS deleted";
-        let batch = parse_opencypher_unwind_batch(query).unwrap().unwrap();
-        assert_eq!(batch.parameter, "detach_rows");
-        assert_eq!(
-            batch.kind,
-            ParsedUnwindBatchKind::DeleteVerticesAndIsolatedCandidates {
-                detach_vertex_field: "vertex".to_string(),
-                isolated_parameter: "candidate_rows".to_string(),
-                isolated_vertex_field: "vertex".to_string(),
-                isolated_path_node_constraints: ParsedUnwindVertexConstraints {
-                    labels: BTreeSet::new(),
-                    properties: BTreeMap::new(),
-                },
-                deleted_column: QueryColumn::new("deleted"),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_unwind_relationship_property_delete_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row MATCH ()-[r:RELATES {chunk_id: row.chunk_id}]->() DELETE r",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.parameter, "rows");
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::DeleteRelationshipsByProperty {
-                edge_type: "RELATES".to_string(),
-                property: "chunk_id".to_string(),
-                value_field: "chunk_id".to_string(),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_unwind_create_between_matched_labeled_vertices() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row \
-             MATCH (s:Source {id: row.source_vertex}), \
-                   (r:Source {id: row.related_vertex}) \
-             CREATE (s)-[:FORCEFUL_RELATION]->(r)",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.parameter, "rows");
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::CreateEdgesBetweenLabeledVertices {
-                edge_type: "FORCEFUL_RELATION".to_string(),
-                source_field: "source_vertex".to_string(),
-                destination_field: "related_vertex".to_string(),
-                source_label: "Source".to_string(),
-                destination_label: "Source".to_string(),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_unwind_vertex_upsert_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row MERGE (n {id: row.vertex}) SET n:Source, n.source_id = row.source_id, n.active = row.active",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.parameter, "rows");
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::UpsertVertices {
-                label: "Source".to_string(),
-                vertex_field: "vertex".to_string(),
-                property_fields: BTreeMap::from([
-                    ("active".to_string(), "active".to_string()),
-                    ("source_id".to_string(), "source_id".to_string()),
-                ]),
-                update_if_newer_by: None,
-                create_only_properties: BTreeSet::new(),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_guarded_unwind_vertex_upsert_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row MERGE (n {id: row.vertex}) SET n:Source, \
-             n.created_at = row.created_at, n.updated_at = row.updated_at, \
-             n.__hydradb_update_if_newer_by = row.updated_at, \
-             n.__hydradb_create_only_created_at = row.created_at",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::UpsertVertices {
-                label: "Source".to_string(),
-                vertex_field: "vertex".to_string(),
-                property_fields: BTreeMap::from([
-                    ("created_at".to_string(), "created_at".to_string()),
-                    ("updated_at".to_string(), "updated_at".to_string()),
-                ]),
-                update_if_newer_by: Some("updated_at".to_string()),
-                create_only_properties: BTreeSet::from(["created_at".to_string()]),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn legacy_guard_markers_remain_readable_during_the_rename() {
-        assert!(is_update_if_newer_marker(LEGACY_UPDATE_IF_NEWER_MARKER));
-        assert_eq!(
-            create_only_marker_property("__turbolay_create_only_created_at"),
-            Some("created_at")
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn rejects_a_guard_that_is_also_create_only() {
-        let error = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row MERGE (n {id: row.vertex}) SET n:Source, \
-             n.updated_at = row.updated_at, \
-             n.__hydradb_update_if_newer_by = row.updated_at, \
-             n.__hydradb_create_only_updated_at = row.updated_at",
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("cannot also be create-only"));
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn rejects_unwind_merge_that_would_rewrite_pattern_metadata() {
-        let err = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row MERGE (n:Source {id: row.vertex, source_id: row.source_id})",
-        )
-        .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("requires MERGE by id followed by SET"));
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_unwind_relationship_create_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row \
-             MATCH (s:Entity {id: row.source_vertex}), \
-                   (d:Entity {id: row.destination_vertex}) \
-             CREATE (s)-[:RELATES {id: row.relationship_vertex, relationship_id: row.relationship_id, chunk_id: row.chunk_id}]->(d)",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.parameter, "rows");
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::CreateRelationshipsBetweenLabeledVertices {
-                edge_type: "RELATES".to_string(),
-                source_field: "source_vertex".to_string(),
-                destination_field: "destination_vertex".to_string(),
-                relationship_id_field: "relationship_vertex".to_string(),
-                property_fields: BTreeMap::from([
-                    ("chunk_id".to_string(), "chunk_id".to_string()),
-                    ("relationship_id".to_string(), "relationship_id".to_string(),),
-                ]),
-                source_label: "Entity".to_string(),
-                destination_label: "Entity".to_string(),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_guarded_unwind_relationship_merge_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row \
-             MATCH (s:Entity {id: row.source_vertex}), \
-                   (d:Entity {id: row.destination_vertex}) \
-             MERGE (s)-[r:RELATES {id: row.relationship_vertex}]->(d) \
-             SET r.timestamp = row.timestamp, r.valid_from = row.valid_from, \
-                 r.__hydradb_update_if_newer_by = row.timestamp, \
-                 r.__hydradb_create_only_valid_from = row.valid_from",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::MergeRelationshipsBetweenLabeledVertices {
-                edge_type: "RELATES".to_string(),
-                source_field: "source_vertex".to_string(),
-                destination_field: "destination_vertex".to_string(),
-                relationship_id_field: "relationship_vertex".to_string(),
-                property_fields: BTreeMap::from([
-                    ("timestamp".to_string(), "timestamp".to_string()),
-                    ("valid_from".to_string(), "valid_from".to_string()),
-                ]),
-                source_label: "Entity".to_string(),
-                destination_label: "Entity".to_string(),
-                update_if_newer_by: Some("timestamp".to_string()),
-                create_only_properties: BTreeSet::from(["valid_from".to_string()]),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_unwind_relationship_merge_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row \
-             MATCH (s:Entity {id: row.source_vertex}), \
-                   (d:Entity {id: row.destination_vertex}) \
-             MERGE (s)-[r:RELATES {id: row.relationship_vertex}]->(d) \
-             SET r.relationship_id = row.relationship_id, r.chunk_id = row.chunk_id",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.parameter, "rows");
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::MergeRelationshipsBetweenLabeledVertices {
-                edge_type: "RELATES".to_string(),
-                source_field: "source_vertex".to_string(),
-                destination_field: "destination_vertex".to_string(),
-                relationship_id_field: "relationship_vertex".to_string(),
-                property_fields: BTreeMap::from([
-                    ("chunk_id".to_string(), "chunk_id".to_string()),
-                    ("relationship_id".to_string(), "relationship_id".to_string()),
-                ]),
-                source_label: "Entity".to_string(),
-                destination_label: "Entity".to_string(),
-                update_if_newer_by: None,
-                create_only_properties: BTreeSet::new(),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn lowers_sequential_match_relationship_merge_batch() {
-        let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row \
-             MATCH (s:Source {id: row.source_vertex}) \
-             MATCH (d:Source {id: row.destination_vertex}) \
-             MERGE (s)-[r:FORCEFUL_RELATION {id: row.relationship_vertex}]->(d)",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.parameter, "rows");
-        assert_eq!(
-            parsed.kind,
-            ParsedUnwindBatchKind::MergeRelationshipsBetweenLabeledVertices {
-                edge_type: "FORCEFUL_RELATION".to_string(),
-                source_field: "source_vertex".to_string(),
-                destination_field: "destination_vertex".to_string(),
-                relationship_id_field: "relationship_vertex".to_string(),
-                property_fields: BTreeMap::new(),
-                source_label: "Source".to_string(),
-                destination_label: "Source".to_string(),
-                update_if_newer_by: None,
-                create_only_properties: BTreeSet::new(),
-            }
-        );
-    }
-
-    #[cfg(feature = "client-api")]
-    #[test]
-    fn rejects_mutable_relationship_merge_keys() {
-        let err = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row \
-             MATCH (s:Entity {id: row.source_vertex}), \
-                   (d:Entity {id: row.destination_vertex}) \
-             MERGE (s)-[r:RELATES {id: row.relationship_vertex, chunk_id: row.chunk_id}]->(d)",
-        )
-        .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("MERGE pattern matches only id; apply properties with SET"));
-    }
-
-    #[test]
-    fn lowers_distinct_row_query() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN DISTINCT u.id AS src",
-        )
-        .unwrap();
-        assert!(parsed.distinct);
-        assert_eq!(parsed.columns, vec![QueryColumn::new("src")]);
-
-        let err = parse_opencypher_row_query(
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN DISTINCT u.id ORDER BY v.id",
-        )
-        .unwrap_err();
-        assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
-    }
-
-    #[test]
-    fn lowers_row_query_with_labels_properties_and_property_projection() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u:User {active: true})-[:FOLLOWS]->(v:User {age: 42}) \
-             RETURN u.name AS src, v.age AS age ORDER BY v.age DESC",
-        )
-        .unwrap();
-        assert_eq!(parsed.patterns.len(), 1);
-        let RowPattern::Edge(pattern) = &parsed.patterns[0] else {
-            panic!("expected edge row pattern");
-        };
-        assert_eq!(pattern.src.labels, BTreeSet::from(["User".to_string()]));
-        assert_eq!(
-            pattern.src.properties.get("active"),
-            Some(&VertexPropertyValue::Bool(true))
-        );
-        assert_eq!(
-            pattern.dst.properties.get("age"),
-            Some(&VertexPropertyValue::Integer(42))
-        );
-        assert_eq!(
-            parsed.projections,
-            vec![
-                RowProjection::Property {
-                    binding: "u".to_string(),
-                    property: "name".to_string(),
-                },
-                RowProjection::Property {
-                    binding: "v".to_string(),
-                    property: "age".to_string(),
-                },
-            ]
-        );
-        assert_eq!(
-            parsed.order_by,
-            vec![RowSort {
-                expression: RowSortExpression::Property {
-                    binding: "v".to_string(),
-                    property: "age".to_string(),
-                },
-                ascending: false,
-            }]
-        );
-    }
-
-    #[test]
-    fn lowers_row_query_with_relationship_properties_and_projection() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u {id: 1})-[r:FOLLOWS {since: 2020, close: true}]->(v) \
-             RETURN r.since AS since, v.id AS dst ORDER BY r.since DESC",
-        )
-        .unwrap();
-        assert_eq!(parsed.patterns.len(), 1);
-        let RowPattern::Edge(pattern) = &parsed.patterns[0] else {
-            panic!("expected edge row pattern");
-        };
-        assert_eq!(pattern.binding.as_deref(), Some("r"));
-        assert_eq!(
-            pattern.properties.get("since"),
-            Some(&VertexPropertyValue::Integer(2020))
-        );
-        assert_eq!(
-            pattern.properties.get("close"),
-            Some(&VertexPropertyValue::Bool(true))
-        );
-        assert_eq!(
-            parsed.projections,
-            vec![
-                RowProjection::Property {
-                    binding: "r".to_string(),
-                    property: "since".to_string(),
-                },
-                RowProjection::NodeId {
-                    binding: "v".to_string(),
-                },
-            ]
-        );
-        assert_eq!(
-            parsed.order_by,
-            vec![RowSort {
-                expression: RowSortExpression::Property {
-                    binding: "r".to_string(),
-                    property: "since".to_string(),
-                },
-                ascending: false,
-            }]
-        );
-        assert_eq!(
-            parsed.columns,
-            vec![QueryColumn::new("since"), QueryColumn::new("dst")]
-        );
-    }
-
-    #[test]
-    fn lowers_node_only_row_query() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u:User {active: true}) RETURN u.name AS name ORDER BY u.name",
-        )
-        .unwrap();
-        assert_eq!(parsed.patterns.len(), 1);
-        let RowPattern::Node(node) = &parsed.patterns[0] else {
-            panic!("expected node row pattern");
-        };
-        assert_eq!(node.binding.as_deref(), Some("u"));
-        assert_eq!(node.labels, BTreeSet::from(["User".to_string()]));
-        assert_eq!(
-            node.properties.get("active"),
-            Some(&VertexPropertyValue::Bool(true))
-        );
-        assert_eq!(
-            parsed.projections,
-            vec![RowProjection::Property {
-                binding: "u".to_string(),
-                property: "name".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn lowers_multi_match_row_query_as_pattern_pipeline() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u:User {id: 1})-[:FOLLOWS]->(v) \
-             MATCH (v)-[:POSTED]->(p:Post) \
-             WHERE p.score >= 10 \
-             RETURN u.id AS user, p.id AS post ORDER BY post",
-        )
-        .unwrap();
-        assert_eq!(parsed.patterns.len(), 2);
-        let RowPattern::Edge(first) = &parsed.patterns[0] else {
-            panic!("expected first edge row pattern");
-        };
-        let RowPattern::Edge(second) = &parsed.patterns[1] else {
-            panic!("expected second edge row pattern");
-        };
-        assert_eq!(first.src.binding.as_deref(), Some("u"));
-        assert_eq!(first.dst.binding.as_deref(), Some("v"));
-        assert_eq!(second.src.binding.as_deref(), Some("v"));
-        assert_eq!(second.dst.binding.as_deref(), Some("p"));
-        assert!(parsed.predicate.is_some());
-        assert_eq!(
-            parsed.columns,
-            vec![QueryColumn::new("user"), QueryColumn::new("post")]
-        );
-    }
-
-    #[test]
-    fn lowers_passthrough_with_row_query() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u {id: 1})-[r:FOLLOWS]->(v) WITH u, r, v \
-             MATCH (v)-[:POSTED]->(p) RETURN p.id AS post",
-        )
-        .unwrap();
-        assert_eq!(parsed.patterns.len(), 2);
-        let RowPattern::Edge(first) = &parsed.patterns[0] else {
-            panic!("expected first edge row pattern");
-        };
-        assert_eq!(first.binding.as_deref(), Some("r"));
-        assert_eq!(parsed.columns, vec![QueryColumn::new("post")]);
-
-        let err = parse_opencypher_row_query(
-            "MATCH (u {id: 1})-[r:FOLLOWS]->(v) WITH v \
-             MATCH (v)-[:POSTED]->(p) RETURN p.id",
-        )
-        .unwrap_err();
-        assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
-    }
-
-    #[test]
-    fn folds_trailing_with_limit_into_return_window() {
-        // The shape hydradb-application's get_chunk_ids_by_sub_tenant sends.
-        let parameters = BTreeMap::from([
-            (
-                "t".to_string(),
-                VertexPropertyValue::String("tenant".to_string()),
-            ),
-            (
-                "u".to_string(),
-                VertexPropertyValue::String("sub".to_string()),
-            ),
-            ("fetch_limit".to_string(), VertexPropertyValue::Integer(3)),
-        ]);
-        let parsed = parse_opencypher_row_query_with_parameters(
-            "MATCH (s:Source {tenant_id: $t, sub_tenant_id: $u})-[:HAS_CHUNK]-(c:Chunk) \
-             WITH c LIMIT $fetch_limit RETURN c.chunk_id AS chunk_id",
-            &parameters,
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.window,
-            QueryWindow {
-                skip: 0,
-                limit: Some(3)
-            }
-        );
-        assert_eq!(parsed.columns, vec![QueryColumn::new("chunk_id")]);
-
-        let skipped =
-            parse_opencypher_row_query("MATCH (u:User) WITH u SKIP 1 LIMIT 5 RETURN u.id AS id")
-                .unwrap();
-        assert_eq!(
-            skipped.window,
-            QueryWindow {
-                skip: 1,
-                limit: Some(5)
-            }
-        );
-
-        // Narrowing without a window is the same row set, so it lowers too.
-        let narrowed = parse_opencypher_row_query(
-            "MATCH (s:Source)-[:HAS_CHUNK]-(c:Chunk) WITH c RETURN c.chunk_id AS chunk_id",
-        )
-        .unwrap();
-        assert!(narrowed.window.is_default());
-    }
-
-    #[test]
-    fn composes_with_window_and_return_window() {
-        // WITH keeps rows [2, 12); RETURN skips 3 of those and keeps 4:
-        // rows [5, 9).
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u:User) WITH u SKIP 2 LIMIT 10 RETURN u.id AS id SKIP 3 LIMIT 4",
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.window,
-            QueryWindow {
-                skip: 5,
-                limit: Some(4)
-            }
-        );
-
-        // RETURN's own limit is larger than what the WITH leaves over.
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u:User) WITH u LIMIT 5 RETURN u.id AS id SKIP 3 LIMIT 100",
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.window,
-            QueryWindow {
-                skip: 3,
-                limit: Some(2)
-            }
-        );
-
-        // Skipping past everything the WITH kept leaves nothing.
-        let parsed =
-            parse_opencypher_row_query("MATCH (u:User) WITH u LIMIT 2 RETURN u.id AS id SKIP 5")
-                .unwrap();
-        assert_eq!(
-            parsed.window,
-            QueryWindow {
-                skip: 5,
-                limit: Some(0)
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_with_window_whose_rows_are_reshaped_after_it() {
-        for query in [
-            // Each of these reads the whole bounded row set, so folding the
-            // window into RETURN would answer a different question.
-            "MATCH (u:User) WITH u LIMIT 2 RETURN u.id AS id ORDER BY id",
-            "MATCH (u:User) WITH u LIMIT 2 RETURN DISTINCT u.name AS name",
-            "MATCH (u:User) WITH u LIMIT 2 RETURN count(*) AS n",
-            "MATCH (u:User) WITH u LIMIT 2 RETURN count(u.id) AS n",
-            // A MATCH after the window would expand the bounded rows.
-            "MATCH (u:User) WITH u LIMIT 2 MATCH (u)-[:POSTED]->(p) RETURN p.id",
-        ] {
-            let err = parse_opencypher_row_query(query).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    GraphError::UnsupportedQuery {
-                        reason: QueryFailureReason::OrderWindow,
-                        ..
-                    }
-                ),
-                "{query}: {err:?}"
-            );
-        }
-        // A trailing WITH may drop bindings, but RETURN cannot then read them.
-        for query in [
-            "MATCH (s:Source)-[:HAS_CHUNK]-(c:Chunk) WITH c LIMIT 2 RETURN s.source_id",
-            "MATCH (s:Source)-[:HAS_CHUNK]-(c:Chunk) WITH c RETURN c.chunk_id ORDER BY s.source_id",
-        ] {
-            let err = parse_opencypher_row_query(query).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    GraphError::UnsupportedQuery {
-                        reason: QueryFailureReason::Return,
-                        ..
-                    }
-                ),
-                "{query}: {err:?}"
-            );
-        }
-        // DISTINCT, WHERE and ORDER BY on the WITH itself stay unsupported.
-        for query in [
-            "MATCH (u:User) WITH DISTINCT u RETURN u.id",
-            "MATCH (u:User) WITH u WHERE u.id > 1 RETURN u.id",
-            "MATCH (u:User) WITH u ORDER BY u.id LIMIT 1 RETURN u.id",
-        ] {
-            let err = parse_opencypher_row_query(query).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    GraphError::UnsupportedQuery {
-                        reason: QueryFailureReason::Return,
-                        ..
-                    }
-                ),
-                "{query}: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn lowers_optional_match_as_left_join_group() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u:User) OPTIONAL MATCH (u)-[:FOLLOWS]->(v) WHERE v.id <> 99 \
-             RETURN u.id AS user, v.id AS followed ORDER BY user",
-        )
-        .unwrap();
-        assert_eq!(parsed.pattern_groups.len(), 2);
-        assert!(!parsed.pattern_groups[0].optional);
-        assert!(parsed.pattern_groups[1].optional);
-        assert!(parsed.pattern_groups[1].predicate.is_some());
-        assert_eq!(
-            parsed.columns,
-            vec![QueryColumn::new("user"), QueryColumn::new("followed")]
-        );
-    }
-
-    #[test]
-    fn lowers_union_row_query_arms() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u:User) RETURN u.id AS id \
-             UNION ALL MATCH (m:Moderator) RETURN m.id AS id",
-        )
-        .unwrap();
-        assert!(parsed.union_all);
-        assert_eq!(parsed.union_arms.len(), 1);
-        assert_eq!(parsed.columns, vec![QueryColumn::new("id")]);
-        assert_eq!(parsed.union_arms[0].columns, vec![QueryColumn::new("id")]);
-
-        let windowed = parse_opencypher_row_query(
-            "MATCH (u:User) RETURN u.id AS id ORDER BY id DESC LIMIT 2 \
-			 UNION ALL MATCH (m:Moderator) RETURN m.id AS id ORDER BY id LIMIT 1",
-        )
-        .unwrap();
-        assert_eq!(windowed.window.limit, Some(2));
-        assert_eq!(windowed.union_arms[0].window.limit, Some(1));
-        assert!(!windowed.order_by.is_empty());
-        assert!(!windowed.union_arms[0].order_by.is_empty());
-
-        let mismatch = parse_opencypher_row_query(
-            "MATCH (u:User) RETURN u.id AS id \
-             UNION MATCH (m:Moderator) RETURN m.id AS other",
-        )
-        .unwrap_err();
-        assert!(matches!(mismatch, GraphError::UnsupportedQuery { .. }));
-    }
-
-    #[test]
-    fn lowers_large_union_path_arms_independently() {
-        fn path_arm(parameter: &str) -> String {
-            let mut query =
-                format!("MATCH (n0:Entity{{name:${parameter},tenant_id:$t,sub_tenant_id:$u}})");
-            for hop in 0..3 {
-                query.push_str(&format!(
-                    "-[r{hop}:RELATES]->(n{}:Entity{{tenant_id:$t,sub_tenant_id:$u}})",
-                    hop + 1
-                ));
-            }
-            let mut projections = Vec::new();
-            for node in 0..=3 {
-                for (index, property) in ["name", "type", "identifier", "entity_id", "namespace"]
-                    .iter()
-                    .enumerate()
-                {
-                    if node == 0 && *property == "name" {
-                        projections.push("n0.name".to_string());
-                    } else {
-                        projections.push(format!(
-                            "n{node}.{property} AS n{node}{}",
-                            char::from(b'a' + u8::try_from(index).unwrap())
-                        ));
-                    }
-                }
-            }
-            for hop in 0..3 {
-                for (index, property) in [
-                    "canonical_relation",
-                    "raw_relation",
-                    "chunk_id",
-                    "relationship_id",
-                    "timestamp",
-                    "metadata",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    projections.push(format!(
-                        "r{hop}.{property} AS r{hop}{}",
-                        char::from(b'a' + u8::try_from(index).unwrap())
-                    ));
-                }
-            }
-            query.push_str(" RETURN ");
-            query.push_str(&projections.join(","));
-            query.push_str(" LIMIT 50");
-            query
-        }
-
-        let mut parameters = BTreeMap::from([
-            (
-                "t".to_string(),
-                VertexPropertyValue::String("tenant".to_string()),
-            ),
-            (
-                "u".to_string(),
-                VertexPropertyValue::String("collection".to_string()),
-            ),
-        ]);
-        let mut arms = Vec::new();
-        for index in 0..10 {
-            let parameter = format!("batch_value_{index}");
-            parameters.insert(
-                parameter.clone(),
-                VertexPropertyValue::String(format!("entity-{index}")),
-            );
-            arms.push(path_arm(&parameter));
-        }
-        let query = arms.join(" UNION ALL ");
-
-        let parsed = parse_opencypher_row_query_with_parameters(&query, &parameters).unwrap();
-        assert!(parsed.union_all);
-        assert_eq!(parsed.union_arms.len(), 9);
-        assert_eq!(parsed.columns.len(), 38);
-        assert_eq!(
-            classify_opencypher_query_access(&query).unwrap(),
-            OpenCypherQueryAccess::Read
-        );
-    }
-
-    #[test]
-    fn top_level_union_splitter_ignores_nested_and_quoted_tokens() {
-        let query = "MATCH (n {text: 'UNION ALL', `UNION`: 1}) RETURN n.id AS id \
-                     UNION /* separator */ ALL \
-                     MATCH (m {text: \"UNION\"}) RETURN m.id AS id";
-        let union = split_top_level_union(query).unwrap().unwrap();
-        assert!(union.union_all);
-        assert_eq!(union.arms.len(), 2);
-        assert!(union.arms[0].contains("'UNION ALL'"));
-        assert!(union.arms[1].contains("\"UNION\""));
-
-        assert!(
-            split_top_level_union("CALL { RETURN 1 UNION ALL RETURN 2 } RETURN 3")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            split_top_level_union("MATCH (n) WHERE n.union = $union RETURN n.union AS value")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn lowers_multi_edge_path_as_joinable_edge_patterns() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v)-[:POSTED]->(p) \
-             RETURN u.id, v.id, p.id",
-        )
-        .unwrap();
-        assert_eq!(parsed.patterns.len(), 2);
-        let RowPattern::Edge(first) = &parsed.patterns[0] else {
-            panic!("expected first edge row pattern");
-        };
-        let RowPattern::Edge(second) = &parsed.patterns[1] else {
-            panic!("expected second edge row pattern");
-        };
-        assert_eq!(first.edge_type, "FOLLOWS");
-        assert_eq!(first.src.id, Some(1));
-        assert_eq!(first.dst.binding.as_deref(), Some("v"));
-        assert_eq!(second.edge_type, "POSTED");
-        assert_eq!(second.src.binding.as_deref(), Some("v"));
-        assert_eq!(second.dst.binding.as_deref(), Some("p"));
-    }
-
-    #[test]
-    fn lowers_grouped_aggregate_row_query() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (u)-[:FOLLOWS]->(v)-[:POSTED]->(p:Post) \
-             RETURN u.id AS user, count(*) AS posts, sum(p.score) AS score, \
-             avg(p.score) AS avg_score, collect(p.id) AS post_ids ORDER BY posts DESC",
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.columns,
-            vec![
-                QueryColumn::new("user"),
-                QueryColumn::new("posts"),
-                QueryColumn::new("score"),
-                QueryColumn::new("avg_score"),
-                QueryColumn::new("post_ids"),
-            ]
-        );
-        assert_eq!(
-            parsed.projections,
-            vec![
-                RowProjection::NodeId {
-                    binding: "u".to_string(),
-                },
-                RowProjection::CountAll,
-                RowProjection::Aggregate {
-                    function: RowAggregateFunction::Sum,
-                    expression: RowExpression::Property {
-                        binding: "p".to_string(),
-                        property: "score".to_string(),
-                    },
-                },
-                RowProjection::Aggregate {
-                    function: RowAggregateFunction::Avg,
-                    expression: RowExpression::Property {
-                        binding: "p".to_string(),
-                        property: "score".to_string(),
-                    },
-                },
-                RowProjection::Aggregate {
-                    function: RowAggregateFunction::Collect,
-                    expression: RowExpression::NodeId {
-                        binding: "p".to_string(),
-                    },
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn lowers_mutation_queries() {
-        let parsed = parse_opencypher_mutation_query_with_parameters(
-            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) \
-             SET u.active = true, v:Moderator REMOVE v.name DELETE r",
-            &BTreeMap::new(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.patterns.len(), 1);
-        let RowPattern::Edge(edge) = &parsed.patterns[0] else {
-            panic!("expected edge pattern");
-        };
-        assert_eq!(edge.binding.as_deref(), Some("r"));
-        assert_eq!(edge.edge_type, "FOLLOWS");
-        assert_eq!(edge.src.binding.as_deref(), Some("u"));
-        assert_eq!(edge.dst.binding.as_deref(), Some("v"));
-        assert_eq!(
-            parsed.actions,
-            vec![
-                RowMutationAction::SetProperty {
-                    binding: "u".to_string(),
-                    property: "active".to_string(),
-                    value: VertexPropertyValue::Bool(true),
-                },
-                RowMutationAction::SetLabels {
-                    binding: "v".to_string(),
-                    labels: BTreeSet::from(["Moderator".to_string()]),
-                },
-                RowMutationAction::RemoveProperty {
-                    binding: "v".to_string(),
-                    property: "name".to_string(),
-                },
-                RowMutationAction::DeleteBinding {
-                    binding: "r".to_string(),
-                    detach: false,
-                },
-            ]
-        );
-
-        let merge = parse_opencypher_mutation_query_with_parameters(
-            "MERGE (u:User {id: 1})-[:FOLLOWS]->(v {id: 2})",
-            &BTreeMap::new(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            merge.actions,
-            vec![RowMutationAction::MergeEdge {
-                edge_type: "FOLLOWS".to_string(),
-                src: 1,
-                dst: 2,
-                src_metadata: VertexMetadata::default().with_label("User"),
-                dst_metadata: VertexMetadata::default(),
-                edge_metadata: EdgeMetadata::default(),
-            }]
-        );
-    }
-
-    /// The scope parameters every PRO-2165 cleanup query binds.
-    fn cleanup_parameters() -> BTreeMap<String, VertexPropertyValue> {
-        BTreeMap::from([
-            (
-                "source_id".to_string(),
-                VertexPropertyValue::String("src-1".to_string()),
-            ),
-            (
-                "tenant_id".to_string(),
-                VertexPropertyValue::String("tenant-1".to_string()),
-            ),
-            (
-                "sub_tenant_id".to_string(),
-                VertexPropertyValue::String("sub-1".to_string()),
-            ),
-        ])
-    }
-
-    /// The bounded cleanup shape from PRO-2165 §I3 "Remove app edges and
-    /// comments", verbatim. The loop that issues it repeats until `deleted`
-    /// comes back zero, so all three parts have to lower together: without the
-    /// ceiling one call takes the whole source, and without the count the
-    /// caller cannot tell when to stop.
-    #[test]
-    fn lowers_bounded_returning_relationship_delete() {
-        let parsed = parse_opencypher_mutation_query_with_parameters(
-            "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
-             WHERE s.tenant_id = $tenant_id \
-                 AND s.sub_tenant_id = $sub_tenant_id \
-             WITH r LIMIT 1000 \
-             DELETE r \
-             RETURN count(r) AS deleted",
-            &cleanup_parameters(),
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(parsed.row_limit, Some(1000));
-        assert_eq!(
-            parsed.actions,
-            vec![RowMutationAction::DeleteBinding {
-                binding: "r".to_string(),
-                detach: false,
-            }]
-        );
-        let returning = parsed.returning.expect("RETURN count(r) must lower");
-        assert_eq!(returning.binding, "r");
-        assert_eq!(returning.column, QueryColumn::new("deleted"));
-    }
-
-    /// The three parts are independent: a barrier without a ceiling, a ceiling
-    /// without a count, and a count whose column falls back to the expression
-    /// text all have to behave.
-    #[test]
-    fn lowers_bounded_delete_variants() {
-        let parameters = cleanup_parameters();
-
-        let unbounded = parse_opencypher_mutation_query_with_parameters(
-            "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
-             WITH r DELETE r RETURN count(r) AS deleted",
-            &parameters,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(unbounded.row_limit, None);
-        assert!(unbounded.returning.is_some());
-
-        let silent = parse_opencypher_mutation_query_with_parameters(
-            "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
-             WITH r LIMIT 1000 DELETE r",
-            &parameters,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(silent.row_limit, Some(1000));
-        assert_eq!(silent.returning, None);
-
-        let unaliased = parse_opencypher_mutation_query_with_parameters(
-            "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
-             WITH r LIMIT 1000 DELETE r RETURN count(r)",
-            &parameters,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            unaliased.returning.expect("count must lower").column,
-            QueryColumn::new("count(r)")
-        );
-
-        let mut parameterized = parameters.clone();
-        parameterized.insert("batch".to_string(), VertexPropertyValue::Integer(250));
-        let bound = parse_opencypher_mutation_query_with_parameters(
-            "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
-             WITH r LIMIT $batch DELETE r RETURN count(r) AS deleted",
-            &parameterized,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(bound.row_limit, Some(250));
-    }
-
-    /// A mutation may only write through a binding the barrier carried. Without
-    /// this, `WITH r` followed by `DELETE a` would quietly delete the actors the
-    /// query just dropped from scope.
-    #[test]
-    fn rejects_mutation_through_binding_the_barrier_dropped() {
-        let error = parse_opencypher_mutation_query_with_parameters(
-            "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
-             WITH r LIMIT 1000 DELETE a RETURN count(r) AS deleted",
-            &cleanup_parameters(),
-        )
-        .expect_err("a mutation through a dropped binding must not lower");
-        assert!(
-            matches!(
-                &error,
-                GraphError::UnsupportedQuery { feature, .. }
-                    if feature.contains("WITH does not carry")
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    /// Every barrier form that would change which rows reach the write is
-    /// rejected rather than ignored. Silently dropping an ORDER BY or a WHERE
-    /// here would delete a different set of rows than the query asked for.
-    #[test]
-    fn rejects_unsupported_mutation_barrier_and_return_forms() {
-        let parameters = cleanup_parameters();
-        let head = "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) ";
-        let rejected = [
-            "WITH DISTINCT r LIMIT 1000 DELETE r",
-            "WITH * LIMIT 1000 DELETE r",
-            "WITH r LIMIT 1000 WHERE r.role = 'author' DELETE r",
-            "WITH r ORDER BY r.role LIMIT 1000 DELETE r",
-            "WITH r SKIP 10 LIMIT 1000 DELETE r",
-            "WITH r AS kept LIMIT 1000 DELETE kept",
-            "WITH missing LIMIT 1000 DELETE r",
-            "WITH r LIMIT 1000 DELETE r RETURN r",
-            "WITH r LIMIT 1000 DELETE r RETURN count(*)",
-            "WITH r LIMIT 1000 DELETE r RETURN count(DISTINCT r)",
-            "WITH r LIMIT 1000 DELETE r RETURN count(r) AS deleted, count(r) AS again",
-            "WITH r LIMIT 1000 DELETE r RETURN count(r) AS deleted ORDER BY deleted",
-            "WITH r LIMIT 1000 DELETE r RETURN count(r) AS deleted LIMIT 1",
-            "WITH r LIMIT 1000 DELETE r RETURN count(a) AS deleted",
-        ];
-        for tail in rejected {
-            let query = format!("{head}{tail}");
-            let outcome = parse_opencypher_mutation_query_with_parameters(&query, &parameters);
-            assert!(
-                matches!(outcome, Err(GraphError::UnsupportedQuery { .. })),
-                "{query} must be rejected, got {outcome:?}"
-            );
-        }
-    }
-
-    /// A read pipeline that happens to contain WITH still belongs to the row
-    /// path. The mutation lowerer must hand it back rather than claim it.
-    #[test]
-    fn leaves_read_with_pipelines_to_the_row_path() {
-        let parsed = parse_opencypher_mutation_query_with_parameters(
-            "MATCH (a:Actor)-[r:ACTED_ON]->(s:Source {source_id: $source_id}) \
-             WITH r LIMIT 1000 RETURN count(r) AS seen",
-            &cleanup_parameters(),
-        )
-        .unwrap();
-        assert!(parsed.is_none(), "a read pipeline is not a mutation");
-    }
-
-    #[test]
-    fn lowers_full_signed_integer_literal_range() {
-        let parsed = parse_opencypher_row_query(
-            "MATCH (n:Score {score: -9223372036854775808}) RETURN n.score",
-        )
-        .unwrap();
-        let RowPattern::Node(node) = &parsed.patterns[0] else {
-            panic!("expected node pattern");
-        };
-        assert_eq!(
-            node.properties.get("score"),
-            Some(&VertexPropertyValue::SignedInteger(i64::MIN))
-        );
-    }
-
-    /// The fingerprint's two load-bearing properties, and nothing more: it is
-    /// the same for two runs of the same shape, and it never contains a value.
-    #[test]
-    fn query_fingerprint_is_stable_across_values_and_formatting() {
-        let a = query_shape_fingerprint("MATCH (n:Person) WHERE n.id = 42 RETURN n.name");
-        let b = query_shape_fingerprint("MATCH (n:Person)\n  WHERE n.id = 7\n  RETURN n.name");
-        assert_eq!(
-            a, b,
-            "literal values and whitespace must not fork the shape"
-        );
-
-        let quoted =
-            query_shape_fingerprint("MATCH (n:Person) WHERE n.email = 'a@b.test' RETURN n");
-        let other = query_shape_fingerprint("MATCH (n:Person) WHERE n.email = 'c@d.test' RETURN n");
-        assert_eq!(quoted, other);
-
-        let different = query_shape_fingerprint("MATCH (n:Company) WHERE n.id = 42 RETURN n.name");
-        assert_ne!(a, different, "a different label is a different shape");
-
-        // A literal list's length must not fork the shape either, or every
-        // batch size becomes its own row in the dashboard.
-        assert_eq!(
-            query_shape_fingerprint("MATCH (n) WHERE n.id IN [1, 2] RETURN n"),
-            query_shape_fingerprint("MATCH (n) WHERE n.id IN [1, 2, 3, 4, 5] RETURN n")
-        );
-
-        // Safe to log unredacted: the normalised shape carries no value.
-        let shape =
-            normalize_query_shape("MATCH (n) WHERE n.email = 'secret@example.test' RETURN n");
-        assert!(!shape.contains("secret"), "shape leaked a literal: {shape}");
-        assert_eq!(shape, "MATCH (n) WHERE n.email = ? RETURN n");
-    }
-
-    #[test]
-    fn logged_query_shape_carries_no_literal_and_is_capped() {
-        let shape = opencypher_query_shape_for_log(
-            "MATCH (s:Source {tenant_id: 'acme'})-[:HAS_CHUNK]-(c:Chunk) \
-             WITH c LIMIT 50 RETURN c.chunk_id AS chunk_id",
-        );
-        assert!(!shape.contains("acme"), "shape leaked a literal: {shape}");
-        assert!(!shape.contains("50"), "shape leaked a literal: {shape}");
-        assert!(
-            shape.contains("WITH c LIMIT ? RETURN c.chunk_id"),
-            "{shape}"
-        );
-
-        let huge = format!("MATCH (n) RETURN {}", "n.p, ".repeat(2000));
-        let shape = opencypher_query_shape_for_log(&huge);
-        assert!(shape.len() <= MAX_LOGGED_QUERY_SHAPE_BYTES + " …".len());
-        assert!(shape.ends_with(" …"));
-
-        // The cap bounds the scan, not just the result: a statement that is
-        // mostly one long literal still costs only the capped shape.
-        let long_literal = format!(
-            "MATCH (n) WHERE n.blob = '{}' RETURN n",
-            "s".repeat(1 << 20)
-        );
-        assert_eq!(
-            opencypher_query_shape_for_log(&long_literal),
-            "MATCH (n) WHERE n.blob = ? RETURN n"
-        );
-    }
-
-    #[test]
-    fn logged_query_shape_elides_every_numeric_literal_form() {
-        // The digit arm used to consume only the decimal head of a token, so
-        // `0xDEADBEEF` reached the log as `?xDEADBEEF`. Cypher 25 accepts hex
-        // and octal integers (`Cypher25Lexer.g4`, UNSIGNED_HEX_INTEGER /
-        // UNSIGNED_OCTAL_INTEGER) and underscore separators, and none of those
-        // bytes may survive into a log line.
-        for query in [
-            "MATCH (n) WHERE n.id = 0xDEADBEEF RETURN n",
-            "MATCH (n) WHERE n.id = 0XCAFEF00D RETURN n",
-            "MATCH (n) WHERE n.id = 0o7551 RETURN n",
-            "MATCH (n) WHERE n.id = 1_000_000 RETURN n",
-            "MATCH (n) WHERE n.id = 1.5e-3 RETURN n",
-        ] {
-            let shape = opencypher_query_shape_for_log(query);
-            assert_eq!(
-                shape, "MATCH (n) WHERE n.id = ? RETURN n",
-                "shape leaked a literal: {shape}"
-            );
-        }
-
-        // ... and all of them are the one shape, as the decimal form already
-        // was.
-        assert_eq!(
-            query_shape_fingerprint("MATCH (n) WHERE n.id = 0xDEADBEEF RETURN n"),
-            query_shape_fingerprint("MATCH (n) WHERE n.id = 42 RETURN n")
-        );
-
-        // A digit inside a name is not a literal and still reads as itself.
-        assert_eq!(
-            normalize_query_shape("MATCH (n) RETURN n.addr2line"),
-            "MATCH (n) RETURN n.addr?line"
-        );
-    }
-
-    #[test]
-    fn query_fingerprint_survives_an_unparseable_statement() {
-        // The root span opens before anything is parsed, so the fingerprint has
-        // to exist for text the parser will reject.
-        assert_eq!(
-            opencypher_query_fingerprint("MATCH ((("),
-            query_shape_fingerprint("MATCH ((("),
-        );
     }
 }

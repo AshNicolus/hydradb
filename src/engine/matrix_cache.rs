@@ -352,6 +352,29 @@ impl GraphShard {
 
     async fn load_matrix_adjacency(&self, artifact: &MatrixArtifact) -> Result<MatrixAdjacency> {
         if artifact.out_tiles == 0 {
+            if let Some(generation) = self
+                .graph_index_generation_at(
+                    &artifact.cell_id,
+                    &artifact.edge_type,
+                    artifact.base_epoch,
+                )
+                .await?
+            {
+                if let Some(canonical) = self.graph_index_csc(&generation).await? {
+                    let adjacency = canonical.to_adjacency()?;
+                    let edge_count = adjacency_edge_count(&adjacency);
+                    if edge_count != artifact.edge_count {
+                        return corrupt(
+                            &matrix_manifest_key(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch),
+                            format!(
+                                "external graph-index edge count {edge_count} does not match manifest {}",
+                                artifact.edge_count
+                            ),
+                        );
+                    }
+                    return Ok(adjacency);
+                }
+            }
             if let Some(canonical) = self
                 .graphblas_csc(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch)
                 .await?
@@ -360,11 +383,7 @@ impl GraphShard {
                 let edge_count = adjacency_edge_count(&adjacency);
                 if edge_count != artifact.edge_count {
                     return corrupt(
-                        &matrix_manifest_key(
-                            &artifact.cell_id,
-                            &artifact.edge_type,
-                            artifact.base_epoch,
-                        ),
+                        &matrix_manifest_key(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch),
                         format!(
                             "canonical adjacency edge count {edge_count} does not match manifest {}",
                             artifact.edge_count

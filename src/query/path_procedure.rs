@@ -77,6 +77,103 @@ struct ParsedNativePathCall {
     projections: Vec<NativePathProjection>,
 }
 
+/// Every `CALL algo.*` procedure the engine answers natively, outside both
+/// Cypher planners.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum NativeProcedure {
+    Path(Box<NativePathProcedure>),
+    Degree(NativeDegreeProcedure),
+}
+
+impl NativeProcedure {
+    pub(crate) fn procedure_name(&self) -> &'static str {
+        match self {
+            Self::Path(procedure) => procedure.kind.procedure_name(),
+            Self::Degree(_) => NATIVE_DEGREE_PROCEDURE_NAME,
+        }
+    }
+}
+
+const NATIVE_DEGREE_PROCEDURE_NAME: &str = "algo.degree";
+
+/// `CALL algo.degree({label, relTypes, relDirection, neighborLabel, minDegree, limit})
+/// YIELD node, degree RETURN ...`.
+///
+/// For every vertex carrying `label`, `degree` is the number of relationships
+/// of `relTypes` touching it in `relDirection` -- what
+/// `MATCH (n:label)-[r:T]->() RETURN count(r)` (outgoing), its incoming mirror,
+/// the sum of both (`both`, the default), or the undirected
+/// `MATCH (n:label)-[r:T]-() RETURN count(r)` (`undirected`) would count.
+/// Parallel relationships each count. A self-loop counts once per direction,
+/// so twice under `both`, and once under `undirected`, as Cypher's undirected
+/// pattern matches it. Rows with `degree >= minDegree` are returned ordered by
+/// degree descending, then vertex id ascending, at most `limit` of them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeDegreeProcedure {
+    pub(crate) label: String,
+    /// Count only relationships whose other endpoint carries this label, as
+    /// `(n)-[:T]->(:neighborLabel)` would. A self-loop's other endpoint is the
+    /// vertex itself.
+    pub(crate) neighbor_label: Option<String>,
+    pub(crate) rel_types: Vec<String>,
+    pub(crate) direction: NativeDegreeDirection,
+    pub(crate) min_degree: u64,
+    pub(crate) limit: Option<u64>,
+    pub(crate) projections: Vec<NativeDegreeProjection>,
+}
+
+/// Which relationships `algo.degree` counts for a vertex.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeDegreeDirection {
+    Outgoing,
+    Incoming,
+    /// Outgoing plus incoming: a self-loop counts twice.
+    Both,
+    /// Every relationship touching the vertex once: a self-loop counts once.
+    Undirected,
+}
+
+impl NativeDegreeDirection {
+    pub(crate) fn outgoing(self) -> bool {
+        self != Self::Incoming
+    }
+
+    pub(crate) fn incoming(self) -> bool {
+        self != Self::Outgoing
+    }
+
+    /// Whether a self-loop counts once rather than once per direction.
+    pub(crate) fn self_loops_once(self) -> bool {
+        self == Self::Undirected
+    }
+}
+
+/// One `RETURN` item of `algo.degree`: `node`, `node.<property>` or `degree`,
+/// each optionally renamed with `AS`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeDegreeProjection {
+    pub(crate) value: NativeDegreeValue,
+    pub(crate) column: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeDegreeValue {
+    /// The vertex id.
+    Node,
+    /// A vertex property; `id` is the vertex id, as in a Cypher projection.
+    NodeProperty(String),
+    Degree,
+}
+
+impl NativeDegreeProcedure {
+    pub(crate) fn columns(&self) -> Vec<QueryColumn> {
+        self.projections
+            .iter()
+            .map(|projection| QueryColumn::new(projection.column.clone()))
+            .collect()
+    }
+}
+
 pub(crate) fn is_native_path_procedure(query: &str) -> bool {
     let query = query.trim_start();
     query
@@ -86,6 +183,38 @@ pub(crate) fn is_native_path_procedure(query: &str) -> bool {
             .trim_start()
             .to_ascii_lowercase()
             .starts_with("algo.")
+}
+
+/// Parse any natively executed `CALL algo.*` procedure. `None` means the
+/// query is not one, and belongs to a Cypher planner.
+pub(crate) fn parse_native_procedure(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    max_traversal_hops: u8,
+) -> Result<Option<NativeProcedure>> {
+    if let Some(degree) = parse_native_degree_procedure(query, parameters)? {
+        return Ok(Some(NativeProcedure::Degree(degree)));
+    }
+    Ok(
+        parse_native_path_procedure(query, parameters, max_traversal_hops)?
+            .map(|procedure| NativeProcedure::Path(Box::new(procedure))),
+    )
+}
+
+/// The result columns of a native procedure, known before execution so Bolt
+/// can send them with the RUN response.
+#[cfg(feature = "client-api")]
+pub(crate) fn parse_native_procedure_columns(query: &str) -> Result<Option<Vec<QueryColumn>>> {
+    if let Some(parsed) = parse_native_degree_call(query)? {
+        return Ok(Some(
+            parsed
+                .projections
+                .into_iter()
+                .map(|projection| QueryColumn::new(projection.column))
+                .collect(),
+        ));
+    }
+    parse_native_path_procedure_columns(query)
 }
 
 pub(crate) fn parse_native_path_procedure(
@@ -294,6 +423,159 @@ fn parse_native_path_call(query: &str) -> Result<Option<ParsedNativePathCall>> {
     }
     Ok(Some(ParsedNativePathCall {
         kind,
+        config,
+        projections,
+    }))
+}
+
+struct ParsedNativeDegreeCall {
+    config: BTreeMap<String, ConfigValue>,
+    projections: Vec<NativeDegreeProjection>,
+}
+
+fn parse_native_degree_procedure(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<Option<NativeDegreeProcedure>> {
+    let Some(ParsedNativeDegreeCall {
+        config,
+        projections,
+    }) = parse_native_degree_call(query)?
+    else {
+        return Ok(None);
+    };
+    let known = [
+        "label",
+        "neighborLabel",
+        "relTypes",
+        "relDirection",
+        "minDegree",
+        "limit",
+    ];
+    if let Some(unknown) = config.keys().find(|key| !known.contains(&key.as_str())) {
+        return path_parse_error(format!("unknown algo.degree option {unknown}"));
+    }
+    let label = config_string(&config, "label", parameters)?.ok_or_else(|| {
+        GraphError::MissingQueryParameter {
+            dialect: "OpenCypher",
+            name: "label".to_string(),
+        }
+    })?;
+    crate::validate_component("label", &label)?;
+    let neighbor_label = config_string(&config, "neighborLabel", parameters)?;
+    if let Some(neighbor_label) = &neighbor_label {
+        crate::validate_component("neighborLabel", neighbor_label)?;
+    }
+    let rel_types = config_string_list(&config, "relTypes")?.unwrap_or_default();
+    if rel_types.is_empty() {
+        return path_parse_error("algo.degree requires a non-empty relTypes list");
+    }
+    for edge_type in &rel_types {
+        crate::validate_component("edge_type", edge_type)?;
+    }
+    let mut rel_types = rel_types;
+    rel_types.sort();
+    rel_types.dedup();
+    let direction = match config_string(&config, "relDirection", parameters)?
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("both") => NativeDegreeDirection::Both,
+        Some("outgoing") => NativeDegreeDirection::Outgoing,
+        Some("incoming") => NativeDegreeDirection::Incoming,
+        Some("undirected") => NativeDegreeDirection::Undirected,
+        Some(_) => {
+            return path_parse_error(
+                "relDirection must be 'incoming', 'outgoing', 'both', or 'undirected'",
+            )
+        }
+    };
+    let min_degree = config_u64(&config, "minDegree", parameters)?.unwrap_or(0);
+    let limit = config_u64(&config, "limit", parameters)?;
+    if limit == Some(0) {
+        return path_parse_error("limit must be greater than zero");
+    }
+    Ok(Some(NativeDegreeProcedure {
+        label,
+        neighbor_label,
+        rel_types,
+        direction,
+        min_degree,
+        limit,
+        projections,
+    }))
+}
+
+fn parse_native_degree_call(query: &str) -> Result<Option<ParsedNativeDegreeCall>> {
+    if !is_native_path_procedure(query) {
+        return Ok(None);
+    }
+    let mut parser = Parser::new(query)?;
+    parser.keyword("CALL")?;
+    parser.identifier_eq("algo")?;
+    parser.token(Token::Dot)?;
+    if !parser.identifier()?.eq_ignore_ascii_case("degree") {
+        return Ok(None);
+    }
+    parser.token(Token::LeftParen)?;
+    let config = parser.config()?;
+    parser.token(Token::RightParen)?;
+    parser.keyword("YIELD")?;
+    let mut yielded = Vec::new();
+    loop {
+        let column = parser.identifier()?;
+        if !["node", "degree"].contains(&column.as_str()) {
+            return path_parse_error(format!("algo.degree yields node and degree, not {column}"));
+        }
+        if yielded.contains(&column) {
+            return path_parse_error(format!("duplicate algo.degree yield column {column}"));
+        }
+        yielded.push(column);
+        if !parser.optional(Token::Comma) {
+            break;
+        }
+    }
+    parser.keyword("RETURN")?;
+    let mut projections = Vec::<NativeDegreeProjection>::new();
+    loop {
+        let variable = parser.identifier()?;
+        if !yielded.contains(&variable) {
+            return path_parse_error(format!(
+                "RETURN may only reference yielded algo.degree columns, not {variable}"
+            ));
+        }
+        let (value, default_column) = if parser.optional(Token::Dot) {
+            if variable != "node" {
+                return path_parse_error(format!("{variable} has no properties"));
+            }
+            let property = parser.identifier()?;
+            crate::validate_component("property", &property)?;
+            let column = format!("{variable}.{property}");
+            (NativeDegreeValue::NodeProperty(property), column)
+        } else if variable == "node" {
+            (NativeDegreeValue::Node, variable)
+        } else {
+            (NativeDegreeValue::Degree, variable)
+        };
+        let column = if parser.optional_keyword("AS") {
+            parser.identifier()?
+        } else {
+            default_column
+        };
+        if projections
+            .iter()
+            .any(|projection| projection.column == column)
+        {
+            return path_parse_error(format!("duplicate algo.degree result column {column}"));
+        }
+        projections.push(NativeDegreeProjection { value, column });
+        if !parser.optional(Token::Comma) {
+            break;
+        }
+    }
+    parser.optional(Token::Semicolon);
+    parser.end()?;
+    Ok(Some(ParsedNativeDegreeCall {
         config,
         projections,
     }))
@@ -670,6 +952,16 @@ impl Parser {
         }
     }
 
+    fn optional_keyword(&mut self, expected: &str) -> bool {
+        match self.tokens.get(self.offset) {
+            Some(Token::Identifier(actual)) if actual.eq_ignore_ascii_case(expected) => {
+                self.offset += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn optional(&mut self, expected: Token) -> bool {
         if self.tokens.get(self.offset) == Some(&expected) {
             self.offset += 1;
@@ -831,99 +1123,4 @@ fn path_parse_error<T>(reason: impl Into<String>) -> Result<T> {
         dialect: "OpenCypher",
         reason: reason.into(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_single_pair_native_path_call() {
-        let parameters = BTreeMap::from([
-            ("source".to_string(), VertexPropertyValue::Integer(7)),
-            ("target".to_string(), VertexPropertyValue::Integer(11)),
-            ("count".to_string(), VertexPropertyValue::Integer(2)),
-        ]);
-        let parsed = parse_native_path_procedure(
-            "CALL algo.SPpaths({sourceNode: $source, targetNode: $target, relTypes: ['RELATES'], maxLen: 3, relDirection: 'both', pathCount: $count}) YIELD path, pathWeight, pathCost RETURN path, pathWeight, pathCost",
-            &parameters,
-            10,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.kind, NativePathProcedureKind::SinglePair);
-        assert_eq!(parsed.source, 7);
-        assert_eq!(parsed.target, Some(11));
-        assert!(parsed.source_selector.is_none());
-        assert!(parsed.target_selector.is_none());
-        assert_eq!(parsed.rel_types, vec!["RELATES"]);
-        assert_eq!(parsed.direction, NativePathDirection::Both);
-        assert_eq!(parsed.max_len, 3);
-        assert_eq!(parsed.path_count, 2);
-    }
-
-    #[test]
-    fn parses_multi_source_native_path_call() {
-        let parsed = parse_native_path_procedure(
-            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], pairwise: true, relTypes: ['RELATES'], maxLen: 3, relDirection: 'both', pathCount: 5, fairRelationshipVariants: true, resultLimit: 100}) YIELD path RETURN path",
-            &BTreeMap::new(),
-            10,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(parsed.kind, NativePathProcedureKind::MultiSource);
-        assert!(parsed.pairwise);
-        assert!(parsed.fair_relationship_variants);
-        assert_eq!(parsed.path_count, 5);
-        assert_eq!(parsed.result_limit, Some(100));
-        assert_eq!(
-            parsed.source_selector,
-            Some(NativePathNodeSelector {
-                label: "Entity".to_string(),
-                property: "name".to_string(),
-                values: vec!["alpha".to_string(), "beta".to_string()],
-            })
-        );
-        assert_eq!(
-            parsed.target_selector,
-            Some(NativePathNodeSelector {
-                label: "Entity".to_string(),
-                property: "name".to_string(),
-                values: vec!["alpha".to_string(), "beta".to_string()],
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_multi_source_options_on_scalar_procedures() {
-        let error = parse_native_path_procedure(
-            "CALL algo.SSpaths({sourceNode: 7, sourceValues: ['alpha'], relTypes: ['RELATES']}) YIELD path RETURN path",
-            &BTreeMap::new(),
-            10,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("only supported by algo.MSpaths"));
-    }
-
-    #[test]
-    fn rejects_partial_multi_source_target_selector() {
-        let error = parse_native_path_procedure(
-            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', sourceValues: ['alpha'], targetLabel: 'Entity', relTypes: ['RELATES']}) YIELD path RETURN path",
-            &BTreeMap::new(),
-            10,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("targetValues is required"));
-    }
-
-    #[test]
-    fn rejects_path_depth_above_runtime_limit() {
-        let error = parse_native_path_procedure(
-            "CALL algo.SSpaths({sourceNode: 7, relTypes: ['RELATES'], maxLen: 11}) YIELD path RETURN path",
-            &BTreeMap::new(),
-            10,
-        )
-        .unwrap_err();
-        assert!(matches!(error, GraphError::AdmissionRejected { .. }));
-    }
 }

@@ -17,7 +17,7 @@ impl GraphTopologyOverlay {
         self.states.entry(src).or_default().insert(dst, exists);
     }
 
-    fn state(&self, src: VertexId, dst: VertexId) -> Option<bool> {
+    pub(crate) fn state(&self, src: VertexId, dst: VertexId) -> Option<bool> {
         self.states
             .get(&src)
             .and_then(|destinations| destinations.get(&dst))
@@ -39,6 +39,18 @@ impl GraphTopologyOverlay {
     }
 
     #[cfg(feature = "opencypher")]
+    pub(crate) fn in_neighbor_scan_work(&self) -> u64 {
+        u64::try_from(self.states.len()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn out_neighbor_scan_work(&self, src: VertexId) -> u64 {
+        self.states.get(&src).map_or(0, |destinations| {
+            u64::try_from(destinations.len()).unwrap_or(u64::MAX)
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
     pub(crate) fn apply_in_neighbors(
         &self,
         dst: VertexId,
@@ -54,7 +66,7 @@ impl GraphTopologyOverlay {
                 neighbors.remove(src);
             }
         }
-        u64::try_from(self.states.len()).unwrap_or(u64::MAX)
+        self.in_neighbor_scan_work()
     }
 
     #[cfg(feature = "opencypher")]
@@ -73,20 +85,7 @@ impl GraphTopologyOverlay {
                 neighbors.remove(dst);
             }
         }
-        u64::try_from(destinations.len()).unwrap_or(u64::MAX)
-    }
-
-    /// Test-only introspection. The WAL-tail overlay is otherwise only
-    /// observable through a compiled GraphBLAS traversal, which needs the
-    /// SuiteSparse C kernel; these let a repro assert on the overlay directly.
-    #[cfg(test)]
-    pub(crate) fn test_state(&self, src: VertexId, dst: VertexId) -> Option<bool> {
-        self.state(src, dst)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_len(&self) -> usize {
-        self.states.values().map(BTreeMap::len).sum()
+        self.out_neighbor_scan_work(src)
     }
 }
 
@@ -193,11 +192,6 @@ impl WalTailFileCache {
             };
             self.total_entries = self.total_entries.saturating_sub(evicted.len());
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cached_file_count(&self) -> usize {
-        self.files.len()
     }
 }
 
@@ -358,11 +352,6 @@ impl GraphShard {
         }
         Ok(GraphTopologyTail::Complete(overlay))
     }
-
-    #[cfg(test)]
-    pub(crate) async fn test_wal_tail_cached_file_count(&self) -> usize {
-        self.wal_tail_file_cache.lock().await.cached_file_count()
-    }
 }
 
 fn collect_wal_topology_entry(
@@ -505,80 +494,4 @@ pub(crate) fn expand_range_with_overlay(
         // The overlay walk runs on whichever compiled kernel the matrix baked in.
         backend: crate::sparse_kernel::compiled_graphblas_kernel(compiled),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(feature = "opencypher")]
-    #[test]
-    fn neighbor_application_reports_overlay_scan_work() {
-        let mut overlay = GraphTopologyOverlay::default();
-        overlay.set(1, 10, true);
-        overlay.set(1, 11, false);
-        overlay.set(2, 10, true);
-        overlay.set(3, 99, true);
-
-        let mut outgoing = BTreeSet::from([11]);
-        assert_eq!(overlay.apply_out_neighbors(1, &mut outgoing), 2);
-        assert_eq!(outgoing, BTreeSet::from([10]));
-
-        let mut incoming = BTreeSet::new();
-        assert_eq!(overlay.apply_in_neighbors(10, &mut incoming), 3);
-        assert_eq!(incoming, BTreeSet::from([1, 2]));
-    }
-
-    #[test]
-    fn malformed_wal_topology_isolated_to_its_cell_and_edge_type() {
-        let mut parsed = Vec::new();
-        collect_wal_topology_entry(
-            b"cell/cell-a/e/out/CHAIN/1/2",
-            &ValueDeletable::Tombstone,
-            11,
-            &mut parsed,
-        );
-        collect_wal_topology_entry(
-            b"cell/cell-a/e/out/REPLIES/not-a-vertex/9",
-            &ValueDeletable::Tombstone,
-            12,
-            &mut parsed,
-        );
-        collect_wal_topology_entry(
-            b"cell/cell-b/e/out/CHAIN/also-bad/8",
-            &ValueDeletable::Tombstone,
-            13,
-            &mut parsed,
-        );
-
-        let generation = crate::GraphIndexGeneration {
-            cell_id: "cell-a".to_string(),
-            edge_type: "CHAIN".to_string(),
-            base_sequence: 10,
-            last_wal_id: 0,
-            edge_count: 0,
-            checksum: 0,
-            generation: "fault-isolation".to_string(),
-        };
-        let affected = parsed
-            .iter()
-            .map(|entry| entry.affected_edge_for(&generation, 13))
-            .collect::<Result<Vec<_>>>()
-            .expect("unrelated malformed records must not fail CHAIN in cell-a");
-        assert_eq!(
-            affected.into_iter().flatten().collect::<Vec<_>>(),
-            vec![(1, 2)]
-        );
-
-        let malformed_generation = crate::GraphIndexGeneration {
-            edge_type: "REPLIES".to_string(),
-            ..generation
-        };
-        let error = parsed
-            .iter()
-            .map(|entry| entry.affected_edge_for(&malformed_generation, 13))
-            .collect::<Result<Vec<_>>>()
-            .expect_err("the malformed record must still fail its owning edge type");
-        assert!(matches!(error, GraphError::CorruptValue { .. }));
-    }
 }

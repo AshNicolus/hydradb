@@ -1,5 +1,8 @@
 use std::fmt::{Display, Formatter};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+
 use crate::{validate_component, GraphError, Result};
 
 pub const DEFAULT_NAMESPACE_ID: &str = "default";
@@ -27,6 +30,21 @@ impl NamespaceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Encode one caller-facing database or collection identifier into the
+/// canonical namespace segment used by client protocol routing.
+///
+/// Keeping this transformation beside [`NamespaceId`] lets online routing and
+/// offline image writers share one storage-layout contract.
+pub fn encode_scope_namespace_id(component: &'static str, value: &str) -> Result<NamespaceId> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(GraphError::InvalidKeyComponent {
+            component,
+            value: value.to_string(),
+        });
+    }
+    NamespaceId::new(URL_SAFE_NO_PAD.encode(value.as_bytes()))
 }
 
 impl Default for NamespaceId {

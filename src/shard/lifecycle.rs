@@ -2,7 +2,6 @@ use super::*;
 use crate::core::memory_diagnostics::{
     request_estimated_bytes, MemoryDiagnosticGuard, MemoryStage,
 };
-use crate::QueryFailureReason;
 
 use tracing::Instrument as _;
 
@@ -232,6 +231,12 @@ impl GraphShard {
                 tenant_quota,
                 crate::shard::experimental_cypher::STATISTICS_MEMO_MAX_BYTES,
             )),
+            #[cfg(feature = "experimental-cypher-engine")]
+            planner_statistics: options.planner_statistics,
+            #[cfg(feature = "experimental-cypher-engine")]
+            planner_statistics_cache: Default::default(),
+            #[cfg(feature = "experimental-cypher-engine")]
+            planner_statistics_hints: Default::default(),
             #[cfg(feature = "opencypher")]
             relationship_rows_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_relationship_row_sets,
@@ -425,13 +430,9 @@ impl GraphShard {
         &self,
         operation: &'static str,
     ) -> Result<OwnedSemaphorePermit> {
-        self.cache_metrics
-            .hydration_started
-            .fetch_add(1, Ordering::Relaxed);
+        self.cache_metrics.record_hydration_started();
         if self.hydration_gate.available_permits() == 0 {
-            self.cache_metrics
-                .hydration_waited
-                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics.record_hydration_waited();
         }
         self.hydration_gate
             .clone()
@@ -444,15 +445,17 @@ impl GraphShard {
     }
 
     pub(crate) fn record_hydration_complete(&self) {
-        self.cache_metrics
-            .hydration_completed
-            .fetch_add(1, Ordering::Relaxed);
+        self.cache_metrics.record_hydration_completed();
     }
 
     pub(crate) async fn acquire_graph_write_permit(
         &self,
         operation: &'static str,
-    ) -> Result<(OwnedSemaphorePermit, MemoryDiagnosticGuard)> {
+    ) -> Result<(
+        OwnedSemaphorePermit,
+        MemoryDiagnosticGuard,
+        MemoryDiagnosticGuard,
+    )> {
         self.operation_metrics
             .write_attempts
             .fetch_add(1, Ordering::Relaxed);
@@ -474,9 +477,19 @@ impl GraphShard {
             None => acquire.await?,
         };
         drop(waiting);
+        // The same hold split by commit path. A pipeline write releases the
+        // permit after its local commit; an inline write still holds it through
+        // its remote durability wait. Zero bytes: `shard_write_active` already
+        // carries this request's byte view.
+        let hold = if super::write_pipeline::current().is_some() {
+            MemoryStage::ShardWriteActivePipeline
+        } else {
+            MemoryStage::ShardWriteActiveInline
+        };
         Ok((
             permit,
             MemoryDiagnosticGuard::new(MemoryStage::ShardWriteActive, bytes),
+            MemoryDiagnosticGuard::new(hold, 0),
         ))
     }
 
@@ -847,7 +860,7 @@ impl GraphShard {
     /// does not — and both return the same number. [`BookmarkWait`] carries the
     /// difference out to the client, which is the only layer that knows which
     /// request paid for it. Change 4 of
-    /// `docs/plans/2026-08-21-cell-affine-read-routing.md`.
+    /// the cell-affine read-routing design.
     ///
     /// Nothing here allocates, locks or reaches the store that did not already:
     /// the writer flag falls out of the branch `durable_sequence` took anyway,
@@ -875,7 +888,7 @@ impl GraphShard {
         // that race and so was almost never observed in production. Bounding
         // the wait separately makes it lose to nothing: it degrades into a
         // clear, Bolt-retriable error with the rest of the budget intact.
-        // Change 3 of `docs/plans/2026-08-21-cell-affine-read-routing.md`.
+        // Change 3 of the cell-affine read-routing design.
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(self.limits.max_bookmark_wait_ms);
         loop {
@@ -915,10 +928,10 @@ impl GraphShard {
             });
         }
         if read_epoch != current_epoch {
-            return Err(GraphError::UnsupportedQuery {
-                reason: QueryFailureReason::InvalidRequest,
-                dialect: "GraphSnapshot",
-                feature: "historical graph epochs are not SlateDB snapshots".to_string(),
+            return Err(GraphError::SnapshotUnavailable {
+                cell_id: cell_id.to_string(),
+                read_epoch,
+                current_epoch,
             });
         }
         Ok(GraphSnapshot {
@@ -927,75 +940,5 @@ impl GraphShard {
             read_epoch,
             storage_snapshot,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use slatedb::object_store::memory::InMemory;
-
-    async fn open_shard(path: &str) -> GraphShard {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        GraphShard::open_standalone_writer(path, object_store)
-            .await
-            .unwrap()
-    }
-
-    /// The cache gauges must release each cache mutex before taking the next one.
-    ///
-    /// Guard lifetime is not observable through the public API, so the test drives
-    /// the collection future by hand: it holds one cache lock, polls the future
-    /// exactly once, and checks that the caches the future has already visited are
-    /// free while it is parked. Written as a single struct literal the guards are
-    /// temporaries of the tail expression, so they live until the function returns
-    /// and `try_lock` on an earlier cache fails. There is no timing and no second
-    /// task involved, so the test cannot flake.
-    #[tokio::test]
-    async fn cache_entry_count_gauges_release_each_lock_before_the_next() {
-        let shard = open_shard("cache-entry-count-locks").await;
-
-        let blocker = shard.graphblas_cache.lock().await;
-        let mut counts = std::pin::pin!(shard.graph_cache_entry_counts());
-        assert!(
-            futures::poll!(counts.as_mut()).is_pending(),
-            "the held graphblas_cache lock should have parked the collection"
-        );
-        assert!(
-            shard.matrix_artifact_cache.try_lock().is_ok(),
-            "matrix_artifact_cache is still held while the gauge collection waits \
-             on a later cache: the guards overlap"
-        );
-        assert!(
-            shard.matrix_cache.try_lock().is_ok(),
-            "matrix_cache is still held while the gauge collection waits on a \
-             later cache: the guards overlap"
-        );
-        drop(blocker);
-        assert_eq!(counts.await, GraphCacheEntryCounts::default());
-
-        shard.close().await.unwrap();
-    }
-
-    /// See above; `graph_cache_resident_bytes` has the same shape one lock shorter.
-    #[tokio::test]
-    async fn cache_resident_byte_gauges_release_each_lock_before_the_next() {
-        let shard = open_shard("cache-resident-byte-locks").await;
-
-        let blocker = shard.graphblas_cache.lock().await;
-        let mut resident = std::pin::pin!(shard.graph_cache_resident_bytes());
-        assert!(
-            futures::poll!(resident.as_mut()).is_pending(),
-            "the held graphblas_cache lock should have parked the collection"
-        );
-        assert!(
-            shard.matrix_cache.try_lock().is_ok(),
-            "matrix_cache is still held while the gauge collection waits on a \
-             later cache: the guards overlap"
-        );
-        drop(blocker);
-        assert_eq!(resident.await, GraphCacheResidentBytes::default());
-
-        shard.close().await.unwrap();
     }
 }

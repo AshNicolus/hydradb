@@ -152,9 +152,7 @@ async fn main() -> Result<()> {
                 .await?;
             println!(
                 "graph worker chunked-batch node={node_id} cell={cell_id} src={src} ops={ops} inserted={} existed={} epoch={}",
-                result.inserted,
-                result.already_existed,
-                result.end_epoch
+                result.inserted, result.already_existed, result.end_epoch
             );
         }
         "deleter" => {
@@ -290,9 +288,7 @@ async fn main() -> Result<()> {
                     .await?;
                 println!(
                     "graph worker segment-gc node={node_id} cell={cell_id} src={src} epoch={} segments_deleted={} tombstones_deleted={}",
-                    compact.compacted_through_epoch,
-                    compact.deleted_segment_keys,
-                    compact.deleted_tombstone_keys
+                    compact.compacted_through_epoch, compact.deleted_segment_keys, compact.deleted_tombstone_keys
                 );
             } else {
                 println!("graph worker segment-gc node={node_id} cell={cell_id} epoch=0 skipped");
@@ -311,10 +307,7 @@ async fn main() -> Result<()> {
                     .await?;
                 println!(
                     "graph worker matrix node={node_id} cell={cell_id} epoch={} edges={} out_tiles={} transpose_tiles={}",
-                    artifact.base_epoch,
-                    artifact.edge_count,
-                    artifact.out_tiles,
-                    artifact.transpose_tiles
+                    artifact.base_epoch, artifact.edge_count, artifact.out_tiles, artifact.transpose_tiles
                 );
             } else {
                 println!("graph worker matrix node={node_id} cell={cell_id} epoch=0 skipped");
@@ -350,9 +343,7 @@ async fn main() -> Result<()> {
                         parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
                     )
                     .await?;
-                println!(
-                    "graph worker delta-gc node={node_id} cell={cell_id} epoch={epoch} skipped=no-graph-delta-log"
-                );
+                println!("graph worker delta-gc node={node_id} cell={cell_id} epoch={epoch} skipped=no-graph-delta-log");
             } else {
                 println!("graph worker delta-gc node={node_id} cell={cell_id} epoch=0 skipped");
             }

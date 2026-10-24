@@ -1,5 +1,5 @@
-//! Measures the read cost of the two index key shapes discussed on PRO-1541,
-//! on the same SlateDB instance the graph runs on.
+//! Measures the read cost of the two index key shapes on the same SlateDB
+//! instance the graph runs on.
 //!
 //! Today every property index is sorted and answered by a prefix scan:
 //!

@@ -17,6 +17,16 @@ pub struct PropertyStatistics {
     pub bloom: Option<BloomFilterStatistics>,
 }
 
+/// The numeric domain of one property's index entries: integers and floats
+/// merged by value into one `f64` range, as the ordered index walk merges
+/// them. `entries` counts only the numeric entries.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PropertyNumericRange {
+    pub min: f64,
+    pub max: f64,
+    pub entries: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BloomFilterStatistics {
     pub bit_count: u64,
@@ -31,6 +41,25 @@ pub struct BloomFilterStatistics {
 /// methods must not perform I/O. That keeps logical lowering deterministic and
 /// makes one planning attempt observe one coherent statistics generation.
 pub trait StatisticsProvider: Send + Sync {
+    /// True only for a provider whose counts may rank a vertex's equality,
+    /// range and label candidates against each other. Every older provider
+    /// stays `false`, which is what keeps their plans byte-identical: the
+    /// planner then takes the first equality exactly as it always has.
+    fn ranks_access_candidates(&self) -> bool {
+        false
+    }
+
+    /// The numeric domain of a vertex property's index entries, for
+    /// estimating the share of entries a range keeps. `None` when unknown, or
+    /// when the property holds no number.
+    fn property_numeric_range(
+        &self,
+        _labels: &[Symbol],
+        _property: &Symbol,
+    ) -> Option<PropertyNumericRange> {
+        None
+    }
+
     fn vertex_count(&self, _labels: &[Symbol]) -> Option<u64> {
         None
     }

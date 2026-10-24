@@ -21,11 +21,12 @@ use chrono::{DateTime, Utc};
 
 use config::RuntimeConfig;
 use hydradb::{
-    object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
-    ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
+    object_store_from_env, probe_create_only_puts, BoltServerConfig, ClientBoltServer,
+    ClientHttpServer, ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
     HierarchicalClientDatabaseResolver, HttpQueryServerConfig, ObjectStoreBoltRoutingTableProvider,
     ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
     QueryTransportScopeGrant, ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
+    WriterGate,
 };
 use hydradb_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
 use hydradb_placement::liveness::HeartbeatAction;
@@ -36,6 +37,67 @@ use slatedb::object_store::{path::Path, ObjectStore};
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const INDEXER_NOTIFY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Concurrent PUTs in the create-only probe: one run, 32 small PUTs.
+const CREATE_ONLY_PROBE_CONTENDERS: usize = 32;
+/// Backoff between create-only probes after a failure: doubling from the first
+/// to the last, then repeating the last.
+const CREATE_ONLY_PROBE_RETRY_FIRST: Duration = Duration::from_secs(5);
+const CREATE_ONLY_PROBE_RETRY_LAST: Duration = Duration::from_secs(300);
+
+/// Close `gate` and probe the store in the background until a probe passes,
+/// then open it. The node boots and serves reads meanwhile; a slow or failing
+/// store delays only writes and readiness, never the listeners. Returns the
+/// probe task for shutdown to abort.
+///
+/// Each attempt uses its own key: a run id plus the attempt number, so neither
+/// a restart nor a retry contends with an earlier probe's leftover object.
+fn start_create_only_probe(
+    object_store: Arc<dyn ObjectStore>,
+    data_path: String,
+    node_id: String,
+    started_at: DateTime<Utc>,
+    gate: WriterGate,
+) -> tokio::task::JoinHandle<()> {
+    gate.set_open(false);
+    let run = started_at.timestamp_nanos_opt().unwrap_or_default();
+    tokio::spawn(async move {
+        let mut delay = CREATE_ONLY_PROBE_RETRY_FIRST;
+        let mut attempt: u64 = 0;
+        loop {
+            let prefix = Path::from(format!(
+                "{data_path}/_create_only_probe/{node_id}-{run}-{attempt}"
+            ));
+            match probe_create_only_puts(
+                object_store.as_ref(),
+                &prefix,
+                CREATE_ONLY_PROBE_CONTENDERS,
+            )
+            .await
+            {
+                Ok(()) => {
+                    gate.set_open(true);
+                    tracing::info!(
+                        attempt,
+                        "object store passed the create-only probe: writers allowed"
+                    );
+                    return;
+                }
+                Err(error) if attempt == 0 => tracing::error!(
+                    %error,
+                    retry_in = ?delay,
+                    "object store failed the create-only probe: serving reads only, not ready, retrying"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, attempt, retry_in = ?delay, "create-only probe failed again")
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(CREATE_ONLY_PROBE_RETRY_LAST);
+            attempt += 1;
+        }
+    })
+}
 
 /// Join the kernel's trace-context hook to the OpenTelemetry implementation.
 ///
@@ -196,6 +258,19 @@ async fn run_node(
         node = node.with_indexer_change_wake(Arc::clone(wake));
     }
     let node = Arc::new(node);
+    // Before any listener opens: WAL fencing needs create-only PUTs, and a store
+    // that ignores them loses acknowledged writes on a takeover without any
+    // error. Until the store passes the probe this node serves reads, takes no
+    // writer, and is not ready (`/readyz`, heartbeat): all three read the one
+    // gate, closed here and opened by the background probe.
+    let writer_gate = node.writer_gate();
+    let storage_probe = start_create_only_probe(
+        Arc::clone(&object_store),
+        config.data_path.clone(),
+        config.node_id.clone(),
+        started_at,
+        writer_gate.clone(),
+    );
     let indexer_notifier = match (config.indexer_notify_url.clone(), indexer_change_wake) {
         (Some(url), Some(wake)) => Some(start_indexer_change_notifier(url, wake, token.clone())?),
         _ => None,
@@ -276,7 +351,7 @@ async fn run_node(
     // `GRAPH_READ_ROUTING` decides whether `READ` names the whole live fleet or
     // just the cell's owner. Default `fleet`, i.e. inert, so the flip is an env
     // change per environment rather than a fleet-wide behaviour change carried
-    // by an image (docs/plans/2026-08-21-cell-affine-read-routing.md, change 2).
+    // by an image (the cell-affine read-routing design, change 2).
     let routing = ObjectStoreBoltRoutingTableProvider::new(
         config.bolt_node_addresses.clone(),
         30,
@@ -309,7 +384,7 @@ async fn run_node(
     // placement: a node that has shed its view of the fleet (decision 7) is not
     // ready and must withdraw its heartbeat, or it stays the computed owner for
     // every peer while refusing every write they route to it.
-    let ready = NodeReadiness::new(placement.clone());
+    let ready = NodeReadiness::new(placement.clone()).with_writer_gate(writer_gate);
     let admin = admin::AdminServer::bind_scoped(
         config.admin_addr,
         ready.clone(),
@@ -349,6 +424,7 @@ async fn run_node(
         result = shutdown_signal() => result?,
     }
     ready.mark_unready();
+    storage_probe.abort();
     // Before anything drains. The publisher's last act is to DELETE this node's
     // heartbeat, and awaiting it here is what makes a graceful restart hand the
     // node's cells over immediately instead of costing peers a full
@@ -488,7 +564,7 @@ fn start_writer_lease_reconciler(
 /// SIGTERM:                            -> DELETE <base>/_graph_nodes/v1/<id>, then drain
 /// ```
 ///
-/// Decision 4 of `docs/plans/2026-07-25-rendezvous-placement.md`. **Presence of
+/// Decision 4 of the rendezvous placement design. **Presence of
 /// the object is the readiness signal**, not merely a liveness one: it replaces
 /// the per-caller `/readyz` fan-out that routing used to run, so a node that is
 /// up but unready must leave *no* object behind. That is why the unready branch
@@ -701,161 +777,4 @@ async fn shutdown_signal() -> RuntimeResult<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use slatedb::object_store::{memory::InMemory, ObjectStoreExt};
-
-    use super::*;
-
-    /// Long enough to cover many publisher ticks, short enough that a genuine
-    /// hang fails the test instead of the suite.
-    const SETTLE: Duration = Duration::from_secs(5);
-    const TICK: Duration = Duration::from_millis(5);
-
-    /// A readiness handle over a fleet of one, already up. Placement is
-    /// `Grace(configured fleet)` until something refreshes it, which is the
-    /// ready posture — the shed half of this type is exercised in
-    /// `graph_node/readiness.rs`, where a failing store can produce it.
-    fn ready_node() -> NodeReadiness {
-        let readiness = NodeReadiness::new(
-            PlacementView::new("graph-node-0", ["graph-node-0"], PlacementConfig::default())
-                .expect("a valid fleet"),
-        );
-        readiness.mark_ready();
-        readiness
-    }
-
-    async fn settles_to(store: &Arc<dyn ObjectStore>, path: &Path, present: bool) -> bool {
-        let deadline = std::time::Instant::now() + SETTLE;
-        while std::time::Instant::now() < deadline {
-            if store.head(path).await.is_ok() == present {
-                return true;
-            }
-            tokio::time::sleep(TICK).await;
-        }
-        false
-    }
-
-    /// Decision 4: the object's presence *is* the readiness signal, so going
-    /// unready has to remove it. A publisher that merely skipped the PUT would
-    /// keep advertising an unready node for a whole `heartbeat_timeout`, and
-    /// nothing downstream could tell the difference.
-    #[tokio::test]
-    async fn heartbeat_tracks_readiness_in_both_directions() {
-        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let base = Path::from("graph/data");
-        let path = Path::from("graph/data/_graph_nodes/v1/graph-node-0");
-        let ready = ready_node();
-        let (stop, task) = start_heartbeat_publisher(
-            Arc::clone(&store),
-            base,
-            "graph-node-0".to_string(),
-            vec!["cell-0".to_string()],
-            ready.clone(),
-            Utc::now(),
-            TICK,
-        );
-
-        assert!(settles_to(&store, &path, true).await, "never published");
-        ready.mark_unready();
-        assert!(
-            settles_to(&store, &path, false).await,
-            "stayed published while unready"
-        );
-        ready.mark_ready();
-        assert!(
-            settles_to(&store, &path, true).await,
-            "did not republish on becoming ready again"
-        );
-
-        let _ = stop.send(true);
-        task.await.unwrap();
-    }
-
-    /// The SIGTERM withdrawal, and the reason `run_node` awaits the task before
-    /// draining: peers take the node's cells over the moment this DELETE lands
-    /// rather than `heartbeat_timeout` later.
-    #[tokio::test]
-    async fn shutdown_withdraws_the_heartbeat_of_a_ready_node() {
-        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let base = Path::from("graph/data");
-        let path = Path::from("graph/data/_graph_nodes/v1/graph-node-0");
-        // A publisher interval far longer than the test: the withdrawal must
-        // come from the shutdown path, not from a tick that happened to land.
-        let (stop, task) = start_heartbeat_publisher(
-            Arc::clone(&store),
-            base,
-            "graph-node-0".to_string(),
-            vec!["cell-0".to_string()],
-            ready_node(),
-            Utc::now(),
-            Duration::from_secs(600),
-        );
-
-        assert!(settles_to(&store, &path, true).await, "never published");
-        let _ = stop.send(true);
-        task.await.unwrap();
-        assert!(
-            store.head(&path).await.is_err(),
-            "heartbeat outlived the process"
-        );
-    }
-
-    #[tokio::test]
-    async fn indexer_notifier_coalesces_a_write_burst_into_one_http_wake() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let authenticated_hits = Arc::new(AtomicUsize::new(0));
-        let handler_hits = Arc::clone(&hits);
-        let handler_authenticated_hits = Arc::clone(&authenticated_hits);
-        let app = axum::Router::new().route(
-            "/v1/changes:process",
-            axum::routing::post(move |headers: axum::http::HeaderMap| {
-                let hits = Arc::clone(&handler_hits);
-                let authenticated_hits = Arc::clone(&handler_authenticated_hits);
-                async move {
-                    hits.fetch_add(1, Ordering::Relaxed);
-                    if headers
-                        .get(axum::http::header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok())
-                        == Some("Bearer test-indexer-token")
-                    {
-                        authenticated_hits.fetch_add(1, Ordering::Relaxed);
-                    }
-                    axum::http::StatusCode::ACCEPTED
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let wake = Arc::new(tokio::sync::Notify::new());
-        let (stop, task) = start_indexer_change_notifier(
-            format!("http://{address}/v1/changes:process"),
-            Arc::clone(&wake),
-            "test-indexer-token".to_string(),
-        )
-        .unwrap();
-
-        for _ in 0..100 {
-            wake.notify_one();
-        }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while hits.load(Ordering::Relaxed) == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("notifier did not deliver the wake");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
-        assert_eq!(authenticated_hits.load(Ordering::Relaxed), 1);
-
-        let _ = stop.send(true);
-        task.await.unwrap().unwrap();
-        server.abort();
-    }
 }

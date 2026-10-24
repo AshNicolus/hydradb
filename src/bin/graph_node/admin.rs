@@ -1,6 +1,3 @@
-#[cfg(test)]
-#[path = "admin/cypher_engine_tests.rs"]
-mod cypher_engine_tests;
 #[path = "admin/memory_sampler.rs"]
 mod memory_sampler;
 
@@ -14,8 +11,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use hydradb::{
-    ClientQueryService, CypherEngineMode, CypherEngineSelection, DurationHistogramSnapshot,
-    ExperimentalOperatorMetricsSnapshot, GraphCacheMetricsSnapshot,
+    CellOperationalCounterTotals, ClientQueryService, CypherEngineMode, CypherEngineSelection,
+    DurationHistogramSnapshot, ExperimentalOperatorMetricsSnapshot, GraphCacheMetricsSnapshot,
     GraphOperationalMetricsSnapshot, Result, ScopedGraphShardRuntimeMetrics,
     ScopedRoutedGraphCluster,
 };
@@ -108,7 +105,7 @@ pub const PROMETHEUS_HISTOGRAMS: &[PrometheusHistogram] = &[
         source: FieldSource::GraphNode,
     },
     // Read-your-writes latency, and the instrument change 4 of
-    // `docs/plans/2026-08-21-cell-affine-read-routing.md` exists to add. In
+    // the cell-affine read-routing design exists to add. In
     // microseconds rather than seconds because it is a HydraDB metric and not a
     // semconv one — only `db.client.operation.duration` is fixed in seconds —
     // and because the two counters it sits beside are counts of the same waits,
@@ -184,6 +181,82 @@ pub const PROMETHEUS_HISTOGRAMS: &[PrometheusHistogram] = &[
         carries_scope: false,
         source: FieldSource::GraphNode,
     },
+    // Write entry points that commit outside the durability pipeline, so
+    // their volume and latency can be compared with the pipelined families.
+    PrometheusHistogram {
+        field: "set_edge_metadata_latency",
+        name: "graph_set_edge_metadata_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
+        field: "set_edge_metadata_batch_latency",
+        name: "graph_set_edge_metadata_batch_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
+        field: "write_edge_latency",
+        name: "graph_write_edge_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
+        field: "write_edge_mutations_batch_latency",
+        name: "graph_write_edge_mutations_batch_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
+        field: "create_relationship_latency",
+        name: "graph_create_relationship_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
+        field: "import_vertex_metadata_batch_latency",
+        name: "graph_import_vertex_metadata_batch_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    // Whole-request latency of experimental queries split by what chose the
+    // access path, so `histogram_quantile` reads p95 per source. Keyed by
+    // `cell_id` alone, like the write-batch families: the source is the
+    // field, never a label value derived from the query.
+    PrometheusHistogram {
+        field: "query_experimental_access_statistics_latency",
+        name: "graph_query_experimental_access_statistics_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
+        field: "query_experimental_access_probe_latency",
+        name: "graph_query_experimental_access_probe_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
+        field: "query_experimental_access_guard_latency",
+        name: "graph_query_experimental_access_guard_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
+    PrometheusHistogram {
+        field: "query_experimental_access_default_latency",
+        name: "graph_query_experimental_access_default_duration_microseconds",
+        unit: ExportUnit::Microseconds,
+        carries_scope: false,
+        source: FieldSource::GraphNode,
+    },
     PrometheusHistogram {
         field: "rpc_latency",
         name: "graph_query_transport_rpc_duration_microseconds",
@@ -226,10 +299,14 @@ pub enum PrometheusCounterExport {
     /// otherwise render the same series name and label set twice with different
     /// values in one scrape, which Prometheus rejects outright.
     ///
-    /// The cost is one real property: a scope closing makes the sum *fall*,
-    /// which `rate()` reads as a counter reset and undercounts across, where a
-    /// per-scope series would simply have gone stale. Undercounting a rate at a
-    /// scope eviction is the cheaper of the two failures.
+    /// The sum is over every scope that has *ever* been open on the node, not
+    /// only the ones open now: a closed scope's final values stay in the total
+    /// (`ScopedRoutedGraphCluster::cell_operational_counter_totals`). A sum over
+    /// open scopes alone falls when one closes, and `rate()`/`increase()` do
+    /// not undercount across a fall — they read it as a reset to zero and
+    /// count the whole remaining sum again as new increase. On staging
+    /// that turned scope evictions into phantom spikes of thousands
+    /// of `graph_write_commits` a minute with no client writes at all.
     PerCell(&'static str),
     /// One series per `{scope, cell_id}`.
     ///
@@ -347,7 +424,7 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
     // The bookmark-wait family: one denominator and four fractions of it, all
     // `Global` because the wait is a property of the *node* the read landed on
     // and not of the cell it asked for — the whole point of
-    // `docs/plans/2026-08-21-cell-affine-read-routing.md` is that two nodes
+    // the cell-affine read-routing design is that two nodes
     // serving the same cell answer this differently. A `cell_id` label would
     // therefore split the one series an operator wants to read.
     //
@@ -768,6 +845,110 @@ pub const PROMETHEUS_COUNTERS: &[PrometheusCounter] = &[
         source: CounterSource::Shard,
         field: "query_experimental_sampled_plans",
         export: PrometheusCounterExport::PerCell("graph_query_experimental_sampled_plans"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_statistics_requests",
+        export: PrometheusCounterExport::PerCell(
+            "graph_query_experimental_access_statistics_requests",
+        ),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_statistics_us",
+        export: PrometheusCounterExport::PerCell(
+            "graph_query_experimental_access_statistics_microseconds",
+        ),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_probe_requests",
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_probe_requests"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_probe_us",
+        export: PrometheusCounterExport::PerCell(
+            "graph_query_experimental_access_probe_microseconds",
+        ),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_guard_requests",
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_guard_requests"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_guard_us",
+        export: PrometheusCounterExport::PerCell(
+            "graph_query_experimental_access_guard_microseconds",
+        ),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_default_requests",
+        export: PrometheusCounterExport::PerCell(
+            "graph_query_experimental_access_default_requests",
+        ),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_default_us",
+        export: PrometheusCounterExport::PerCell(
+            "graph_query_experimental_access_default_microseconds",
+        ),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_guard_stops",
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_guard_stops"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_planned_without_statistics",
+        export: PrometheusCounterExport::PerCell(
+            "graph_query_experimental_planned_without_statistics",
+        ),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "planner_statistics_reloads",
+        export: PrometheusCounterExport::PerCell("graph_planner_statistics_reloads"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "planner_statistics_load_failures",
+        export: PrometheusCounterExport::PerCell("graph_planner_statistics_load_failures"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "planner_statistics_corrupt_ignored",
+        export: PrometheusCounterExport::PerCell("graph_planner_statistics_corrupt_ignored"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "planner_statistics_hints_sent",
+        export: PrometheusCounterExport::PerCell("graph_planner_statistics_hints_sent"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_rows_estimated",
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_rows_estimated"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_rows_actual",
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_rows_actual"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_underestimates",
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_underestimates"),
+    },
+    PrometheusCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_overestimates",
+        export: PrometheusCounterExport::PerCell("graph_query_experimental_access_overestimates"),
     },
     PrometheusCounter {
         source: CounterSource::Shard,
@@ -1363,6 +1544,11 @@ async fn metrics(State(state): State<AdminState>) -> Response {
         std::time::Duration::from_secs(1),
     )
     .await;
+    append_per_cell_counters(
+        &mut output,
+        &state.routed_node.cell_operational_counter_totals(),
+    );
+    append_cache_counters(&mut output, &state.routed_node.graph_cache_metrics());
     append_slatedb_cache_metrics(&mut output, state.routed_node.slatedb_cache_metrics());
     crate::otel_metrics::memory_diagnostics::append(&mut output);
     state.memory_sampler.render(&mut output);
@@ -1555,9 +1741,11 @@ fn parse_linux_rss_bytes(status: &str) -> Option<u64> {
 /// families that already carry it — they are scraped today and every dashboard
 /// and recording rule built on them is downstream of those exact strings — while
 /// letting nothing new join them. The remaining shard counters are therefore
-/// summed across the scopes open on this node, which is also the only way they
-/// *can* be emitted: two scopes hosting the same `cell_id` would otherwise
-/// render one series name and label set twice in a single scrape.
+/// summed per cell, which is also the only way they *can* be emitted: two
+/// scopes hosting the same `cell_id` would otherwise render one series name and
+/// label set twice in a single scrape. They are rendered by
+/// `append_per_cell_counters` from the runtime's cumulative totals, not here,
+/// so a scope closing cannot lower them.
 fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRuntimeMetrics]) {
     // Declared from the enumeration rather than written out, so a counter that
     // joins `GraphOperationalMetricsSnapshot` cannot be declared here and
@@ -1585,6 +1773,8 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
         "# TYPE graph_storage_compaction_bytes counter\n",
         "# TYPE graph_storage_running_compactions gauge\n",
         "# TYPE graph_storage_last_compaction_timestamp_sec gauge\n",
+        "# TYPE graph_storage_wal_buffer_flushes counter\n",
+        "# TYPE graph_storage_wal_buffer_flush_requests counter\n",
         "# TYPE graph_storage_write_bytes counter\n",
         "# TYPE graph_storage_block_cache_accesses counter\n",
         "# TYPE graph_storage_object_store_requests counter\n",
@@ -1715,6 +1905,14 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
                 "graph_storage_last_compaction_timestamp_sec",
                 storage.last_compaction_timestamp_sec,
             ),
+            (
+                "graph_storage_wal_buffer_flushes",
+                storage.wal_buffer_flushes,
+            ),
+            (
+                "graph_storage_wal_buffer_flush_requests",
+                storage.wal_buffer_flush_requests,
+            ),
         ] {
             output.push_str(&format!(
                 "{name}{{scope=\"{}\",cell_id=\"{}\"}} {value}\n",
@@ -1817,8 +2015,8 @@ fn append_node_metrics(output: &mut String, shard_metrics: &[ScopedGraphShardRun
             &[("cell_id", cell_id)],
         );
     }
-    append_per_cell_counters(output, shard_metrics);
     append_experimental_operator_families(output, shard_metrics);
+    crate::otel_metrics::planner_statistics::append(output, shard_metrics);
 }
 
 /// The experimental engine's per-operator families: one Prometheus family per
@@ -1928,103 +2126,58 @@ fn merge_histogram(total: &mut DurationHistogramSnapshot, shard: &DurationHistog
     total.sum_us = total.sum_us.saturating_add(shard.sum_us);
 }
 
-/// Per-cell counter totals, summed over every scope open on this node.
-///
-/// Three maps rather than one map of a three-field row, because each is handed
-/// to its renderer alongside the enumeration it belongs to and no renderer ever
-/// wants two of them.
-#[derive(Default)]
-struct CellTotals<'a> {
-    /// `GraphOperationalMetricsSnapshot::counter_fields`, per cell.
-    operational: BTreeMap<&'a str, Vec<(&'static str, u64)>>,
-    /// `GraphCacheMetricsSnapshot::counter_fields`, per cell.
-    cache: BTreeMap<&'a str, Vec<(&'static str, u64)>>,
-    /// `GraphOperationalMetricsSnapshot::class_counter_fields`, per cell.
-    classes: BTreeMap<&'a str, Vec<(&'static str, &'static str, u64)>>,
-}
-
 /// Every shard counter that is not one of the three `{scope, cell_id}`
-/// survivors, summed by `cell_id` and rendered family by family.
+/// survivors, per `cell_id`, rendered family by family.
 ///
-/// Family-major rather than shard-major, which is the opposite of the loop
-/// above: these series are aggregated, so all of a family's cells are known at
-/// once and can be emitted under a single `# TYPE` line. That is what the
-/// exposition format actually asks for, and the shard-major block above only
-/// departs from it because its output has to stay byte-identical.
-fn append_per_cell_counters(output: &mut String, shard_metrics: &[ScopedGraphShardRuntimeMetrics]) {
-    let mut totals = CellTotals::default();
-    for metrics in shard_metrics {
-        let cell_id = metrics.shard.cell_id.as_str();
-        accumulate(
-            totals.operational.entry(cell_id).or_default(),
-            metrics.shard.operational.counter_fields(),
-        );
-        accumulate(
-            totals.cache.entry(cell_id).or_default(),
-            metrics.shard.cache.counter_fields(),
-        );
-        accumulate_classes(
-            totals.classes.entry(cell_id).or_default(),
-            metrics.shard.operational.class_counter_fields(),
-        );
-    }
-
+/// From the runtime's cumulative totals rather than from the shard snapshots
+/// `append_node_metrics` renders, so a scope closing never lowers a series —
+/// see [`PrometheusCounterExport::PerCell`]. That also puts these outside the
+/// bounded shard collection: the totals are atomics read under one mutex, so a
+/// slow scope open cannot make a counter family vanish for a scrape either.
+///
+/// Family-major rather than shard-major: all of a family's cells are known at
+/// once and can be emitted under a single `# TYPE` line, which is what the
+/// exposition format actually asks for.
+fn append_per_cell_counters(
+    output: &mut String,
+    totals: &BTreeMap<String, CellOperationalCounterTotals>,
+) {
+    let operational = totals
+        .iter()
+        .map(|(cell_id, cell)| (cell_id.as_str(), cell.counters.clone()))
+        .collect();
+    let classes = totals
+        .iter()
+        .map(|(cell_id, cell)| (cell_id.as_str(), cell.classes.clone()))
+        .collect();
     append_per_cell_family(
         output,
         CounterSource::Shard,
         GraphOperationalMetricsSnapshot::default().counter_fields(),
-        &totals.operational,
-    );
-    append_per_cell_family(
-        output,
-        CounterSource::ShardCache,
-        GraphCacheMetricsSnapshot::default().counter_fields(),
-        &totals.cache,
+        &operational,
     );
     append_per_cell_class_family(
         output,
         CounterSource::Shard,
         GraphOperationalMetricsSnapshot::default().class_counter_fields(),
-        &totals.classes,
+        &classes,
     );
 }
 
-/// Add one snapshot's counters into a running per-cell total.
-///
-/// Matched by field name rather than by position. The enumeration is in
-/// declaration order and two snapshots of one type cannot disagree about it, so
-/// indexing would work — but a linear match over this bounded field set costs nothing
-/// and cannot silently add `write_commits` into `write_attempts` if that ever
-/// stops being true.
-fn accumulate(
-    totals: &mut Vec<(&'static str, u64)>,
-    fields: impl Iterator<Item = (&'static str, u64)>,
+fn append_cache_counters(
+    output: &mut String,
+    metrics: &BTreeMap<String, GraphCacheMetricsSnapshot>,
 ) {
-    for (field, value) in fields {
-        match totals.iter_mut().find(|(name, _)| *name == field) {
-            // Saturating: the operands are `u64` counters that only a
-            // decades-long uptime could overflow, and a wrapped total on a
-            // metrics endpoint is a phantom incident.
-            Some(slot) => slot.1 = slot.1.saturating_add(value),
-            None => totals.push((field, value)),
-        }
-    }
-}
-
-/// [`accumulate`] for the `(field, class, count)` rows.
-fn accumulate_classes(
-    totals: &mut Vec<(&'static str, &'static str, u64)>,
-    fields: impl Iterator<Item = (&'static str, &'static str, u64)>,
-) {
-    for (field, class, value) in fields {
-        match totals
-            .iter_mut()
-            .find(|(name, existing, _)| *name == field && *existing == class)
-        {
-            Some(slot) => slot.2 = slot.2.saturating_add(value),
-            None => totals.push((field, class, value)),
-        }
-    }
+    let totals = metrics
+        .iter()
+        .map(|(cell, snapshot)| (cell.as_str(), snapshot.counter_fields().collect()))
+        .collect();
+    append_per_cell_family(
+        output,
+        CounterSource::ShardCache,
+        GraphCacheMetricsSnapshot::default().counter_fields(),
+        &totals,
+    );
 }
 
 /// Declare a `# TYPE … counter` line for every field a snapshot enumerates
@@ -2331,797 +2484,4 @@ fn admin_io_error(error: std::io::Error) -> hydradb::GraphError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use hydradb::{
-        ClientQueryServiceConfig, GraphCacheMetricsSnapshot, GraphId, GraphMemoryConfig,
-        GraphOpenOptions, GraphOperationalMetricsSnapshot, GraphScope, GraphShardRuntimeMetrics,
-        NamespaceId, NamespacePath, ObjectStoreNodeDirectory, PlacementConfig, PlacementView,
-        QueryCellClient, QueryTransportMetricsSnapshot, ScopedGraphShardRuntimeMetrics,
-    };
-    use slatedb::object_store::memory::InMemory;
-
-    use super::*;
-
-    /// Two shards with contrived-but-distinguishable values, so every series in
-    /// `append_node_metrics` renders something a diff can see move.
-    fn shard_metrics() -> Vec<ScopedGraphShardRuntimeMetrics> {
-        let mut first = GraphOperationalMetricsSnapshot {
-            query_graphblas_artifact_snapshots: 11,
-            query_graphblas_rebuilt_snapshots: 22,
-            query_rust_sparse_fallbacks: 33,
-            query_experimental_property_seek_requests: 77,
-            query_experimental_relationship_expand_requests: 88,
-            query_experimental_ordered_property_scan_requests: 99,
-            ..Default::default()
-        };
-        first.query_rows_latency.bucket_counts[0] = 4;
-        first.query_rows_latency.bucket_counts[3] = 2;
-        first.query_rows_latency.bucket_counts[17] = 1;
-        first.query_rows_latency.sum_us = 31_000_909;
-        first.query_rows_duration_us = first.query_rows_latency.sum_us;
-
-        let second = GraphOperationalMetricsSnapshot {
-            query_graphblas_artifact_snapshots: 44,
-            query_graphblas_rebuilt_snapshots: 55,
-            query_rust_sparse_fallbacks: 66,
-            ..Default::default()
-        };
-
-        [("cell-a", first), ("cell-b", second)]
-            .into_iter()
-            .map(|(cell_id, operational)| ScopedGraphShardRuntimeMetrics {
-                scope: GraphScope::default(),
-                shard: GraphShardRuntimeMetrics {
-                    cell_id: cell_id.to_string(),
-                    operational,
-                    cache: GraphCacheMetricsSnapshot::default(),
-                    cache_entries: Default::default(),
-                    cache_resident_bytes: Default::default(),
-                    storage: Default::default(),
-                },
-            })
-            .collect()
-    }
-
-    /// A query service over a routed cluster that never opens a scope. Enough
-    /// to drive the handler; the counters it reports are all zero, which is
-    /// what a freshly booted node reports too.
-    fn query_service() -> ClientQueryService {
-        let directory =
-            ObjectStoreNodeDirectory::new(["cell-a".to_string()], ["graph-node-0".to_string()])
-                .expect("a one-cell directory");
-        let placement = PlacementView::new(
-            "graph-node-0",
-            ["graph-node-0".to_string()],
-            PlacementConfig::default(),
-        )
-        .expect("a fleet of one");
-        let node = Arc::new(
-            ScopedRoutedGraphCluster::new(
-                "graph/data",
-                NamespacePath::default(),
-                GraphId::default(),
-                "graph-node-0",
-                directory,
-                placement,
-                Arc::new(InMemory::new()),
-                GraphOpenOptions::default(),
-                GraphMemoryConfig::default(),
-                4,
-            )
-            .expect("a routed cluster"),
-        );
-        ClientQueryService::new(
-            node as Arc<dyn QueryCellClient>,
-            ClientQueryServiceConfig::default(),
-        )
-        .expect("a query service")
-    }
-
-    /// The whole `/metrics` document, rendered through the real handler.
-    ///
-    /// Shard series are appended separately because a cluster that has opened
-    /// no scope reports no shards, and the labelled half of the endpoint is
-    /// exactly the half a rename would break.
-    async fn rendered_metrics() -> String {
-        let directory =
-            ObjectStoreNodeDirectory::new(["cell-a".to_string()], ["graph-node-0".to_string()])
-                .expect("a one-cell directory");
-        let placement = PlacementView::new(
-            "graph-node-0",
-            ["graph-node-0".to_string()],
-            PlacementConfig::default(),
-        )
-        .expect("a fleet of one");
-        let routed_node = Arc::new(
-            ScopedRoutedGraphCluster::new(
-                "graph/data",
-                NamespacePath::default(),
-                GraphId::default(),
-                "graph-node-0",
-                directory,
-                placement.clone(),
-                Arc::new(InMemory::new()),
-                GraphOpenOptions::default(),
-                GraphMemoryConfig::default(),
-                4,
-            )
-            .expect("a routed cluster"),
-        );
-        let ready = NodeReadiness::new(placement);
-        ready.mark_ready();
-        let state = AdminState {
-            ready,
-            query: query_service(),
-            routed_node,
-            memory_sampler: memory_sampler::MemorySampler::start(),
-            control_token: Arc::from("unused-by-the-metrics-handler"),
-        };
-
-        let response = metrics(State(state)).await;
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a complete body");
-        let mut document = String::from_utf8(body.to_vec()).expect("utf-8");
-        append_node_metrics(&mut document, &shard_metrics());
-        document
-    }
-
-    /// Writes `/metrics` to `$HYDRADB_METRICS_CAPTURE` when it is set, so the
-    /// endpoint can be diffed across a change to it. Asserts nothing on its
-    /// own: the assertion is the diff.
-    #[tokio::test]
-    async fn capture_metrics_document() {
-        let document = rendered_metrics().await;
-        if let Ok(path) = std::env::var("HYDRADB_METRICS_CAPTURE") {
-            std::fs::write(path, &document).expect("capture is writable");
-        }
-        assert!(document.contains("graph_runtime_ready 1\n"));
-    }
-
-    /// The build-info series opens the document, so `curl … | head -2` names
-    /// the build. Asserted on the rendered endpoint rather than on
-    /// `prometheus_gauge` alone because what can regress here is the wiring —
-    /// a future edit that appends the gauge instead of seeding `output` with
-    /// it would still pass a test of the telemetry crate.
-    #[tokio::test]
-    async fn metrics_open_with_the_build_info_series() {
-        let document = rendered_metrics().await;
-        let mut lines = document.lines();
-        assert_eq!(lines.next(), Some("# TYPE graph_build_info gauge"));
-        let series = lines.next().expect("a build_info series");
-        assert!(series.starts_with("graph_build_info{"), "{series}");
-        assert!(series.ends_with("} 1"), "{series}");
-        assert!(series.contains("commit=\""), "{series}");
-        // The series the endpoint used to open with is still present and
-        // unchanged; this gauge was added ahead of it, not in place of it.
-        assert!(document.contains("graph_runtime_ready 1\n"));
-    }
-
-    #[test]
-    fn slatedb_cache_metrics_report_the_actual_ram_budget() {
-        let mut output = String::new();
-        append_slatedb_cache_metrics(
-            &mut output,
-            hydradb::SlateDbCacheMetricsSnapshot {
-                capacity_bytes: 671_088_640,
-                resident_bytes: 12_345,
-                entries: 7,
-            },
-        );
-        assert!(output.contains("graph_slatedb_cache_capacity_bytes 671088640\n"));
-        assert!(output.contains("graph_slatedb_cache_resident_bytes 12345\n"));
-        assert!(output.contains("graph_slatedb_cache_entries 7\n"));
-    }
-
-    #[tokio::test]
-    async fn blocked_shard_collection_is_cancelled_without_publishing_false_zeroes() {
-        let mut output = String::from("graph_runtime_ready 1\n");
-        append_bounded_node_metrics(
-            &mut output,
-            std::future::pending(),
-            std::time::Duration::from_millis(1),
-        )
-        .await;
-        crate::otel_metrics::memory_diagnostics::append(&mut output);
-        assert!(output.contains("graph_runtime_shard_metrics_collection_success 0\n"));
-        assert!(output.contains("graph_memory_diagnostic_items{"));
-        assert!(!output.contains("graph_storage_total_mem_size_bytes"));
-        let mut completed = String::new();
-        append_bounded_node_metrics(
-            &mut completed,
-            std::future::ready(shard_metrics()),
-            std::time::Duration::from_secs(1),
-        )
-        .await;
-        assert!(completed.contains("graph_runtime_shard_metrics_collection_success 1\n"));
-        assert!(completed.contains("graph_storage_total_mem_size_bytes"));
-    }
-
-    #[test]
-    fn process_memory_metrics_render_rss_and_allocator_accounting() {
-        let mut output = String::new();
-        append_process_memory_metrics(
-            &mut output,
-            ProcessMemoryMetrics {
-                resident_bytes: 13_521_796 * 1024,
-                allocator_arena_bytes: 11_396_000_000,
-                allocator_arena_in_use_bytes: 1_234_000_000,
-                allocator_arena_free_bytes: 10_162_000_000,
-                allocator_mmap_bytes: 4_000_000_000,
-                allocator_live_bytes: 5_234_000_000,
-                open_file_descriptors: Some(377),
-                open_file_descriptor_soft_limit: Some(65_536),
-            },
-        );
-
-        for line in [
-            "# TYPE graph_process_resident_memory_bytes gauge\n",
-            "# TYPE graph_process_allocator_arena_bytes gauge\n",
-            "# TYPE graph_process_allocator_arena_in_use_bytes gauge\n",
-            "# TYPE graph_process_allocator_arena_free_bytes gauge\n",
-            "# TYPE graph_process_allocator_mmap_bytes gauge\n",
-            "# TYPE graph_process_allocator_live_bytes gauge\n",
-            "graph_process_resident_memory_bytes 13846319104\n",
-            "graph_process_allocator_arena_bytes 11396000000\n",
-            "graph_process_allocator_arena_in_use_bytes 1234000000\n",
-            "graph_process_allocator_arena_free_bytes 10162000000\n",
-            "graph_process_allocator_mmap_bytes 4000000000\n",
-            "graph_process_allocator_live_bytes 5234000000\n",
-            "graph_process_open_file_descriptors 377\n",
-            "graph_process_open_file_descriptor_soft_limit 65536\n",
-        ] {
-            assert!(output.contains(line), "{line:?} did not render");
-        }
-    }
-
-    #[test]
-    fn linux_rss_parser_requires_a_valid_vmrss_row() {
-        assert_eq!(
-            parse_linux_rss_bytes("Name:\tgraph-node\nVmRSS:\t13521796 kB\n"),
-            Some(13_521_796 * 1024)
-        );
-        assert_eq!(parse_linux_rss_bytes("VmSize:\t13521796 kB\n"), None);
-        assert_eq!(parse_linux_rss_bytes("VmRSS:\tnot-a-number kB\n"), None);
-    }
-
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    #[test]
-    fn linux_process_memory_snapshot_reads_rss_and_glibc_allocator() {
-        let memory = process_memory_metrics().expect("Linux procfs and glibc are available");
-        assert!(memory.resident_bytes > 0);
-        assert!(memory.allocator_arena_bytes >= memory.allocator_arena_free_bytes);
-        assert!(memory.allocator_live_bytes >= memory.allocator_mmap_bytes);
-        assert!(memory.open_file_descriptors.is_some_and(|open| open > 0));
-        assert!(memory
-            .open_file_descriptor_soft_limit
-            .is_some_and(|limit| limit > 0));
-    }
-
-    /// The histogram family is **additive**. Every series this endpoint served
-    /// before it existed keeps its exact name, its exact labels and its exact
-    /// value -- a scraper's recording rules and every dashboard built on them
-    /// are downstream of these strings, and renaming one is a silent outage in
-    /// a dashboard rather than a loud one here.
-    #[test]
-    fn experimental_operator_families_render_per_cell_and_operator() {
-        let operator = |requests| ExperimentalOperatorMetricsSnapshot {
-            operator: "ExpandExec",
-            requests,
-            invocations: 3,
-            hydrated_vertices: 40,
-            ..Default::default()
-        };
-        let mut metrics = shard_metrics();
-        metrics[0].shard.operational.experimental_operators = vec![operator(2)];
-        // A second scope on the same cell sums into the same series.
-        let mut same_cell = metrics[0].clone();
-        same_cell.scope = GraphScope::new(
-            NamespacePath::new([NamespaceId::new("other").unwrap()]).unwrap(),
-            GraphId::default(),
-        );
-        same_cell.shard.operational.experimental_operators = vec![operator(5)];
-        metrics.push(same_cell);
-        let mut output = String::new();
-        append_experimental_operator_families(&mut output, &metrics);
-        for (index, (field, _)) in EXPERIMENTAL_OPERATOR_FAMILIES.iter().enumerate() {
-            assert_eq!(
-                ExperimentalOperatorMetricsSnapshot::default().counter_fields()[index].0,
-                *field
-            );
-        }
-        assert!(
-            output.contains("# TYPE graph_query_experimental_operator_estimate_misses counter\n")
-        );
-        let cell = &metrics[0].shard.cell_id;
-        assert!(output.contains(&format!(
-            "graph_query_experimental_operator_requests{{cell_id=\"{cell}\",operator=\"ExpandExec\"}} 7\n"
-        )));
-        assert!(output.contains(&format!(
-            "graph_query_experimental_operator_hydrated_vertices{{cell_id=\"{cell}\",operator=\"ExpandExec\"}} 80\n"
-        )));
-        assert!(!output.contains("scope="));
-    }
-
-    #[tokio::test]
-    async fn the_pre_existing_series_are_untouched() {
-        let document = rendered_metrics().await;
-        for line in [
-            "# TYPE graph_runtime_ready gauge\n",
-            "graph_runtime_ready 1\n",
-            "# TYPE graph_query_started counter\ngraph_query_started 0\n",
-            "# TYPE graph_query_completed counter\ngraph_query_completed 0\n",
-            "# TYPE graph_query_failed counter\ngraph_query_failed 0\n",
-            "# TYPE graph_query_auth_failures counter\ngraph_query_auth_failures 0\n",
-            "# TYPE graph_query_scope_denials counter\ngraph_query_scope_denials 0\n",
-            "graph_query_graphblas_artifact_snapshots{scope=\"default/graphs/default\",cell_id=\"cell-a\"} 11\n",
-            "graph_query_graphblas_rebuilt_snapshots{scope=\"default/graphs/default\",cell_id=\"cell-a\"} 22\n",
-            "graph_query_rust_sparse_fallbacks{scope=\"default/graphs/default\",cell_id=\"cell-b\"} 66\n",
-            "graph_cache_entries{scope=\"default/graphs/default\",cell_id=\"cell-a\",cache=\"graphblas_matrices\"} 0\n",
-            "graph_cache_resident_bytes{scope=\"default/graphs/default\",cell_id=\"cell-b\",cache=\"relationship_rows\"} 0\n",
-        ] {
-            assert!(document.contains(line), "{line:?} no longer appears");
-        }
-    }
-
-    #[tokio::test]
-    async fn experimental_operator_requests_render_per_cell() {
-        let document = rendered_metrics().await;
-        for line in [
-            "# TYPE graph_query_experimental_property_seek_requests counter\n",
-            "# TYPE graph_query_experimental_relationship_expand_requests counter\n",
-            "# TYPE graph_query_experimental_ordered_property_scan_requests counter\n",
-            "graph_query_experimental_property_seek_requests{cell_id=\"cell-a\"} 77\n",
-            "graph_query_experimental_relationship_expand_requests{cell_id=\"cell-a\"} 88\n",
-            "graph_query_experimental_ordered_property_scan_requests{cell_id=\"cell-a\"} 99\n",
-            "graph_query_experimental_property_seek_requests{cell_id=\"cell-b\"} 0\n",
-            "graph_query_experimental_relationship_expand_requests{cell_id=\"cell-b\"} 0\n",
-            "graph_query_experimental_ordered_property_scan_requests{cell_id=\"cell-b\"} 0\n",
-        ] {
-            assert!(document.contains(line), "{line:?} did not render");
-        }
-    }
-
-    /// The SlateDB storage-engine families declare their `# TYPE` and render one
-    /// series per (scope, cell_id), the same shape as the cache gauges. The
-    /// fixture opens no real store, so the values are the zero snapshot -- this
-    /// asserts the wiring renders, not the counts.
-    #[tokio::test]
-    async fn the_storage_families_render_per_scope() {
-        let document = rendered_metrics().await;
-        for line in [
-            "# TYPE graph_storage_l0_sst_count gauge\n",
-            "# TYPE graph_storage_scan_requests counter\n",
-            "# TYPE graph_storage_get_requests counter\n",
-            "# TYPE graph_storage_sst_filter_checks counter\n",
-            "# TYPE graph_storage_compaction_bytes counter\n",
-            "# TYPE graph_storage_write_bytes counter\n",
-            "# TYPE graph_storage_block_cache_accesses counter\n",
-            "# TYPE graph_storage_object_store_requests counter\n",
-            "graph_storage_l0_sst_count{scope=\"default/graphs/default\",cell_id=\"cell-a\"} 0\n",
-            "graph_storage_scan_requests{scope=\"default/graphs/default\",cell_id=\"cell-a\"} 0\n",
-            "graph_storage_backpressure_writes{scope=\"default/graphs/default\",cell_id=\"cell-a\"} 0\n",
-            "graph_storage_sst_filter_checks{scope=\"default/graphs/default\",cell_id=\"cell-a\",kind=\"prefix\",outcome=\"positive\"} 0\n",
-            "graph_storage_write_bytes{scope=\"default/graphs/default\",cell_id=\"cell-a\",stage=\"memtable\"} 0\n",
-            "graph_storage_block_cache_accesses{scope=\"default/graphs/default\",cell_id=\"cell-a\",entry_kind=\"filter\",result=\"miss\"} 0\n",
-            "graph_storage_object_store_requests{scope=\"default/graphs/default\",cell_id=\"cell-a\",op=\"get\"} 0\n",
-        ] {
-            assert!(document.contains(line), "{line:?} did not render");
-        }
-    }
-
-    /// `_count` is derived by summing the buckets, so it and `le="+Inf"` are
-    /// equal by construction rather than by two `fetch_add`s staying in step.
-    /// The rendering must not lose that.
-    #[tokio::test]
-    async fn the_count_line_equals_the_overflow_bucket() {
-        let document = rendered_metrics().await;
-        let labels = "{scope=\"default/graphs/default\",cell_id=\"cell-a\"";
-        assert!(document.contains(&format!(
-            "graph_query_rows_duration_microseconds_bucket{labels},le=\"+Inf\"}} 7\n"
-        )));
-        assert!(document.contains(&format!(
-            "graph_query_rows_duration_microseconds_count{labels}}} 7\n"
-        )));
-        assert!(document.contains(&format!(
-            "graph_query_rows_duration_microseconds_sum{labels}}} 31000909\n"
-        )));
-    }
-
-    /// The seconds family is the one that can be wrong by a factor of a
-    /// million, and the `le` bounds are the join between the two exports: an
-    /// `0.000100000` here against a `0.0001` in OTLP is two series that look
-    /// like one.
-    #[tokio::test]
-    async fn the_client_family_renders_seconds() {
-        let document = rendered_metrics().await;
-        assert!(
-            document.contains("# TYPE graph_client_operation_read_duration_seconds histogram\n")
-        );
-        assert!(document.contains(
-            "graph_client_operation_read_duration_seconds_bucket{cypher_engine=\"legacy\",le=\"0.0001\"} 0\n"
-        ));
-        assert!(document.contains(
-            "graph_client_operation_write_duration_seconds_bucket{cypher_engine=\"legacy\",le=\"30\"} 0\n"
-        ));
-        assert!(document.contains(
-            "graph_client_operation_write_duration_seconds_count{cypher_engine=\"legacy\"} 0\n"
-        ));
-    }
-
-    /// The engine label is the one dimension the client family carries, and
-    /// both values render on every node, whatever it is configured or
-    /// overridden to: the histograms are per engine, so a node the kill switch
-    /// has flipped holds two populations and neither may inherit the other's
-    /// observations. An engine that has run nothing renders at zero rather
-    /// than going absent, so a panel keeps its series across a flip.
-    #[tokio::test]
-    async fn the_client_family_carries_the_engine_that_ran_each_population() {
-        let document = rendered_metrics().await;
-        // One `# TYPE` per family however many engines carry it: a repeated
-        // one is a rejected scrape.
-        for family in [
-            "graph_client_operation_read_duration_seconds",
-            "graph_client_operation_write_duration_seconds",
-        ] {
-            assert_eq!(
-                document
-                    .lines()
-                    .filter(|line| *line == format!("# TYPE {family} histogram"))
-                    .count(),
-                1,
-                "{family} declared its type twice"
-            );
-        }
-        for engine in ["legacy", "experimental"] {
-            assert_eq!(
-                document
-                    .lines()
-                    .filter(|line| line.starts_with("graph_client_operation_")
-                        && line.contains(&format!("cypher_engine=\"{engine}\"")))
-                    .count(),
-                // Two families, each one `_bucket` per ladder bucket (`+Inf`
-                // included) plus `_sum` and `_count`.
-                2 * (hydradb::DURATION_BUCKET_COUNT + 2),
-                "{engine} is missing from the client families"
-            );
-        }
-        assert!(
-            hydradb_telemetry::semconv::METRIC_LABELS
-                .iter()
-                .any(|label| label.key() == format!("hydradb.{CYPHER_ENGINE_LABEL}")),
-            "the Prometheus label and the registry key have drifted",
-        );
-        // And only the execution families: a labelled bookmark-wait series
-        // would split the one ratio that family exists for.
-        assert!(
-            !document
-                .lines()
-                .any(|line| line.starts_with("graph_client_bookmark_wait")
-                    && line.contains(CYPHER_ENGINE_LABEL)),
-            "the bookmark-wait family took the engine label"
-        );
-    }
-
-    /// The failure-reason family: every valid label combination renders at
-    /// zero, so a `rate()` over a bucket that has never failed is a flat line
-    /// rather than an absent series, and every series names the engine.
-    #[tokio::test]
-    async fn the_failure_reason_family_renders_every_bucket_at_zero() {
-        let document = rendered_metrics().await;
-        assert!(document.contains("# TYPE graph_query_failed_by_reason counter\n"));
-        let series: Vec<&str> = document
-            .lines()
-            .filter(|line| line.starts_with("graph_query_failed_by_reason{"))
-            .collect();
-        // 2 engines x 2 stages x 14 reasons; only the query class, so no
-        // error_class. Both engines render on every node: the counters are per
-        // engine, so a flip moves nothing already counted, and an engine that
-        // has failed nothing is a zero rather than an absent series.
-        assert_eq!(series.len(), 2 * 2 * hydradb::QueryFailureReason::COUNT);
-        for engine in ["legacy", "experimental"] {
-            assert_eq!(
-                series
-                    .iter()
-                    .filter(|line| line.contains(&format!("cypher_engine=\"{engine}\"")))
-                    .count(),
-                2 * hydradb::QueryFailureReason::COUNT,
-                "{engine} is missing from the failure-reason family"
-            );
-        }
-        assert_eq!(
-            document
-                .lines()
-                .filter(|line| *line == "# TYPE graph_query_failed_by_reason counter")
-                .count(),
-            1,
-            "the failure-reason family declared its type twice"
-        );
-        assert!(!series.iter().any(|line| line.contains("error_class")));
-        for line in [
-            "graph_query_failed_by_reason{cypher_engine=\"legacy\",stage=\"prepare\",\
-             reason=\"unsupported_where\"} 0",
-            "graph_query_failed_by_reason{cypher_engine=\"legacy\",stage=\"execute\",\
-             reason=\"invalid_request\"} 0",
-            "graph_query_failed_by_reason{cypher_engine=\"experimental\",stage=\"execute\",\
-             reason=\"invalid_request\"} 0",
-        ] {
-            assert!(series.contains(&line), "{line:?} did not render");
-        }
-    }
-
-    /// The bookmark-wait family, end to end through the real handler.
-    ///
-    /// The name table is checked for *consistency* by
-    /// `crate::otel_metrics::tests::every_histogram_field_reaches_both_exports`,
-    /// which proves a field is named in both exports and says nothing about
-    /// whether a byte of it reaches a scraper. This is the other half: the
-    /// series an operator would paste into a dashboard, spelled exactly as
-    /// `/metrics` renders it.
-    ///
-    /// Five counters and a histogram, because the ratio is the point.
-    /// `graph_client_bookmark_waits_polled / graph_client_bookmark_waits` is
-    /// the alert change 4 of
-    /// `docs/plans/2026-08-21-cell-affine-read-routing.md` asks for, and a
-    /// numerator whose denominator failed to render is not alertable — so both
-    /// halves are asserted, and asserted as complete `# TYPE` + series pairs
-    /// rather than as substrings that a prefix of some other family could
-    /// satisfy.
-    #[tokio::test]
-    async fn the_bookmark_wait_family_renders() {
-        let document = rendered_metrics().await;
-        for line in [
-            "# TYPE graph_client_bookmark_waits counter\ngraph_client_bookmark_waits 0\n",
-            "# TYPE graph_client_bookmark_waits_polled counter\ngraph_client_bookmark_waits_polled 0\n",
-            "# TYPE graph_client_bookmark_waits_declined counter\ngraph_client_bookmark_waits_declined 0\n",
-            "# TYPE graph_client_bookmark_waits_on_cell_writer counter\ngraph_client_bookmark_waits_on_cell_writer 0\n",
-            "# TYPE graph_client_bookmark_waits_off_cell_writer counter\ngraph_client_bookmark_waits_off_cell_writer 0\n",
-            "# TYPE graph_client_bookmark_wait_duration_microseconds histogram\n",
-            // Microseconds, not seconds: a `le="0.0001"` here would be the
-            // same measurement read off by a factor of a million, and the
-            // unit is the one thing the two exports may not disagree about.
-            "graph_client_bookmark_wait_duration_microseconds_bucket{le=\"100\"} 0\n",
-            "graph_client_bookmark_wait_duration_microseconds_bucket{le=\"30000000\"} 0\n",
-            "graph_client_bookmark_wait_duration_microseconds_bucket{le=\"+Inf\"} 0\n",
-            "graph_client_bookmark_wait_duration_microseconds_sum 0\n",
-            "graph_client_bookmark_wait_duration_microseconds_count 0\n",
-        ] {
-            assert!(document.contains(line), "{line:?} did not render");
-        }
-        // Process-global, like every other client series: a `cell_id` or
-        // `scope` label would split the one ratio the family exists for.
-        assert!(
-            !document.contains("graph_client_bookmark_waits{"),
-            "the bookmark-wait counters took a label"
-        );
-    }
-
-    /// The transport families render from the same enumeration and the same
-    /// name table as everything else. They are asserted here rather than
-    /// through `/metrics` because both rows are
-    /// `crate::otel_metrics::FieldSource::TransportOnly` -- this binary holds no
-    /// `QueryTransportMetricsSnapshot`, for the reasons that type documents.
-    ///
-    /// So this test *is* the only exercise those two families get, which is why
-    /// it renders them from a hand-built snapshot rather than skipping them: a
-    /// name table row nothing ever renders is a row whose `le` arithmetic and
-    /// unit suffix nobody has checked.
-    #[test]
-    fn the_transport_families_render_from_the_same_enumeration() {
-        let mut snapshot = QueryTransportMetricsSnapshot::default();
-        snapshot.serve_latency.bucket_counts[11] = 3;
-        snapshot.serve_latency.bucket_counts[17] = 2;
-        snapshot.serve_latency.sum_us = 91_500_000;
-        snapshot.remote_latency_us = snapshot.serve_latency.sum_us;
-
-        let mut output = String::new();
-        append_histogram_types(&mut output, snapshot.histogram_fields());
-        append_histograms(&mut output, snapshot.histogram_fields(), &[]);
-
-        assert!(
-            output.contains("# TYPE graph_query_transport_rpc_duration_microseconds histogram\n")
-        );
-        assert!(
-            output.contains("# TYPE graph_query_transport_serve_duration_microseconds histogram\n")
-        );
-        // 500ms is a pinned bound because it is `slow_query_log_threshold`:
-        // the mass above it and the `slow_queries` counter are the same event,
-        // so the cumulative count *at* the bound is what reconciles them.
-        assert!(output.contains(
-            "graph_query_transport_serve_duration_microseconds_bucket{le=\"500000\"} 3\n"
-        ));
-        assert!(output
-            .contains("graph_query_transport_serve_duration_microseconds_bucket{le=\"+Inf\"} 5\n"));
-        assert!(output.contains("graph_query_transport_serve_duration_microseconds_count 5\n"));
-        assert!(output.contains("graph_query_transport_rpc_duration_microseconds_count 0\n"));
-    }
-
-    /// Two tenants on one node share a `cell_id`, and the counters that carry
-    /// no `scope` must therefore be **summed**, not emitted twice.
-    ///
-    /// This is the failure mode the shape decision exists to avoid, and it is a
-    /// hard one: `graph_write_attempts{cell_id="cell-a"}` appearing twice with
-    /// two values in a single scrape is not a wrong number, it is a rejected
-    /// scrape — Prometheus drops the whole response.
-    #[test]
-    fn per_cell_counters_are_summed_across_scopes() {
-        let shards: Vec<ScopedGraphShardRuntimeMetrics> = [("alpha", 3u64), ("beta", 4u64)]
-            .into_iter()
-            .map(|(tenant, writes)| ScopedGraphShardRuntimeMetrics {
-                scope: GraphScope::tenant(
-                    NamespaceId::new(tenant).expect("a valid namespace id"),
-                    GraphId::default(),
-                ),
-                shard: GraphShardRuntimeMetrics {
-                    cell_id: "cell-a".to_string(),
-                    operational: GraphOperationalMetricsSnapshot {
-                        write_attempts: writes,
-                        ..Default::default()
-                    },
-                    cache: GraphCacheMetricsSnapshot {
-                        matrix_artifact_hits: writes * 10,
-                        ..Default::default()
-                    },
-                    cache_entries: Default::default(),
-                    cache_resident_bytes: Default::default(),
-                    storage: Default::default(),
-                },
-            })
-            .collect();
-
-        let mut output = String::new();
-        append_per_cell_counters(&mut output, &shards);
-
-        assert_eq!(
-            output.matches("graph_write_attempts{").count(),
-            1,
-            "one series per cell, whatever the tenant count: {output}"
-        );
-        assert!(output.contains("graph_write_attempts{cell_id=\"cell-a\"} 7\n"));
-        assert!(output.contains("graph_cache_matrix_artifact_hits{cell_id=\"cell-a\"} 70\n"));
-    }
-
-    /// A histogram that does not carry `scope` must be **summed** across the
-    /// scopes sharing its cell, not rendered once per scope.
-    ///
-    /// This is the counters' `PerCell` hazard applied to a family with twenty
-    /// series instead of one: every scope on a query node runs the same
-    /// `GRAPH_CELL_ID`, so two open scopes would otherwise emit
-    /// `..._bucket{cell_id="cell-a",le="100"}` twice in a single scrape with
-    /// different values, which Prometheus rejects outright. The failure is a
-    /// rejected scrape of the *whole endpoint*, not a wrong number on one
-    /// family, which is why it is worth a test of its own rather than trusting
-    /// the label list.
-    #[test]
-    fn a_scopeless_histogram_is_summed_across_scopes_sharing_a_cell() {
-        // Deliberately different observations per scope: a merge that took one
-        // shard and dropped the other would still emit one series, and only the
-        // arithmetic tells the two apart.
-        let shards: Vec<ScopedGraphShardRuntimeMetrics> = [("alpha", 100u64), ("beta", 2_500u64)]
-            .into_iter()
-            .map(|(tenant, micros)| {
-                let mut fetches = DurationHistogramSnapshot::default();
-                fetches.bucket_counts[bucket_of(micros)] = 3;
-                fetches.sum_us = micros * 3;
-                ScopedGraphShardRuntimeMetrics {
-                    scope: GraphScope::tenant(
-                        NamespaceId::new(tenant).expect("a valid namespace id"),
-                        GraphId::default(),
-                    ),
-                    shard: GraphShardRuntimeMetrics {
-                        cell_id: "cell-a".to_string(),
-                        operational: GraphOperationalMetricsSnapshot {
-                            query_property_fetch_latency: fetches,
-                            ..Default::default()
-                        },
-                        cache: Default::default(),
-                        cache_entries: Default::default(),
-                        cache_resident_bytes: Default::default(),
-                        storage: Default::default(),
-                    },
-                }
-            })
-            .collect();
-
-        let mut output = String::new();
-        append_node_metrics(&mut output, &shards);
-
-        for suffix in ["_sum", "_count"] {
-            assert_eq!(
-                output
-                    .matches(&format!(
-                        "graph_query_property_fetch_duration_microseconds{suffix}{{"
-                    ))
-                    .count(),
-                1,
-                "one series per cell however many scopes are open: {output}"
-            );
-        }
-        assert_eq!(
-            output
-                .matches("graph_query_property_fetch_duration_microseconds_bucket{cell_id=\"cell-a\",le=\"100\"}")
-                .count(),
-            1,
-            "a duplicated bucket line is a rejected scrape: {output}"
-        );
-        // 3 + 3 observations, 300 + 7500 microseconds: both shards, added.
-        assert!(output.contains(
-            "graph_query_property_fetch_duration_microseconds_count{cell_id=\"cell-a\"} 6\n"
-        ));
-        assert!(output.contains(
-            "graph_query_property_fetch_duration_microseconds_sum{cell_id=\"cell-a\"} 7800\n"
-        ));
-        // The scoped family beside it is untouched: one series per scope still.
-        assert_eq!(
-            output
-                .matches("graph_query_rows_duration_microseconds_count{scope=")
-                .count(),
-            2,
-            "a family that carries scope keeps one series per scope: {output}"
-        );
-    }
-
-    /// The bucket a duration lands in, derived from the exported bounds rather
-    /// than hardcoded, so the test does not have to be rewritten when the
-    /// ladder changes.
-    fn bucket_of(micros: u64) -> usize {
-        hydradb::DURATION_BUCKET_BOUNDS_US.partition_point(|bound| *bound < micros)
-    }
-
-    /// `scope` is unbounded per tenant, so the families that carry it are a
-    /// fixed list of six and nothing may join them.
-    ///
-    /// Six, not the five §1.4 counted: `8d7e939` gave the shard row-query
-    /// histogram the same `{scope, cell_id}` labels as the counters it sits
-    /// beside, which was the consistent choice at the time and is the sixth
-    /// family here. Every other series on this endpoint is either process-global
-    /// or keyed by `cell_id` alone.
-    #[tokio::test]
-    async fn only_the_pre_existing_families_carry_a_scope_label() {
-        const SCOPED: &[&str] = &[
-            "graph_query_graphblas_artifact_snapshots",
-            "graph_query_graphblas_rebuilt_snapshots",
-            "graph_query_rust_sparse_fallbacks",
-            "graph_cache_entries",
-            "graph_cache_resident_bytes",
-            "graph_query_rows_duration_microseconds",
-            // SlateDB storage-engine gauges/counters, one series per (scope,
-            // cell_id) like the cache families above. Bounded the same way:
-            // scope count is the number of graphs open on the node, cell_id is
-            // one value per node.
-            "graph_storage_l0_sst_count",
-            "graph_storage_segment_max_l0_sst_count",
-            "graph_storage_immutable_memtable_flushes",
-            "graph_storage_get_requests",
-            "graph_storage_scan_requests",
-            "graph_storage_total_mem_size_bytes",
-            // The proof set for the prefix-scan work: filter outcomes carry
-            // fixed {kind, outcome} pairs (2×3), write bytes a fixed 3-value
-            // {stage}, cache accesses a fixed {entry_kind, result} (2×2),
-            // object-store requests a fixed 2-value {op}. All sub-labels are
-            // enumerated in the render loops, so per-scope cardinality stays a
-            // constant 27 series.
-            "graph_storage_sst_filter_checks",
-            "graph_storage_backpressure_writes",
-            "graph_storage_l0_write_stalls",
-            "graph_storage_compaction_bytes",
-            "graph_storage_running_compactions",
-            "graph_storage_last_compaction_timestamp_sec",
-            "graph_storage_write_bytes",
-            "graph_storage_block_cache_accesses",
-            "graph_storage_object_store_requests",
-        ];
-        for line in rendered_metrics().await.lines() {
-            if !line.contains("scope=\"") {
-                continue;
-            }
-            let name = line.split(['{', ' ']).next().unwrap_or_default();
-            assert!(
-                SCOPED.iter().any(|family| name.starts_with(family)),
-                "{name} is a new series carrying an unbounded scope label"
-            );
-        }
-    }
-}
 // weave: run 'weave explain src/bin/graph_node/admin.rs' for per-hunk detail, 'weave check' to verify your resolution
