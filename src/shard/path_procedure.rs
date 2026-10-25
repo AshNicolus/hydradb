@@ -8,7 +8,7 @@ use super::topology_tail::GraphTopologyOverlay;
 use super::*;
 use crate::query::path_procedure::{
     NativePathDirection, NativePathNodeSelector, NativePathProcedure, NativePathProcedureKind,
-    NativePathProjection,
+    NativePathProjection, NativeProcedure,
 };
 use crate::QueryFailureReason;
 use crate::{
@@ -19,10 +19,15 @@ use crate::{
 const MAX_NATIVE_PATH_PAGE_CURSORS: usize = 1_024;
 const MAX_NATIVE_PATH_PAGE_CURSOR_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_PATH_PAGE_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-const NATIVE_PATH_HYDRATION_CONCURRENCY: usize = 16;
+// Point reads in flight while a path call hydrates relationships and
+// vertices. A seed's neighbours are scattered across the keyspace, so on a
+// cold scope nearly every read is its own object-store round trip and the
+// hydration takes about `reads / concurrency` of them: at 16, a 960-edge hub
+// cost seconds of S3 latency per call.
+const NATIVE_PATH_HYDRATION_CONCURRENCY: usize = 64;
 const NATIVE_PATH_SELECTOR_HYDRATION_BATCH_SIZE: usize = 256;
 
-enum PathTopologySource {
+pub(super) enum PathTopologySource {
     Compiled {
         matrix: Arc<crate::sparse_kernel::CompiledGraphBlasMatrix>,
         overlay: Option<GraphTopologyOverlay>,
@@ -30,9 +35,76 @@ enum PathTopologySource {
     Storage,
 }
 
-struct TypedPathTopology {
-    edge_type: String,
-    source: PathTopologySource,
+pub(super) struct TypedPathTopology {
+    pub(super) edge_type: String,
+    pub(super) source: PathTopologySource,
+}
+
+// Planning and execution share the same directional access decision. A cold
+// compiled reverse index must never be built as a side effect of a path query:
+// full-index shards can use the pinned incoming storage index; outbound-only
+// shards need a bounded scan of their forward topology instead.
+enum NativePathNeighborAccess<'a> {
+    CompiledReverseScan {
+        matrix: &'a crate::sparse_kernel::CompiledGraphBlasMatrix,
+        overlay: Option<&'a GraphTopologyOverlay>,
+        scan_work: u64,
+    },
+    StorageReverseScan,
+    Compiled {
+        matrix: &'a crate::sparse_kernel::CompiledGraphBlasMatrix,
+        overlay: Option<&'a GraphTopologyOverlay>,
+        scan_work: u64,
+    },
+    Storage,
+}
+
+impl TypedPathTopology {
+    fn neighbor_access(
+        &self,
+        vertex: VertexId,
+        incoming: bool,
+        reverse_storage: bool,
+    ) -> NativePathNeighborAccess<'_> {
+        match &self.source {
+            PathTopologySource::Compiled { matrix, overlay } => {
+                let degree = if incoming {
+                    crate::sparse_kernel::compiled_graphblas_cached_in_degree(matrix, vertex)
+                } else {
+                    Some(crate::sparse_kernel::compiled_graphblas_out_degree(
+                        matrix, vertex,
+                    ))
+                };
+                match degree {
+                    Some(degree) => NativePathNeighborAccess::Compiled {
+                        matrix,
+                        overlay: overlay.as_ref(),
+                        scan_work: degree.saturating_add(overlay.as_ref().map_or(0, |overlay| {
+                            if incoming {
+                                overlay.in_neighbor_scan_work()
+                            } else {
+                                overlay.out_neighbor_scan_work(vertex)
+                            }
+                        })),
+                    },
+                    None if reverse_storage => NativePathNeighborAccess::Storage,
+                    None => NativePathNeighborAccess::CompiledReverseScan {
+                        matrix,
+                        overlay: overlay.as_ref(),
+                        scan_work: matrix.in_neighbor_scan_work().saturating_add(
+                            overlay
+                                .as_ref()
+                                .map_or(0, GraphTopologyOverlay::in_neighbor_scan_work),
+                        ),
+                    },
+                }
+            }
+            PathTopologySource::Storage if incoming && !reverse_storage => {
+                NativePathNeighborAccess::StorageReverseScan
+            }
+            PathTopologySource::Storage => NativePathNeighborAccess::Storage,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -59,12 +131,33 @@ struct NativePathRead<'a> {
     budget: &'a QueryBudget,
 }
 
+struct NativePathFrontier {
+    vertices: BTreeSet<VertexId>,
+    seen: BTreeSet<VertexId>,
+    direction: NativePathDirection,
+    depth: u8,
+    scan_cost: Option<u64>,
+}
+
+impl NativePathFrontier {
+    fn new(seeds: &[VertexId], direction: NativePathDirection) -> Self {
+        let seen = seeds.iter().copied().collect::<BTreeSet<_>>();
+        Self {
+            vertices: seen.clone(),
+            seen,
+            direction,
+            depth: 0,
+            scan_cost: None,
+        }
+    }
+}
+
 impl GraphShard {
     pub(crate) async fn execute_native_path_rows_page(
         &self,
         context: QueryContext,
         query: &str,
-        procedure: NativePathProcedure,
+        procedure: NativeProcedure,
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
@@ -84,7 +177,7 @@ impl GraphShard {
         let scope = context.scope.clone();
         let cell_id = context.cell_id.clone();
         let parameters = context.parameters.clone();
-        let result = self.execute_native_path_rows(context, procedure).await?;
+        let result = Box::pin(self.execute_native_procedure_rows(context, procedure)).await?;
         let QueryResultSet {
             columns,
             rows,
@@ -191,16 +284,16 @@ impl GraphShard {
         Ok(QueryResultPage::new(columns, rows, next_cursor))
     }
 
-    pub(crate) async fn execute_native_path_rows(
+    pub(crate) async fn execute_native_procedure_rows(
         &self,
         context: QueryContext,
-        procedure: NativePathProcedure,
+        procedure: NativeProcedure,
     ) -> Result<QueryResultSet> {
         self.operation_metrics
             .query_rows_started
             .fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let procedure_name = procedure.kind.procedure_name();
+        let procedure_name = procedure.procedure_name();
         let span = tracing::info_span!(
             "query.execute",
             hydradb.cell_id = %context.cell_id,
@@ -213,8 +306,7 @@ impl GraphShard {
             error.operation = tracing::field::Empty,
             hydradb.sampling.tail_keep = tracing::field::Empty,
         );
-        let result = self
-            .execute_native_path_rows_snapshot(context, procedure)
+        let result = Box::pin(self.execute_native_procedure_rows_snapshot(context, procedure))
             .instrument(span.clone())
             .await;
         self.operation_metrics
@@ -245,17 +337,16 @@ impl GraphShard {
         result
     }
 
-    async fn execute_native_path_rows_snapshot(
+    async fn execute_native_procedure_rows_snapshot(
         &self,
         context: QueryContext,
-        procedure: NativePathProcedure,
+        procedure: NativeProcedure,
     ) -> Result<QueryResultSet> {
         if context.read_epoch.is_some() && context.validated_read_epoch().is_none() {
             return Err(GraphError::UnsupportedQuery {
                 reason: QueryFailureReason::InvalidRequest,
                 dialect: "OpenCypher",
-                feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot"
-                    .to_string(),
+                feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot".to_string(),
             });
         }
         if context.read_epoch.is_none() {
@@ -268,12 +359,27 @@ impl GraphShard {
             let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
             return GraphStore::scope_snapshot(
                 snapshot,
-                self.execute_native_path_rows_inner(context, procedure),
+                self.execute_native_procedure_rows_inner(context, procedure),
             )
             .await;
         }
-        self.execute_native_path_rows_inner(context, procedure)
+        self.execute_native_procedure_rows_inner(context, procedure)
             .await
+    }
+
+    async fn execute_native_procedure_rows_inner(
+        &self,
+        context: QueryContext,
+        procedure: NativeProcedure,
+    ) -> Result<QueryResultSet> {
+        match procedure {
+            NativeProcedure::Path(procedure) => {
+                Box::pin(self.execute_native_path_rows_inner(context, *procedure)).await
+            }
+            NativeProcedure::Degree(procedure) => {
+                Box::pin(self.execute_native_degree_rows_inner(context, procedure)).await
+            }
+        }
     }
 
     async fn execute_native_path_rows_inner(
@@ -339,7 +445,7 @@ impl GraphShard {
         tracing::Span::current().record("hydradb.query.result_cache", "miss");
 
         let topologies = self
-            .native_path_topologies(&context.cell_id, &procedure, read_epoch, &budget)
+            .native_path_topologies(&context.cell_id, &procedure.rel_types, read_epoch, &budget)
             .await?;
         let read = NativePathRead {
             snapshot: snapshot.as_ref(),
@@ -444,16 +550,29 @@ impl GraphShard {
                     }
                     continue;
                 }
-                let mut candidates = self
-                    .expand_native_path_relationships(
+                let prefetch = native_path_vertex_prefetch(
+                    &scalar,
+                    &candidates,
+                    result_limit_usize.saturating_sub(rows.len()),
+                );
+                let (mut candidates, ()) = futures::try_join!(
+                    self.expand_native_path_relationships(
                         read,
                         candidates,
                         &mut relationship_choices_cache,
                         &mut relationship_cache,
                         self.limits.max_query_intermediate_rows,
                         false,
-                    )
-                    .await?;
+                    ),
+                    self.hydrate_vertex_metadata_cache_at_concurrently(
+                        read.cell_id,
+                        &prefetch,
+                        read.read_epoch,
+                        &mut vertex_cache,
+                        read.budget,
+                        NATIVE_PATH_HYDRATION_CONCURRENCY,
+                    ),
+                )?;
                 self.score_native_paths(&scalar, &mut candidates, &relationship_cache, &budget)?;
                 select_native_paths(&scalar, &mut candidates);
                 candidates.truncate(result_limit_usize.saturating_sub(rows.len()));
@@ -461,12 +580,13 @@ impl GraphShard {
                     .iter()
                     .flat_map(|candidate| candidate.nodes.iter().copied())
                     .collect::<Vec<_>>();
-                self.hydrate_vertex_metadata_cache_at(
+                self.hydrate_vertex_metadata_cache_at_concurrently(
                     read.cell_id,
                     &vertex_ids,
                     read.read_epoch,
                     &mut vertex_cache,
                     read.budget,
+                    NATIVE_PATH_HYDRATION_CONCURRENCY,
                 )
                 .await?;
                 for candidate in candidates {
@@ -537,12 +657,13 @@ impl GraphShard {
                 .iter()
                 .flat_map(|candidate| candidate.nodes.iter().copied())
                 .collect::<Vec<_>>();
-            self.hydrate_vertex_metadata_cache_at(
+            self.hydrate_vertex_metadata_cache_at_concurrently(
                 read.cell_id,
                 &vertex_ids,
                 read.read_epoch,
                 &mut vertex_cache,
                 read.budget,
+                NATIVE_PATH_HYDRATION_CONCURRENCY,
             )
             .await?;
             for candidate in candidates {
@@ -617,16 +738,31 @@ impl GraphShard {
                 let encoded = encode_vertex_property_value_key(&property_value);
                 let prefix =
                     keys::vertex_property_index_prefix(read.cell_id, &selector.property, &encoded);
+                // Selector cardinality is unknown until the prefix is consumed. Keep
+                // broad values out of SlateDB's shared block cache; validated results
+                // are bounded below and the snapshot still caches SST metadata.
                 let mut candidates = read
-                    .snapshot
-                    // Selector cardinality is unknown until the prefix is consumed. Keep
-                    // broad values out of SlateDB's shared block cache; validated results
-                    // are bounded below and the snapshot still caches SST metadata.
-                    .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+                    .budget
+                    .read_only_io("native_path_selector", async {
+                        Ok::<_, GraphError>(
+                            read.snapshot
+                                .scan_prefix_with_options(
+                                    prefix.as_bytes(),
+                                    ..,
+                                    &remote_scan_options(),
+                                )
+                                .await?,
+                        )
+                    })
                     .await?;
                 let mut indexed_candidates = Vec::new();
-                while let Some(kv) = candidates.next().await? {
-                    read.budget.check("native_path_selector")?;
+                while let Some(kv) = read
+                    .budget
+                    .read_only_io("native_path_selector", async {
+                        Ok::<_, GraphError>(candidates.next().await?)
+                    })
+                    .await?
+                {
                     let count = raw_candidate_count.fetch_add(1, Ordering::Relaxed) + 1;
                     self.ensure_query_index_candidates("native_path_selector_candidates", count)?;
                     let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -645,12 +781,13 @@ impl GraphShard {
         .collect::<Vec<_>>();
         for batch in indexed_candidates.chunks(NATIVE_PATH_SELECTOR_HYDRATION_BATCH_SIZE) {
             let vertex_ids = batch.iter().map(|(vertex, _)| *vertex).collect::<Vec<_>>();
-            self.hydrate_vertex_metadata_cache_at(
+            self.hydrate_vertex_metadata_cache_at_concurrently(
                 read.cell_id,
                 &vertex_ids,
                 read.read_epoch,
                 vertex_cache,
                 read.budget,
+                NATIVE_PATH_HYDRATION_CONCURRENCY,
             )
             .await?;
             for (vertex, property_value) in batch {
@@ -714,22 +851,25 @@ impl GraphShard {
         Ok(())
     }
 
-    async fn native_path_topologies(
+    pub(super) async fn native_path_topologies(
         &self,
         cell_id: &str,
-        procedure: &NativePathProcedure,
+        rel_types: &[String],
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Vec<TypedPathTopology>> {
-        let mut topologies = Vec::with_capacity(procedure.rel_types.len());
-        for edge_type in &procedure.rel_types {
+        let mut topologies = Vec::with_capacity(rel_types.len());
+        for edge_type in rel_types {
             budget.check("native_path_artifact_lookup")?;
             let source = if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy)
                 == SparseKernelBackend::Adjacency
             {
                 PathTopologySource::Storage
-            } else if let Some(artifact) = self
-                .traced_latest_matrix_artifact(cell_id, edge_type, read_epoch)
+            } else if let Some(artifact) = budget
+                .read_only_io(
+                    "native_path_artifact_lookup",
+                    self.traced_latest_matrix_artifact(cell_id, edge_type, read_epoch),
+                )
                 .await?
             {
                 match self
@@ -767,129 +907,179 @@ impl GraphShard {
         sources: &[VertexId],
         targets: Option<&[VertexId]>,
     ) -> Result<BTreeMap<VertexId, Vec<PathEdge>>> {
-        let (target_relevant, mut edge_visits) = if let Some(targets) = targets {
-            let (vertices, edge_visits) = self
-                .native_path_target_relevant_vertices(read, procedure, topologies, targets)
-                .await?;
-            (Some(vertices), edge_visits)
-        } else {
-            (None, 0)
-        };
-        let mut adjacency = BTreeMap::new();
-        let mut seen = sources
-            .iter()
-            .copied()
-            .filter(|source| {
-                target_relevant
-                    .as_ref()
-                    .is_none_or(|vertices| vertices.contains(source))
-            })
-            .collect::<BTreeSet<_>>();
-        let mut frontier = seen.clone();
-        for depth in 0..procedure.max_len {
-            if frontier.is_empty() {
-                break;
-            }
-            let mut next = BTreeSet::new();
-            for vertex in frontier {
-                read.budget.check("native_path_frontier")?;
-                let (mut edges, scanned_edges) = self
-                    .native_path_successors(
-                        read,
-                        vertex,
-                        procedure.direction,
-                        topologies,
-                        target_relevant.as_ref(),
-                    )
-                    .await?;
-                edge_visits = edge_visits.saturating_add(scanned_edges);
-                if edge_visits > self.limits.max_query_scan_edges {
-                    return Err(GraphError::AdmissionRejected {
-                        operation: "native_path_edges",
-                        actual: edge_visits,
-                        limit: self.limits.max_query_scan_edges,
-                    });
-                }
-                if let Some(vertices) = &target_relevant {
-                    edges.retain(|edge| {
-                        far_endpoint(vertex, edge)
-                            .is_some_and(|neighbor| vertices.contains(&neighbor))
-                    });
-                }
-                if depth + 1 < procedure.max_len {
-                    for edge in &edges {
-                        let neighbor =
-                            far_endpoint(vertex, edge).expect("successor touches source");
-                        if seen.insert(neighbor) {
-                            next.insert(neighbor);
-                        }
-                    }
-                }
-                adjacency.insert(vertex, edges);
-            }
-            if seen.len() > self.limits.max_query_intermediate_rows {
-                return Err(GraphError::AdmissionRejected {
-                    operation: "native_path_vertices",
-                    actual: seen.len() as u64,
-                    limit: self.limits.max_query_intermediate_rows as u64,
-                });
-            }
-            frontier = next;
+        if sources.is_empty() || targets.is_some_and(|targets| targets.is_empty()) {
+            return Ok(BTreeMap::new());
         }
-        Ok(adjacency)
-    }
-
-    async fn native_path_target_relevant_vertices(
-        &self,
-        read: NativePathRead<'_>,
-        procedure: &NativePathProcedure,
-        topologies: &[TypedPathTopology],
-        targets: &[VertexId],
-    ) -> Result<(BTreeSet<VertexId>, u64)> {
+        // Every path of length <= L is covered by a source prefix and a
+        // reverse target suffix whose depths sum to L. Choose the cheaper next
+        // layer rather than forcing a fixed split: an expensive dead source
+        // branch must not prevent a small reverse search from answering.
         let reverse_direction = match procedure.direction {
             NativePathDirection::Outgoing => NativePathDirection::Incoming,
             NativePathDirection::Incoming => NativePathDirection::Outgoing,
             NativePathDirection::Both => NativePathDirection::Both,
         };
-        let mut seen = targets.iter().copied().collect::<BTreeSet<_>>();
-        let mut frontier = seen.clone();
+        let mut source = NativePathFrontier::new(sources, procedure.direction);
+        let mut target = NativePathFrontier::new(targets.unwrap_or_default(), reverse_direction);
+        let mut adjacency: BTreeMap<VertexId, BTreeSet<PathEdge>> = BTreeMap::new();
         let mut edge_visits = 0_u64;
-        for depth in 0..procedure.max_len {
-            if frontier.is_empty() {
+        let mut vertices = source
+            .seen
+            .union(&target.seen)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if vertices.len() > self.limits.max_query_intermediate_rows {
+            return Err(GraphError::AdmissionRejected {
+                operation: "native_path_vertices",
+                actual: vertices.len() as u64,
+                limit: self.limits.max_query_intermediate_rows as u64,
+            });
+        }
+        for layer in 0..procedure.max_len {
+            // An exhausted side has already provided every edge reachable from
+            // that side, so every possible source-target path is represented.
+            if source.vertices.is_empty() || (targets.is_some() && target.vertices.is_empty()) {
                 break;
             }
-            let mut next = BTreeSet::new();
-            for vertex in frontier {
-                read.budget.check("native_path_target_frontier")?;
-                let (edges, scanned_edges) = self
-                    .native_path_successors(read, vertex, reverse_direction, topologies, None)
+            let reverse = if targets.is_some() {
+                let source_cost = self
+                    .native_path_frontier_scan_cost(read, &mut source, topologies)
                     .await?;
-                edge_visits = edge_visits.saturating_add(scanned_edges);
-                if edge_visits > self.limits.max_query_scan_edges {
-                    return Err(GraphError::AdmissionRejected {
-                        operation: "native_path_edges",
-                        actual: edge_visits,
-                        limit: self.limits.max_query_scan_edges,
-                    });
-                }
+                let target_cost = self
+                    .native_path_frontier_scan_cost(read, &mut target, topologies)
+                    .await?;
+                target_cost < source_cost
+                    || (target_cost == source_cost && target.depth <= source.depth)
+            } else {
+                false
+            };
+            let (active, other) = if reverse {
+                (&mut target, &source)
+            } else {
+                (&mut source, &target)
+            };
+            // Only the last layer must meet the other ball. Filtering earlier
+            // would lose paths through vertices not reached by the other side.
+            let allowed =
+                (targets.is_some() && layer + 1 == procedure.max_len).then_some(&other.seen);
+            let mut next = BTreeSet::new();
+            for vertex in std::mem::take(&mut active.vertices) {
+                read.budget.check("native_path_frontier")?;
+                let edges = self
+                    .native_path_successors(
+                        read,
+                        vertex,
+                        active.direction,
+                        topologies,
+                        allowed,
+                        &mut edge_visits,
+                    )
+                    .await?;
                 for edge in edges {
-                    let neighbor =
-                        far_endpoint(vertex, &edge).expect("successor touches target frontier");
-                    if seen.insert(neighbor) && depth + 1 < procedure.max_len {
-                        next.insert(neighbor);
+                    let neighbor = far_endpoint(vertex, &edge).expect("successor touches frontier");
+                    if allowed.is_some_and(|vertices| !vertices.contains(&neighbor)) {
+                        continue;
                     }
+                    // Final-hop endpoints are retained only as adjacency edges;
+                    // they never enter another frontier. Edge scans and candidate
+                    // enumeration have their own limits, so do not charge these
+                    // endpoints against the frontier-vertex allowance.
+                    if layer + 1 < procedure.max_len {
+                        vertices.insert(neighbor);
+                        if vertices.len() > self.limits.max_query_intermediate_rows {
+                            return Err(GraphError::AdmissionRejected {
+                                operation: "native_path_vertices",
+                                actual: vertices.len() as u64,
+                                limit: self.limits.max_query_intermediate_rows as u64,
+                            });
+                        }
+                        if active.seen.insert(neighbor) {
+                            next.insert(neighbor);
+                        }
+                    }
+                    // Target expansion walks backwards; enumeration still
+                    // needs adjacency in the query's forward direction.
+                    let from = if reverse { neighbor } else { vertex };
+                    adjacency.entry(from).or_default().insert(edge);
                 }
             }
-            if seen.len() > self.limits.max_query_intermediate_rows {
-                return Err(GraphError::AdmissionRejected {
-                    operation: "native_path_vertices",
-                    actual: seen.len() as u64,
-                    limit: self.limits.max_query_intermediate_rows as u64,
-                });
-            }
-            frontier = next;
+            active.vertices = next;
+            active.depth += 1;
+            active.scan_cost = None;
         }
-        Ok((seen, edge_visits))
+        Ok(adjacency
+            .into_iter()
+            .map(|(vertex, edges)| (vertex, edges.into_iter().collect()))
+            .collect())
+    }
+
+    async fn native_path_frontier_scan_cost(
+        &self,
+        read: NativePathRead<'_>,
+        frontier: &mut NativePathFrontier,
+        topologies: &[TypedPathTopology],
+    ) -> Result<u64> {
+        if let Some(cost) = frontier.scan_cost {
+            return Ok(cost);
+        }
+        let mut cost = 0_u64;
+        for vertex in &frontier.vertices {
+            for topology in topologies {
+                read.budget.check("native_path_frontier_cost")?;
+                for incoming in [false, true] {
+                    if (incoming && frontier.direction == NativePathDirection::Outgoing)
+                        || (!incoming && frontier.direction == NativePathDirection::Incoming)
+                    {
+                        continue;
+                    }
+                    let degree = match topology.neighbor_access(
+                        *vertex,
+                        incoming,
+                        self.writes_reverse_index(),
+                    ) {
+                        NativePathNeighborAccess::Compiled { scan_work, .. }
+                        | NativePathNeighborAccess::CompiledReverseScan { scan_work, .. } => {
+                            scan_work
+                        }
+                        // There is no cheap reverse estimate without an artifact
+                        // or reverse index. Prefer a known-cost forward frontier.
+                        NativePathNeighborAccess::StorageReverseScan => u64::MAX,
+                        NativePathNeighborAccess::Storage if incoming => {
+                            read.budget
+                                .read_only_io(
+                                    "native_path_frontier_cost",
+                                    self.in_degree_in_storage_snapshot(
+                                        read.snapshot,
+                                        read.cell_id,
+                                        &topology.edge_type,
+                                        *vertex,
+                                    ),
+                                )
+                                .await?
+                        }
+                        NativePathNeighborAccess::Storage => {
+                            read.budget
+                                .read_only_io(
+                                    "native_path_frontier_cost",
+                                    self.out_degree_in_storage_snapshot(
+                                        read.snapshot,
+                                        read.cell_id,
+                                        &topology.edge_type,
+                                        *vertex,
+                                    ),
+                                )
+                                .await?
+                        }
+                    };
+                    cost = cost.saturating_add(degree);
+                }
+            }
+        }
+        // Degree counters only choose a side; actual expansion is still charged
+        // against one shared budget. A missing/stale estimate never proves that
+        // a vertex has no neighbors, nor admits work past the limit.
+        frontier.scan_cost = Some(cost);
+        Ok(cost)
     }
 
     async fn native_path_successors(
@@ -899,109 +1089,208 @@ impl GraphShard {
         direction: NativePathDirection,
         topologies: &[TypedPathTopology],
         allowed: Option<&BTreeSet<VertexId>>,
-    ) -> Result<(Vec<PathEdge>, u64)> {
+        edge_visits: &mut u64,
+    ) -> Result<Vec<PathEdge>> {
         let mut edges = BTreeSet::new();
-        let mut scanned_edges = 0_u64;
         for topology in topologies {
-            read.budget.check("native_path_neighbors")?;
-            if direction != NativePathDirection::Incoming {
-                let neighbors = match &topology.source {
-                    PathTopologySource::Compiled { matrix, overlay } => {
-                        scanned_edges = scanned_edges.saturating_add(
-                            crate::sparse_kernel::compiled_graphblas_out_degree(matrix, vertex),
-                        );
-                        let mut neighbors = match allowed {
-                            Some(allowed) => {
+            for incoming in [false, true] {
+                if (incoming && direction == NativePathDirection::Outgoing)
+                    || (!incoming && direction == NativePathDirection::Incoming)
+                {
+                    continue;
+                }
+                read.budget.check("native_path_neighbors")?;
+                let neighbors =
+                    match topology.neighbor_access(vertex, incoming, self.writes_reverse_index()) {
+                        NativePathNeighborAccess::Compiled {
+                            matrix,
+                            overlay,
+                            scan_work,
+                        } => {
+                            self.charge_native_path_edges(edge_visits, scan_work)?;
+                            let mut neighbors = match (incoming, allowed) {
+                            (false, Some(allowed)) => {
                                 crate::sparse_kernel::compiled_graphblas_out_neighbors_intersecting(
                                     matrix, vertex, allowed,
                                 )
                             }
-                            None => crate::sparse_kernel::compiled_graphblas_out_neighbors(
-                                matrix, vertex,
-                            ),
-                        }
-                        .into_iter()
-                        .collect::<BTreeSet<_>>();
-                        if let Some(overlay) = overlay {
-                            scanned_edges = scanned_edges.saturating_add(
-                                overlay.apply_out_neighbors(vertex, &mut neighbors),
-                            );
-                        }
-                        if let Some(allowed) = allowed {
-                            neighbors.retain(|neighbor| allowed.contains(neighbor));
-                        }
-                        neighbors.into_iter().collect()
-                    }
-                    PathTopologySource::Storage => {
-                        let neighbors = self
-                            .out_neighbors_in_storage_snapshot(
-                                read.snapshot,
-                                read.cell_id,
-                                &topology.edge_type,
-                                vertex,
-                                read.read_epoch,
-                            )
-                            .await?;
-                        scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
-                        neighbors
-                    }
-                };
-                edges.extend(neighbors.into_iter().map(|dst| PathEdge {
-                    edge_type: topology.edge_type.clone(),
-                    src: vertex,
-                    dst,
-                    relationship_id: None,
-                }));
-            }
-            if direction != NativePathDirection::Outgoing {
-                let neighbors = match &topology.source {
-                    PathTopologySource::Compiled { matrix, overlay } => {
-                        scanned_edges = scanned_edges.saturating_add(
-                            crate::sparse_kernel::compiled_graphblas_in_degree(matrix, vertex),
-                        );
-                        let mut neighbors = match allowed {
-                            Some(allowed) => {
+                            (false, None) => {
+                                crate::sparse_kernel::compiled_graphblas_out_neighbors(
+                                    matrix, vertex,
+                                )
+                            }
+                            (true, Some(allowed)) => {
                                 crate::sparse_kernel::compiled_graphblas_in_neighbors_intersecting(
                                     matrix, vertex, allowed,
                                 )
                             }
-                            None => crate::sparse_kernel::compiled_graphblas_in_neighbors(
+                            (true, None) => crate::sparse_kernel::compiled_graphblas_in_neighbors(
                                 matrix, vertex,
                             ),
                         }
                         .into_iter()
                         .collect::<BTreeSet<_>>();
-                        if let Some(overlay) = overlay {
-                            scanned_edges = scanned_edges
-                                .saturating_add(overlay.apply_in_neighbors(vertex, &mut neighbors));
+                            if let Some(overlay) = overlay {
+                                if incoming {
+                                    overlay.apply_in_neighbors(vertex, &mut neighbors);
+                                } else {
+                                    overlay.apply_out_neighbors(vertex, &mut neighbors);
+                                }
+                            }
+                            if let Some(allowed) = allowed {
+                                neighbors.retain(|neighbor| allowed.contains(neighbor));
+                            }
+                            neighbors.into_iter().collect::<Vec<_>>()
                         }
-                        if let Some(allowed) = allowed {
-                            neighbors.retain(|neighbor| allowed.contains(neighbor));
+                        NativePathNeighborAccess::CompiledReverseScan {
+                            matrix,
+                            overlay,
+                            scan_work,
+                        } => {
+                            // Check the full work before scanning; no transpose or
+                            // graph-sized copy is allocated. Cancellation is checked
+                            // for every visited vertex and edge.
+                            self.charge_native_path_edges(edge_visits, scan_work)?;
+                            let mut neighbors = matrix
+                                .in_neighbors_without_reverse(vertex, || {
+                                    read.budget.check("native_path_reverse_scan")
+                                })?
+                                .into_iter()
+                                .collect::<BTreeSet<_>>();
+                            if let Some(overlay) = overlay {
+                                overlay.apply_in_neighbors(vertex, &mut neighbors);
+                            }
+                            if let Some(allowed) = allowed {
+                                neighbors.retain(|v| allowed.contains(v));
+                            }
+                            neighbors.into_iter().collect()
                         }
-                        neighbors.into_iter().collect()
-                    }
-                    PathTopologySource::Storage => {
-                        let neighbors = self
-                            .in_neighbors_in_storage_snapshot(
-                                read.snapshot,
-                                read.cell_id,
+                        NativePathNeighborAccess::StorageReverseScan => {
+                            self.native_path_reverse_from_storage(
+                                read,
                                 &topology.edge_type,
                                 vertex,
+                                edge_visits,
                             )
-                            .await?;
-                        scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
-                        neighbors
-                    }
-                };
-                edges.extend(neighbors.into_iter().map(|src| PathEdge {
+                            .await?
+                        }
+                        NativePathNeighborAccess::Storage => {
+                            // This snapshot includes WAL additions/deletions. Applying
+                            // the compiled artifact's overlay here would count it twice.
+                            let neighbors = if incoming {
+                                read.budget
+                                    .read_only_io(
+                                        "native_path_storage_neighbors",
+                                        self.in_neighbors_in_storage_snapshot(
+                                            read.snapshot,
+                                            read.cell_id,
+                                            &topology.edge_type,
+                                            vertex,
+                                        ),
+                                    )
+                                    .await?
+                            } else {
+                                read.budget
+                                    .read_only_io(
+                                        "native_path_storage_neighbors",
+                                        self.out_neighbors_in_storage_snapshot(
+                                            read.snapshot,
+                                            read.cell_id,
+                                            &topology.edge_type,
+                                            vertex,
+                                            read.read_epoch,
+                                        ),
+                                    )
+                                    .await?
+                            };
+                            self.charge_native_path_edges(edge_visits, neighbors.len() as u64)?;
+                            neighbors
+                        }
+                    };
+                edges.extend(neighbors.into_iter().map(|neighbor| PathEdge {
                     edge_type: topology.edge_type.clone(),
-                    src,
-                    dst: vertex,
+                    src: if incoming { neighbor } else { vertex },
+                    dst: if incoming { vertex } else { neighbor },
                     relationship_id: None,
                 }));
             }
         }
-        Ok((edges.into_iter().collect(), scanned_edges))
+        Ok(edges.into_iter().collect())
+    }
+
+    fn charge_native_path_edges(&self, visits: &mut u64, work: u64) -> Result<()> {
+        *visits = visits.saturating_add(work);
+        ensure_limit(
+            "native_path_edges",
+            *visits,
+            self.limits.max_query_scan_edges,
+        )
+    }
+
+    // OutboundOnly still has a source/degree index. Enumerate it from the
+    // pinned snapshot and use the ordinary outgoing reader, which understands
+    // segment-backed adjacency and tombstones as well as individual edge rows.
+    async fn native_path_reverse_from_storage(
+        &self,
+        read: NativePathRead<'_>,
+        edge_type: &str,
+        dst: VertexId,
+        visits: &mut u64,
+    ) -> Result<Vec<VertexId>> {
+        validate_component("cell_id", read.cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let prefix = keys::degree_out_prefix(read.cell_id, edge_type);
+        let mut iter = read
+            .budget
+            .read_only_io("native_path_reverse_storage", async {
+                Ok::<_, GraphError>(
+                    read.snapshot
+                        .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+                        .await?,
+                )
+            })
+            .await?;
+        let mut neighbors = Vec::new();
+        loop {
+            let Some(kv) = read
+                .budget
+                .read_only_io("native_path_reverse_storage", async {
+                    Ok::<_, GraphError>(iter.next().await?)
+                })
+                .await?
+            else {
+                break;
+            };
+            self.charge_native_path_edges(visits, 1)?;
+            let key = String::from_utf8_lossy(&kv.key);
+            let src = parse_u64(
+                &key,
+                key.strip_prefix(&prefix).unwrap_or_default(),
+                "source vertex",
+            )?;
+            let outgoing = read
+                .budget
+                .read_only_io(
+                    "native_path_reverse_storage",
+                    self.out_neighbors_in_storage_snapshot_inner(
+                        read.snapshot,
+                        read.cell_id,
+                        edge_type,
+                        src,
+                        read.read_epoch,
+                        Some(super::query::StorageNeighborScanBudget {
+                            query: read.budget,
+                            scanned_records: visits,
+                            operation: "native_path_edges",
+                        }),
+                    ),
+                )
+                .await?;
+            if outgoing.binary_search(&dst).is_ok() {
+                neighbors.push(src);
+            }
+        }
+        Ok(neighbors)
     }
 
     async fn expand_native_path_relationships(
@@ -1118,12 +1407,13 @@ impl GraphShard {
         vertex_cache: &mut BTreeMap<VertexId, VertexMetadata>,
         relationship_cache: &BTreeMap<PathEdge, EdgeMetadata>,
     ) -> Result<QueryPath> {
-        self.hydrate_vertex_metadata_cache_at(
+        self.hydrate_vertex_metadata_cache_at_concurrently(
             read.cell_id,
             nodes,
             read.read_epoch,
             vertex_cache,
             read.budget,
+            NATIVE_PATH_HYDRATION_CONCURRENCY,
         )
         .await?;
         let mut path_nodes = Vec::with_capacity(nodes.len());
@@ -1166,7 +1456,7 @@ fn native_path_rows_resident_bytes(rows: &VecDeque<QueryRow>) -> u64 {
     })
 }
 
-fn native_path_result_resident_bytes(result: &QueryResultSet) -> usize {
+pub(super) fn native_path_result_resident_bytes(result: &QueryResultSet) -> usize {
     let columns = result.columns.iter().fold(0_usize, |bytes, column| {
         bytes
             .saturating_add(std::mem::size_of::<QueryColumn>())
@@ -1482,6 +1772,48 @@ fn enumerate_candidate_paths_from(
     Ok(())
 }
 
+/// The vertices an unweighted call will return from `candidates`, known
+/// before their relationships are read, so both hydrations can share the
+/// object-store latency instead of queueing behind each other.
+///
+/// Unweighted paths rank by length, then node sequence, then edges, and every
+/// relationship variant of a structural path keeps its rank among the other
+/// structural paths. So the first `keep` structural paths in that order hold
+/// every returned vertex unless a structural edge turns out to have no
+/// relationship, in which case the later hydration reads the rest. This only
+/// warms the metadata cache; it never decides a result.
+fn native_path_vertex_prefetch(
+    procedure: &NativePathProcedure,
+    candidates: &[CandidatePath],
+    remaining_rows: usize,
+) -> Vec<VertexId> {
+    if procedure.weight_property.is_some()
+        || procedure.cost_property.is_some()
+        || procedure.max_cost.is_some()
+    {
+        return Vec::new();
+    }
+    let keep = if procedure.path_count == 0 {
+        remaining_rows
+    } else {
+        usize::try_from(procedure.path_count)
+            .unwrap_or(usize::MAX)
+            .min(remaining_rows)
+    };
+    let mut ranked = candidates
+        .iter()
+        .map(|candidate| (candidate.edges.len(), &candidate.nodes))
+        .collect::<Vec<_>>();
+    if ranked.len() > keep {
+        ranked.select_nth_unstable(keep);
+        ranked.truncate(keep);
+    }
+    ranked
+        .into_iter()
+        .flat_map(|(_, nodes)| nodes.iter().copied())
+        .collect()
+}
+
 fn select_native_paths(procedure: &NativePathProcedure, candidates: &mut Vec<CandidatePath>) {
     candidates.retain(|candidate| {
         candidate.weight.is_finite()
@@ -1559,135 +1891,5 @@ fn numeric_query_value(value: f64) -> QueryValue {
         QueryValue::Count(value as u64)
     } else {
         QueryValue::Float(QueryFloat(value))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn procedure(kind: NativePathProcedureKind, target: Option<VertexId>) -> NativePathProcedure {
-        NativePathProcedure {
-            kind,
-            source: 1,
-            target,
-            source_selector: None,
-            target_selector: None,
-            pairwise: false,
-            fair_relationship_variants: false,
-            rel_types: vec!["RELATES".to_string()],
-            direction: NativePathDirection::Outgoing,
-            max_len: 3,
-            weight_property: None,
-            cost_property: None,
-            max_cost: None,
-            path_count: 1,
-            result_limit: None,
-            projections: vec![NativePathProjection::Path],
-        }
-    }
-
-    fn edge(src: VertexId, dst: VertexId) -> PathEdge {
-        PathEdge {
-            edge_type: "RELATES".to_string(),
-            src,
-            dst,
-            relationship_id: None,
-        }
-    }
-
-    fn candidate_nodes(candidates: &[CandidatePath]) -> Vec<Vec<VertexId>> {
-        candidates
-            .iter()
-            .map(|candidate| candidate.nodes.clone())
-            .collect()
-    }
-
-    #[test]
-    fn single_pair_returns_shortest_deterministic_path() {
-        let adjacency = BTreeMap::from([
-            (1, vec![edge(1, 2), edge(1, 3)]),
-            (2, vec![edge(2, 4)]),
-            (3, vec![edge(3, 5)]),
-            (5, vec![edge(5, 4)]),
-        ]);
-        let budget = QueryBudget::new(None, None);
-        let mut candidates = enumerate_candidate_paths(
-            &procedure(NativePathProcedureKind::SinglePair, Some(4)),
-            &adjacency,
-            100,
-            &budget,
-        )
-        .unwrap();
-        for candidate in &mut candidates {
-            candidate.weight = candidate.edges.len() as f64;
-        }
-        select_native_paths(
-            &procedure(NativePathProcedureKind::SinglePair, Some(4)),
-            &mut candidates,
-        );
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].nodes, vec![1, 2, 4]);
-    }
-
-    #[test]
-    fn enumeration_never_emits_cyclic_paths() {
-        let adjacency = BTreeMap::from([(1, vec![edge(1, 2)]), (2, vec![edge(2, 1), edge(2, 3)])]);
-        let budget = QueryBudget::new(None, None);
-        let mut request = procedure(NativePathProcedureKind::SingleSource, None);
-        request.path_count = 10;
-        let candidates = enumerate_candidate_paths(&request, &adjacency, 100, &budget).unwrap();
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|candidate| candidate.nodes.clone())
-                .collect::<Vec<_>>(),
-            vec![vec![1, 2], vec![1, 2, 3]]
-        );
-    }
-
-    #[test]
-    fn multi_target_enumeration_matches_independent_pair_queries() {
-        let adjacency = BTreeMap::from([
-            (1, vec![edge(1, 2), edge(1, 3), edge(1, 6)]),
-            (2, vec![edge(2, 4), edge(2, 5)]),
-            (3, vec![edge(3, 4), edge(3, 5)]),
-            (4, vec![edge(4, 5)]),
-            (6, vec![edge(6, 5)]),
-        ]);
-        let budget = QueryBudget::new(None, None);
-
-        for path_count in [0, 1, 3] {
-            let mut request = procedure(NativePathProcedureKind::SinglePair, Some(4));
-            request.path_count = path_count;
-            request.max_len = 4;
-            let expected_four =
-                enumerate_unweighted_candidate_paths(&request, &adjacency, 100, &budget).unwrap();
-
-            request.target = Some(5);
-            let expected_five =
-                enumerate_unweighted_candidate_paths(&request, &adjacency, 100, &budget).unwrap();
-
-            request.target = None;
-            let actual = enumerate_unweighted_candidate_paths_to_targets(
-                &request,
-                &adjacency,
-                &[4, 5],
-                100,
-                &budget,
-            )
-            .unwrap();
-
-            assert_eq!(
-                candidate_nodes(actual.get(&4).expect("target four exists")),
-                candidate_nodes(&expected_four),
-                "path_count={path_count} target=4"
-            );
-            assert_eq!(
-                candidate_nodes(actual.get(&5).expect("target five exists")),
-                candidate_nodes(&expected_five),
-                "path_count={path_count} target=5"
-            );
-        }
     }
 }

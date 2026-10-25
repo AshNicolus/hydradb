@@ -6,11 +6,11 @@
 
 use hydradb_cypher_ast::{
     BinaryOperator, Clause, CypherDialect, CypherVersion, Direction, Document, Expression,
-    Identifier, Literal, MatchClause, NodePattern, OrderDirection, PathLength, PathPattern,
-    PatternElement, Projection, ProjectionItems, Query, QueryFailureReason, RelationshipPattern,
-    ReturnClause, SortItem, Statement, SyntaxFragment, UnaryOperator, UnionArm,
+    FilterClause, Identifier, LetClause, Literal, MatchClause, NodePattern, OrderDirection,
+    PathLength, PathPattern, PatternElement, Projection, ProjectionItems, Query,
+    QueryFailureReason, RelationshipPattern, ReturnClause, SetQuantifier, SortItem, Statement,
+    SyntaxFragment, UnaryOperator, UnionArm, UnwindClause, WithClause,
 };
-use std::collections::BTreeSet;
 
 use crate::generated::cypher25_parser::{StatementsContext, ValidatedTreeContext};
 use crate::Cypher25ValidatedTree;
@@ -45,6 +45,7 @@ pub(super) fn lower_cypher25(source: &str, syntax: &Cypher25ValidatedTree) -> Do
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Token {
     Identifier(String),
+    EscapedIdentifier(String),
     Parameter(String),
     Literal(Literal),
     Keyword(&'static str),
@@ -60,6 +61,16 @@ struct Parser {
     /// The clause being read, so a failure can be reported against it rather
     /// than as an untyped statement. Set on entering each clause.
     context: QueryFailureReason,
+}
+
+/// What `WITH` and `RETURN` have in common, parsed once.
+struct ProjectionTail {
+    quantifier: Option<SetQuantifier>,
+    items: ProjectionItems,
+    group_by: Vec<Expression>,
+    order_by: Vec<SortItem>,
+    skip: Option<Expression>,
+    limit: Option<Expression>,
 }
 
 impl Parser {
@@ -104,82 +115,142 @@ impl Parser {
 
     fn query_arm(&mut self) -> Option<Query> {
         let mut clauses = Vec::new();
-        // Set by a WITH that is the last clause before RETURN: what it kept,
-        // and its SKIP/LIMIT. Neither has an AST node of its own -- the typed
-        // AST has no WITH clause -- so both are applied to RETURN below.
-        let mut trailing_with: Option<(BTreeSet<String>, Option<Expression>, Option<Expression>)> =
-            None;
+        // MATCH and WITH in any order and any number, until RETURN. A segment
+        // does not have to start with a MATCH: `WITH` may follow another
+        // `WITH`, and whether a given sequence makes sense - whether a WITH has
+        // bindings to project - is lowering's question, not the tokenizer's.
         loop {
-            let optional = self.keyword("OPTIONAL").is_some();
-            self.keyword("MATCH")?;
-            self.context = QueryFailureReason::Pattern;
-            let mut patterns = vec![self.path()?];
-            while self.punctuation(',').is_some() {
-                patterns.push(self.path()?);
-            }
-            let predicate = if self.keyword("WHERE").is_some() {
-                self.context = QueryFailureReason::Where;
-                Some(self.expression()?)
-            } else {
-                None
-            };
-            clauses.push(Clause::Match(MatchClause {
-                optional,
-                mode: None,
-                patterns,
-                predicate,
-            }));
-            if self.keyword("WITH").is_some() {
-                self.context = QueryFailureReason::Return;
-                let mut projected = BTreeSet::from([self.identifier()?.to_string()]);
-                while self.punctuation(',').is_some() {
-                    projected.insert(self.identifier()?.to_string());
-                }
-                let skip = if self.keyword("SKIP").is_some() {
-                    self.context = QueryFailureReason::OrderWindow;
-                    Some(self.expression()?)
-                } else {
-                    None
-                };
-                let limit = if self.keyword("LIMIT").is_some() {
-                    self.context = QueryFailureReason::OrderWindow;
-                    Some(self.expression()?)
-                } else {
-                    None
-                };
-                let bindings = match_bindings(&clauses);
-                if matches!(self.peek(), Some(Token::Keyword("RETURN"))) {
-                    // Trailing: may narrow, since nothing after it can
-                    // re-bind a dropped name and RETURN is checked against
-                    // what it kept.
-                    if !projected.is_subset(&bindings) {
-                        return None;
+            match self.peek() {
+                Some(Token::Keyword("MATCH" | "OPTIONAL")) => {
+                    let optional = self.keyword("OPTIONAL").is_some();
+                    self.keyword("MATCH")?;
+                    self.context = QueryFailureReason::Pattern;
+                    let mut patterns = vec![self.path()?];
+                    while self.punctuation(',').is_some() {
+                        patterns.push(self.path()?);
                     }
-                    trailing_with = Some((projected, skip, limit));
-                } else if projected != bindings || skip.is_some() || limit.is_some() {
-                    // Mid-query: a window or a dropped binding would change
-                    // what the next MATCH sees, and there is no operator for
-                    // either.
-                    return None;
+                    let predicate = if self.keyword("WHERE").is_some() {
+                        self.context = QueryFailureReason::Where;
+                        Some(self.expression()?)
+                    } else {
+                        None
+                    };
+                    clauses.push(Clause::Match(MatchClause {
+                        optional,
+                        mode: None,
+                        patterns,
+                        predicate,
+                    }));
                 }
-            }
-            if !matches!(
-                self.peek(),
-                Some(Token::Keyword("MATCH") | Token::Keyword("OPTIONAL"))
-            ) {
-                break;
+                // GQL's LET and FILTER are not reserved words, so they arrive
+                // as identifiers; at the start of a clause nothing else could.
+                Some(Token::Identifier(word)) if word.eq_ignore_ascii_case("LET") => {
+                    self.next();
+                    self.context = QueryFailureReason::Return;
+                    let mut bindings = Vec::new();
+                    loop {
+                        let name = self.identifier()?;
+                        self.consume(&Token::Comparison(BinaryOperator::Equal))
+                            .then_some(())?;
+                        bindings.push((name, self.expression()?));
+                        if self.punctuation(',').is_none() {
+                            break;
+                        }
+                    }
+                    clauses.push(Clause::Let(LetClause { bindings }));
+                }
+                Some(Token::Identifier(word)) if word.eq_ignore_ascii_case("FILTER") => {
+                    self.next();
+                    self.context = QueryFailureReason::Where;
+                    // `FILTER WHERE p` and `FILTER p` mean the same.
+                    self.keyword("WHERE");
+                    let predicate = self.expression()?;
+                    clauses.push(Clause::Filter(FilterClause { predicate }));
+                }
+                Some(Token::Identifier(word)) if word.eq_ignore_ascii_case("UNWIND") => {
+                    self.keyword("UNWIND")?;
+                    self.context = QueryFailureReason::Unwind;
+                    let expression = self.expression()?;
+                    self.keyword("AS")?;
+                    let variable = self.identifier()?;
+                    clauses.push(Clause::Unwind(UnwindClause {
+                        expression,
+                        variable,
+                    }));
+                }
+                Some(Token::Keyword("WITH")) => {
+                    self.keyword("WITH")?;
+                    self.context = QueryFailureReason::Return;
+                    let tail = self.projection_tail()?;
+                    let predicate = if self.keyword("WHERE").is_some() {
+                        self.context = QueryFailureReason::Where;
+                        Some(self.expression()?)
+                    } else {
+                        None
+                    };
+                    clauses.push(Clause::With(WithClause {
+                        quantifier: tail.quantifier,
+                        items: tail.items,
+                        group_by: tail.group_by,
+                        order_by: tail.order_by,
+                        skip: tail.skip,
+                        limit: tail.limit,
+                        predicate,
+                    }));
+                }
+                _ => break,
             }
         }
+        // A query may open with RETURN: `RETURN 1 AS one` reads one row that
+        // binds nothing, which lowering supplies.
         self.keyword("RETURN")?;
         self.context = QueryFailureReason::Return;
+        let tail = self.projection_tail()?;
+        clauses.push(Clause::Return(ReturnClause {
+            quantifier: tail.quantifier,
+            items: tail.items,
+            group_by: tail.group_by,
+            order_by: tail.order_by,
+            skip: tail.skip,
+            limit: tail.limit,
+        }));
+        Some(Query {
+            clauses,
+            unions: Vec::new(),
+        })
+    }
+
+    /// The projection list and its trailing modifiers.
+    ///
+    /// `WITH` and `RETURN` project identically - DISTINCT, aliased items,
+    /// ORDER BY, SKIP, LIMIT - so they parse identically. The only difference
+    /// is the `WHERE` that may follow `WITH`, which its caller reads.
+    fn projection_tail(&mut self) -> Option<ProjectionTail> {
         let quantifier = if self.keyword("DISTINCT").is_some() {
-            Some(hydradb_cypher_ast::SetQuantifier::Distinct)
+            Some(SetQuantifier::Distinct)
         } else {
             None
         };
-        let mut projections = vec![self.projection()?];
-        while self.punctuation(',').is_some() {
+        // `*` may only open the list; `count(*)` is read by `atom`.
+        let star = self.punctuation('*').is_some();
+        let mut projections = Vec::new();
+        if !star || self.punctuation(',').is_some() {
             projections.push(self.projection()?);
+            while self.punctuation(',').is_some() {
+                projections.push(self.projection()?);
+            }
+        }
+
+        // GQL's explicit grouping, between the items and the ordering.
+        let mut group_by = Vec::new();
+        if matches!(self.peek(), Some(Token::Identifier(word)) if word.eq_ignore_ascii_case("GROUP"))
+        {
+            self.next();
+            self.keyword("BY")?;
+            group_by.push(self.expression()?);
+            while self.punctuation(',').is_some() {
+                group_by.push(self.expression()?);
+            }
         }
 
         let mut order_by = Vec::new();
@@ -218,59 +289,17 @@ impl Parser {
             None
         };
 
-        let (skip, limit) = match trailing_with {
-            None => (skip, limit),
-            Some((visible, with_skip, with_limit)) => {
-                self.context = QueryFailureReason::Return;
-                let aliases: BTreeSet<String> = projections
-                    .iter()
-                    .filter_map(|projection| projection.alias.as_ref().map(ToString::to_string))
-                    .collect();
-                let reads_only_visible = projections
-                    .iter()
-                    .all(|projection| references_only(&projection.expression, &visible))
-                    && order_by.iter().all(|item| {
-                        references_only(&item.expression, &visible)
-                            || references_only(&item.expression, &aliases)
-                    });
-                if !reads_only_visible {
-                    return None;
-                }
-                if with_skip.is_none() && with_limit.is_none() {
-                    (skip, limit)
-                } else {
-                    // `WITH x LIMIT n RETURN x.p` is `RETURN x.p LIMIT n` only
-                    // when RETURN is a plain per-row projection: DISTINCT,
-                    // ORDER BY and aggregates read the whole bounded row set.
-                    // A RETURN window of its own would have to be composed
-                    // with this one, which needs the values, not expressions.
-                    self.context = QueryFailureReason::OrderWindow;
-                    if quantifier.is_some()
-                        || !order_by.is_empty()
-                        || skip.is_some()
-                        || limit.is_some()
-                        || projections
-                            .iter()
-                            .any(|projection| contains_aggregate(&projection.expression))
-                    {
-                        return None;
-                    }
-                    (with_skip, with_limit)
-                }
-            }
-        };
-
-        clauses.push(Clause::Return(ReturnClause {
+        Some(ProjectionTail {
             quantifier,
-            items: ProjectionItems::Items(projections),
-            group_by: Vec::new(),
+            group_by,
+            items: if star {
+                ProjectionItems::All(projections)
+            } else {
+                ProjectionItems::Items(projections)
+            },
             order_by,
             skip,
             limit,
-        }));
-        Some(Query {
-            clauses,
-            unions: Vec::new(),
         })
     }
 
@@ -311,12 +340,13 @@ impl Parser {
         } else {
             None
         };
+        let predicate = self.element_predicate()?;
         self.punctuation(')')?;
         Some(NodePattern {
             variable,
             labels,
             properties,
-            predicate: None,
+            predicate,
         })
     }
 
@@ -349,6 +379,7 @@ impl Parser {
         } else {
             None
         };
+        let predicate = self.element_predicate()?;
         self.punctuation(']')?;
 
         // The closing side decides the direction: `-[..]->` is outgoing,
@@ -371,8 +402,25 @@ impl Parser {
             direction,
             length,
             properties,
-            predicate: None,
+            predicate,
         })
+    }
+
+    /// The `WHERE` a node or relationship pattern may carry before it closes,
+    /// as in `(n:Item WHERE n.score > 2)`. `Some(None)` when there is none;
+    /// `None` when there is one this adapter cannot type.
+    ///
+    /// Restores the clause context afterwards: the predicate sits inside a
+    /// pattern, and a failure after it is still the pattern's.
+    fn element_predicate(&mut self) -> Option<Option<Expression>> {
+        if self.keyword("WHERE").is_none() {
+            return Some(None);
+        }
+        let context = self.context;
+        self.context = QueryFailureReason::Where;
+        let predicate = self.expression()?;
+        self.context = context;
+        Some(Some(predicate))
     }
 
     fn path_length_bound(&mut self) -> Option<u8> {
@@ -557,8 +605,13 @@ impl Parser {
             self.punctuation(']')?;
             return Some(Expression::List(elements));
         }
+        if self.word("CASE") {
+            return self.case();
+        }
         let expression = match self.next()? {
-            Token::Identifier(value) if self.punctuation('(').is_some() => {
+            Token::Identifier(value) | Token::EscapedIdentifier(value)
+                if self.punctuation('(').is_some() =>
+            {
                 let distinct = self.keyword("DISTINCT").is_some();
                 let mut arguments = Vec::new();
                 if self.punctuation('*').is_some() {
@@ -576,7 +629,9 @@ impl Parser {
                     arguments,
                 }
             }
-            Token::Identifier(value) => Expression::Identifier(Identifier::from(value)),
+            Token::Identifier(value) | Token::EscapedIdentifier(value) => {
+                Expression::Identifier(Identifier::from(value))
+            }
             Token::Parameter(value) => Expression::Parameter(Identifier::from(value)),
             Token::Literal(value) => Expression::Literal(value),
             _ => return None,
@@ -591,6 +646,49 @@ impl Parser {
         } else {
             Some(expression)
         }
+    }
+
+    /// The rest of a CASE expression, after `CASE`. Its words are not
+    /// reserved, so they arrive as identifiers.
+    fn case(&mut self) -> Option<Expression> {
+        let operand = if self.peek_word("WHEN") {
+            None
+        } else {
+            Some(Box::new(self.expression()?))
+        };
+        let mut branches = Vec::new();
+        while self.word("WHEN") {
+            let when = self.expression()?;
+            self.word("THEN").then_some(())?;
+            branches.push((when, self.expression()?));
+        }
+        if branches.is_empty() {
+            return None;
+        }
+        let default = if self.word("ELSE") {
+            Some(Box::new(self.expression()?))
+        } else {
+            None
+        };
+        self.word("END").then_some(())?;
+        Some(Expression::Case {
+            operand,
+            branches,
+            default,
+        })
+    }
+
+    fn peek_word(&self, expected: &str) -> bool {
+        matches!(self.peek(), Some(Token::Identifier(word)) if word.eq_ignore_ascii_case(expected))
+    }
+
+    /// Consume an unreserved word such as `CASE` or `THEN`, case-insensitively.
+    fn word(&mut self, expected: &str) -> bool {
+        let found = self.peek_word(expected);
+        if found {
+            self.cursor += 1;
+        }
+        found
     }
 
     fn map(&mut self) -> Option<Expression> {
@@ -613,7 +711,7 @@ impl Parser {
 
     fn identifier(&mut self) -> Option<Identifier> {
         match self.peek()? {
-            Token::Identifier(value) => {
+            Token::Identifier(value) | Token::EscapedIdentifier(value) => {
                 let identifier = Identifier::from(value.clone());
                 self.cursor += 1;
                 Some(identifier)
@@ -624,6 +722,12 @@ impl Parser {
 
     fn keyword(&mut self, expected: &'static str) -> Option<()> {
         match self.peek()? {
+            Token::Identifier(word)
+                if expected == "UNWIND" && word.eq_ignore_ascii_case(expected) =>
+            {
+                self.cursor += 1;
+                Some(())
+            }
             Token::Keyword(actual) if *actual == expected => {
                 self.cursor += 1;
                 Some(())
@@ -656,72 +760,6 @@ impl Parser {
     }
 }
 
-/// Whether every variable `expression` reads is in `visible`. Property keys,
-/// map keys and parameter names are not variables.
-fn references_only(expression: &Expression, visible: &BTreeSet<String>) -> bool {
-    match expression {
-        Expression::Identifier(name) => visible.contains(name.as_str()),
-        Expression::Parameter(_) | Expression::Literal(_) => true,
-        Expression::Property { target, .. } => references_only(target, visible),
-        Expression::Unary { expression, .. } => references_only(expression, visible),
-        Expression::Binary { left, right, .. } => {
-            references_only(left, visible) && references_only(right, visible)
-        }
-        Expression::Function { arguments, .. } => arguments
-            .iter()
-            .all(|argument| references_only(argument, visible)),
-        Expression::List(items) => items.iter().all(|item| references_only(item, visible)),
-        Expression::Map(entries) => entries
-            .iter()
-            .all(|(_, value)| references_only(value, visible)),
-        // Unknown text: cannot prove what it reads.
-        Expression::Syntax(_) => false,
-    }
-}
-
-fn contains_aggregate(expression: &Expression) -> bool {
-    const AGGREGATES: [&str; 8] = [
-        "count", "sum", "avg", "min", "max", "collect", "stdev", "stdevp",
-    ];
-    match expression {
-        Expression::Function {
-            name, arguments, ..
-        } => {
-            let is_aggregate = matches!(name.as_slice(), [function]
-                if AGGREGATES.iter().any(|aggregate| function.as_str().eq_ignore_ascii_case(aggregate)));
-            is_aggregate || arguments.iter().any(contains_aggregate)
-        }
-        Expression::Property { target, .. } => contains_aggregate(target),
-        Expression::Unary { expression, .. } => contains_aggregate(expression),
-        Expression::Binary { left, right, .. } => {
-            contains_aggregate(left) || contains_aggregate(right)
-        }
-        Expression::List(items) => items.iter().any(contains_aggregate),
-        Expression::Map(entries) => entries.iter().any(|(_, value)| contains_aggregate(value)),
-        Expression::Identifier(_)
-        | Expression::Parameter(_)
-        | Expression::Literal(_)
-        | Expression::Syntax(_) => false,
-    }
-}
-
-fn match_bindings(clauses: &[Clause]) -> BTreeSet<String> {
-    clauses
-        .iter()
-        .filter_map(|clause| match clause {
-            Clause::Match(matched) => Some(matched),
-            Clause::Return(_) | Clause::Syntax(_) => None,
-        })
-        .flat_map(|matched| &matched.patterns)
-        .flat_map(|pattern| &pattern.elements)
-        .filter_map(|element| match element {
-            PatternElement::Node(node) => node.variable.as_ref(),
-            PatternElement::Relationship(relationship) => relationship.variable.as_ref(),
-        })
-        .map(ToString::to_string)
-        .collect()
-}
-
 fn tokenize(source: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut input = source.chars().peekable();
@@ -743,7 +781,7 @@ fn tokenize(source: &str) -> Vec<Token> {
                     identifier.push(next);
                 }
             }
-            tokens.push(Token::Identifier(identifier));
+            tokens.push(Token::EscapedIdentifier(identifier));
             continue;
         }
         if character == '$' {

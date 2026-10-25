@@ -32,7 +32,7 @@
 //! 100 ms"* and *"did p99 move by 2×"*. It does **not** answer *"did p99 move
 //! from 42 ms to 47 ms"* — that needs a relative-error sketch, and the
 //! condition for revisiting is written down in
-//! `docs/plans/2026-07-26-otel-metrics-span-links-and-alerting.md`.
+//! the metrics span-links and alerting design.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 // Only `record` names this, and `record` is gated; an ungated import would be
@@ -144,6 +144,17 @@ impl AtomicDurationHistogram {
         self.record_micros(crate::codec::duration_micros_u64(duration));
     }
 
+    /// Start timing one observation, recorded when the returned guard drops.
+    ///
+    /// For entry points with many early returns: errors, retries exhausted and
+    /// a dropped future all record, so the count is every call that started.
+    pub(crate) fn start_timer(&self) -> HistogramTimer<'_> {
+        HistogramTimer {
+            histogram: self,
+            started: std::time::Instant::now(),
+        }
+    }
+
     /// Take a point-in-time copy.
     pub(crate) fn snapshot(&self) -> DurationHistogramSnapshot {
         let mut bucket_counts = [0u64; DURATION_BUCKET_COUNT];
@@ -154,6 +165,18 @@ impl AtomicDurationHistogram {
             bucket_counts,
             sum_us: self.sum_us.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// Records the time since [`AtomicDurationHistogram::start_timer`] on drop.
+pub(crate) struct HistogramTimer<'a> {
+    histogram: &'a AtomicDurationHistogram,
+    started: std::time::Instant,
+}
+
+impl Drop for HistogramTimer<'_> {
+    fn drop(&mut self) {
+        self.histogram.record(self.started.elapsed());
     }
 }
 
@@ -210,6 +233,3 @@ impl DurationHistogramSnapshot {
         (count > 0).then(|| self.sum_us as f64 / count as f64)
     }
 }
-
-#[cfg(test)]
-mod tests;

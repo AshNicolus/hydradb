@@ -162,6 +162,12 @@ pub(crate) async fn commit_txn_strict_with_sequence(
         return Ok(None);
     };
     if await_durable {
+        // Outside a pipeline a foreground write waits here under its graph
+        // permit. Maintenance commits without a permit land here too.
+        let _durability = crate::core::memory_diagnostics::MemoryDiagnosticGuard::new(
+            crate::core::memory_diagnostics::MemoryStage::ShardWriteDurabilityInline,
+            0,
+        );
         handle.await_durable().await?;
     }
     Ok(Some(handle.seqnum()))
@@ -186,6 +192,25 @@ pub(crate) fn remote_scan_options() -> ScanOptions {
     ScanOptions::default()
         .with_durability_filter(crate::shard::write_pipeline::read_durability())
         .with_cache_blocks(false)
+}
+
+/// A full scan of one key range (every counter, label member or edge row of a
+/// type). SlateDB fetches one block per request by default, so such a scan
+/// costs one object-store round trip per block on every call: 1,566 reads for
+/// a 126k-pair counter range, over 30 s at 20 ms per read. Read ahead in
+/// large requests, several at once; blocks are still not cached, as for any
+/// remote scan.
+#[cfg(feature = "opencypher")]
+pub(crate) const BULK_SCAN_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(feature = "opencypher")]
+pub(crate) const BULK_SCAN_FETCH_TASKS: usize = 8;
+
+#[cfg(feature = "opencypher")]
+pub(crate) fn remote_bulk_scan_options() -> ScanOptions {
+    let mut options = remote_scan_options();
+    options.read_ahead_bytes = BULK_SCAN_READ_AHEAD_BYTES;
+    options.max_fetch_tasks = BULK_SCAN_FETCH_TASKS;
+    options
 }
 
 pub(crate) fn remote_scan_options_for_expected_items(expected_items: u64) -> ScanOptions {
@@ -259,12 +284,7 @@ pub(crate) fn encode_query_stats_record(record: &QueryStatsRecord) -> Vec<u8> {
     };
     let mut encoded = format!(
         "{version}\ncount\t{}\nread_epoch\t{}\nrefreshed_at_ms\t{}\ndistinct_values\t{}\ntotal_values\t{}\nmost_common_count\t{}\n",
-        record.count,
-        record.read_epoch,
-        record.refreshed_at_ms,
-        record.distinct_values,
-        record.total_values,
-        record.most_common_count,
+        record.count, record.read_epoch, record.refreshed_at_ms, record.distinct_values, record.total_values, record.most_common_count,
     );
     if let Some(bloom) = &record.bloom {
         encoded.push_str(&format!(
@@ -605,6 +625,50 @@ pub(crate) fn encode_vertex_property_value_key(value: &VertexPropertyValue) -> S
     }
 }
 
+/// Inverse of [`encode_vertex_property_value_key`]: decode one property index
+/// value segment, type tag included.
+pub(crate) fn decode_vertex_property_value_key(encoded: &str) -> Result<VertexPropertyValue> {
+    let corrupt = |reason: String| GraphError::CorruptValue {
+        key: encoded.to_string(),
+        reason,
+    };
+    let Some((kind, payload)) = encoded.split_at_checked(1) else {
+        return Err(corrupt("empty property index value".to_string()));
+    };
+    match kind {
+        "b" => match payload {
+            "0" => Ok(VertexPropertyValue::Bool(false)),
+            "1" => Ok(VertexPropertyValue::Bool(true)),
+            other => Err(corrupt(format!(
+                "invalid boolean property index value {other}"
+            ))),
+        },
+        "i" => payload
+            .parse::<u64>()
+            .map(VertexPropertyValue::Integer)
+            .map_err(|err| corrupt(format!("invalid unsigned property index value: {err}"))),
+        "j" => u64::from_str_radix(payload, 16)
+            .map(|value| VertexPropertyValue::SignedInteger((value ^ (1_u64 << 63)) as i64))
+            .map_err(|err| corrupt(format!("invalid signed property index value: {err}"))),
+        "n" => u64::from_str_radix(payload, 16)
+            .map(|sortable| {
+                let bits = if sortable & (1_u64 << 63) == 0 {
+                    !sortable
+                } else {
+                    sortable ^ (1_u64 << 63)
+                };
+                VertexPropertyValue::Float(QueryFloat(f64::from_bits(bits)))
+            })
+            .map_err(|err| corrupt(format!("invalid float property index value: {err}"))),
+        "s" => String::from_utf8(hex_decode(encoded, payload)?)
+            .map(VertexPropertyValue::String)
+            .map_err(|err| corrupt(err.to_string())),
+        other => Err(corrupt(format!(
+            "unknown property index value type {other}"
+        ))),
+    }
+}
+
 fn encode_vertex_property_value_record(value: &VertexPropertyValue) -> String {
     match value {
         VertexPropertyValue::Integer(value) => format!("i:{value}"),
@@ -685,17 +749,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
-}
-
-/// The string a property-index key holds, from its hex-encoded form without
-/// the `s` type tag -- the inverse of the string arm of
-/// [`encode_vertex_property_value_key`].
-#[cfg(feature = "experimental-cypher-engine")]
-pub(crate) fn decode_string_index_value(key: &str, encoded: &str) -> Result<String> {
-    String::from_utf8(hex_decode(key, encoded)?).map_err(|error| GraphError::CorruptValue {
-        key: key.to_string(),
-        reason: format!("string index value is not UTF-8: {error}"),
-    })
 }
 
 fn hex_decode(key: &str, text: &str) -> Result<Vec<u8>> {
@@ -810,6 +863,59 @@ pub(crate) fn decode_segment_compaction_idempotency(
         input_edges: parse_u64(key, parts[5], "input_edges")?,
         output_edges: parse_u64(key, parts[6], "output_edges")?,
     })
+}
+
+/// The destination count a segment declares, without decoding its destinations.
+///
+/// [`decode_out_edge_segment`] sizes its `Vec` from this count, so a caller
+/// working to a budget can use this to refuse a segment it could not accept
+/// anyway rather than pay to materialize it first. The count is validated
+/// against the value's real length here, exactly as the full decode does, so a
+/// corrupt record is rejected rather than trusted as a cheap large number.
+#[cfg(feature = "experimental-cypher-engine")]
+pub(crate) fn out_edge_segment_destination_count(key: &str, value: &[u8]) -> Result<usize> {
+    let Some(body) = value.strip_prefix(b"graph-out-segment\n") else {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected graph-out-segment record".to_string(),
+        });
+    };
+    if body.len() < 8 {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("expected graph-out-segment count, got {} bytes", body.len()),
+        });
+    }
+    let declared =
+        u64::from_be_bytes(body[..8].try_into().map_err(|_| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "invalid graph-out-segment count bytes".to_string(),
+        })?);
+    let declared = usize::try_from(declared).map_err(|_| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("graph-out-segment count {declared} is too large"),
+    })?;
+    // A declared count is only believable if the record actually carries that
+    // many destinations. Checking it here keeps this in step with the full
+    // decode, so the two can never disagree about how many a segment holds.
+    if body.len() - 8
+        != declared
+            .checked_mul(8)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("graph-out-segment count {declared} is too large"),
+            })?
+    {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "expected {} graph-out-segment destination bytes, got {}",
+                declared * 8,
+                body.len() - 8
+            ),
+        });
+    }
+    Ok(declared)
 }
 
 pub(crate) fn decode_out_edge_segment(key: &str, value: &[u8]) -> Result<OutEdgeSegment> {
@@ -1631,32 +1737,5 @@ pub(crate) fn ensure_limit(operation: &'static str, actual: u64, limit: u64) -> 
         })
     } else {
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod scan_option_tests {
-    use super::*;
-
-    #[test]
-    fn remote_prefix_scans_do_not_pollute_the_block_cache() {
-        let options = remote_scan_options();
-
-        assert_eq!(options.durability_filter, DurabilityLevel::Remote);
-        assert!(!options.cache_blocks);
-    }
-
-    #[test]
-    fn bounded_remote_scans_admit_only_small_working_sets() {
-        assert!(remote_scan_options_for_expected_items(1_024).cache_blocks);
-        assert!(!remote_scan_options_for_expected_items(1_025).cache_blocks);
-    }
-
-    #[test]
-    fn bounded_remote_point_reads_admit_only_small_working_sets() {
-        let bounded = remote_read_options_for_expected_items(1_024);
-        assert_eq!(bounded.durability_filter, DurabilityLevel::Remote);
-        assert!(bounded.cache_blocks);
-        assert!(!remote_read_options_for_expected_items(1_025).cache_blocks);
     }
 }

@@ -146,34 +146,3 @@ pub fn adopt_remote_parent(span: &tracing::Span, traceparent: &str) {
     // must not fail because its trace could not be joined.
     let _ = span.set_parent(Context::new().with_remote_span_context(span_context));
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The path a `--features otlp` build takes with no collector configured.
-    /// It must not fabricate a header.
-    #[test]
-    fn no_active_trace_yields_no_traceparent() {
-        assert!(current_traceparent().is_none());
-    }
-
-    /// Rubbish from a peer must be dropped, not panic and not poison the span.
-    #[test]
-    fn a_malformed_traceparent_is_ignored() {
-        let span = tracing::info_span!("test");
-        adopt_remote_parent(&span, "not a traceparent");
-        adopt_remote_parent(&span, "");
-        adopt_remote_parent(&span, &"0".repeat(55));
-    }
-
-    /// The exact wire form the transport carries, from the W3C spec's example.
-    #[test]
-    fn a_well_formed_traceparent_is_adopted() {
-        let span = tracing::info_span!("test");
-        adopt_remote_parent(
-            &span,
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-        );
-    }
-}

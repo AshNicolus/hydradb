@@ -2,7 +2,7 @@ name: PR limit
 
 on:
   pull_request_target:
-    types: [opened, reopened]
+    types: [opened, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       backfill:

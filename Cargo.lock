@@ -235,13 +235,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -499,6 +499,15 @@ dependencies = [
  "num-traits",
  "radium",
  "ref-cast",
+]
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -927,6 +936,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -1059,6 +1069,35 @@ dependencies = [
  "once_cell",
  "rand 0.9.5",
  "tokio",
+]
+
+[[package]]
+name = "falkor-dump-import"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "falkordb-rdb",
+ "futures",
+ "hydradb",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha2",
+ "slatedb",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "falkordb-rdb"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "zstd",
 ]
 
 [[package]]
@@ -1686,23 +1725,20 @@ dependencies = [
  "futures",
  "hydradb-cypher-ast",
  "hydradb-cypher-engine",
- "hydradb-cypher-parser-antlr",
  "hydradb-graph-plan",
+ "hydradb-object-publication",
  "hydradb-placement",
  "hydradb-telemetry",
  "libc",
  "libcypher-parser-sys",
- "rcgen",
  "reqwest",
  "rustls-pemfile",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2",
  "slatedb",
  "slatedb-common",
  "subtle",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -1722,8 +1758,8 @@ dependencies = [
  "async-trait",
  "hydradb-cypher-ast",
  "hydradb-cypher-parser-antlr",
+ "indexmap",
  "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
@@ -1740,21 +1776,31 @@ name = "hydradb-graph-plan"
 version = "0.1.0"
 dependencies = [
  "hydradb-cypher-ast",
- "hydradb-cypher-parser-antlr",
+]
+
+[[package]]
+name = "hydradb-object-publication"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "slatedb",
+ "slatedb-common",
+ "slatedb-txn-obj",
+ "thiserror 2.0.18",
+ "ulid",
 ]
 
 [[package]]
 name = "hydradb-placement"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
  "futures",
  "serde",
  "serde_json",
  "slatedb",
  "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
@@ -1769,7 +1815,6 @@ dependencies = [
  "opentelemetry_sdk",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -2941,16 +2986,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
-name = "pem"
-version = "3.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
-dependencies = [
- "base64",
- "serde_core",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3418,19 +3453,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rcgen"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
-dependencies = [
- "pem",
- "ring",
- "rustls-pki-types",
- "time",
- "yasna",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3564,6 +3586,25 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
 ]
 
 [[package]]
@@ -4275,7 +4316,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.16.0"
-source = "git+https://github.com/hydra-db/slatedb.git?rev=4f2e0060473698bc6a8605a6718f4ff1bc691736#4f2e0060473698bc6a8605a6718f4ff1bc691736"
+source = "git+https://github.com/hydra-db/slatedb.git?rev=c1003496403d7c9d6613175d529381eb32e17d46#c1003496403d7c9d6613175d529381eb32e17d46"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -4319,7 +4360,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.16.0"
-source = "git+https://github.com/hydra-db/slatedb.git?rev=4f2e0060473698bc6a8605a6718f4ff1bc691736#4f2e0060473698bc6a8605a6718f4ff1bc691736"
+source = "git+https://github.com/hydra-db/slatedb.git?rev=c1003496403d7c9d6613175d529381eb32e17d46#c1003496403d7c9d6613175d529381eb32e17d46"
 dependencies = [
  "chrono",
  "log",
@@ -4334,7 +4375,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.16.0"
-source = "git+https://github.com/hydra-db/slatedb.git?rev=4f2e0060473698bc6a8605a6718f4ff1bc691736#4f2e0060473698bc6a8605a6718f4ff1bc691736"
+source = "git+https://github.com/hydra-db/slatedb.git?rev=c1003496403d7c9d6613175d529381eb32e17d46#c1003496403d7c9d6613175d529381eb32e17d46"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4633,7 +4674,6 @@ dependencies = [
  "deranged",
  "num-conv",
  "powerfmt",
- "serde_core",
  "time-core",
 ]
 
@@ -5736,15 +5776,6 @@ name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
-
-[[package]]
-name = "yasna"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
-dependencies = [
- "time",
-]
 
 [[package]]
 name = "yoke"

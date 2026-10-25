@@ -262,7 +262,7 @@ serviceMonitor:
   labels: {}
 
 tests:
-  enabled: false
+  enabled: true
   image:
     repository: curlimages/curl
     tag: "8.14.1"

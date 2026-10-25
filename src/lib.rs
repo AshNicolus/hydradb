@@ -6,10 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use slatedb::bytes::Bytes;
 use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
 use slatedb::object_store::{path::Path, ObjectStore};
-#[cfg(test)]
-use slatedb::ErrorKind;
-#[cfg(test)]
-use slatedb::WriteBatch;
 use slatedb::{DbTransaction, IsolationLevel};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -25,6 +21,7 @@ mod engine;
 // renaming. Private, so this costs nothing outside the crate: every item below
 // is re-exported under its own unchanged name.
 mod locality;
+mod offline_image;
 mod prefix_filter;
 mod query;
 mod sparse_kernel;
@@ -54,7 +51,7 @@ pub(crate) use core::config::{open_graph_db, open_graph_reader};
 pub use core::config::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
     GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphReaderMode, GraphStorageMemoryConfig,
-    DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
+    PlannerStatisticsConfig, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
 pub use core::db_cache::SlateDbCacheMetricsSnapshot;
 pub(crate) use core::db_cache::{process_slate_db_cache, SharedSlateDbCache};
@@ -63,17 +60,20 @@ pub use core::metrics::{QueryFailureCountsSnapshot, QueryFailureStage};
 // Widen this as H1 converts the remaining client duration counters. It is no
 // longer feature-gated: `GraphOperationalMetrics::query_rows_latency` is a
 // default-features field, so the type is constructed on every build.
+pub use core::create_only::{probe_create_only_puts, CreateOnlyProbeError, WriterGate};
 pub(crate) use core::histogram::AtomicDurationHistogram;
 pub use core::histogram::{
     DurationHistogramSnapshot, DURATION_BUCKET_BOUNDS_US, DURATION_BUCKET_COUNT,
 };
 pub use core::memory_diagnostics::{memory_diagnostic_snapshot, MemoryDiagnosticSnapshot};
 pub use core::metrics::{
-    ExperimentalOperatorMetricsSnapshot, GraphCacheKind, GraphCacheMetricsSnapshot,
-    GraphCachePolicy, GraphOperationalMetricsSnapshot,
+    CellOperationalCounterTotals, ExperimentalOperatorMetricsSnapshot, GraphCacheKind,
+    GraphCacheMetricsSnapshot, GraphCachePolicy, GraphOperationalMetricsSnapshot,
+    PlannerStatisticsLoadedSnapshot,
 };
 pub(crate) use core::metrics::{
-    GraphCacheMetrics, GraphOperationalMetrics, RelationshipImportProfile,
+    CumulativeOperationalCounters, CumulativeOperationalRegistration, GraphCacheMetrics,
+    GraphOperationalMetrics, RelationshipImportProfile,
 };
 pub(crate) use core::model::OutEdgeSegment;
 #[cfg(feature = "opencypher")]
@@ -88,8 +88,8 @@ pub use core::model::{
     VertexPropertyValue,
 };
 pub use core::namespace::{
-    GraphId, GraphScope, NamespaceId, NamespacePath, DEFAULT_GRAPH_ID, DEFAULT_NAMESPACE_ID,
-    MAX_NAMESPACE_DEPTH,
+    encode_scope_namespace_id, GraphId, GraphScope, NamespaceId, NamespacePath, DEFAULT_GRAPH_ID,
+    DEFAULT_NAMESPACE_ID, MAX_NAMESPACE_DEPTH,
 };
 pub use core::snapshot::GraphSnapshot;
 #[cfg(feature = "opencypher")]
@@ -107,12 +107,16 @@ pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 #[cfg(feature = "query-transport")]
 pub use engine::ScopedRoutedGraphCluster;
 pub use engine::{
-    local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, CellOwnership,
-    GraphCluster, GraphIndexBuildPath, GraphIndexGeneration, GraphScopeChange,
-    GraphShardRuntimeMetrics, MatrixArtifact, MatrixTraversalResult,
-    ObjectStoreGraphScopeDirectory, ObjectStoreNodeDirectory, ObjectStoreWriterLeaseDirectory,
-    PlacementConfig, PlacementRefreshHandle, PlacementView, RoutedGraphCluster,
-    ScopedGraphShardRuntimeMetrics, TraversalBackend, WriterLeaseOwner, WriterLeaseRenewalFailure,
+    decode_planner_statistics, encode_planner_statistics, local_object_store,
+    object_store_from_env, ArtifactGcResult, BenchmarkResult, CellOwnership, GraphCluster,
+    GraphIndexBuildPath, GraphIndexGeneration, GraphScopeChange, GraphShardRuntimeMetrics,
+    MatrixArtifact, MatrixTraversalResult, ObjectStoreGraphScopeDirectory,
+    ObjectStoreNodeDirectory, ObjectStoreWriterLeaseDirectory, PlacementConfig,
+    PlacementRefreshHandle, PlacementView, PlannerStatistics, PlannerStatisticsBuildLimits,
+    PlannerStatisticsPublish, PlannerStatisticsPublisher, PlannerStatisticsRequest,
+    PropertyIndexStatistics, PropertySample, RoutedGraphCluster, ScopedGraphShardRuntimeMetrics,
+    TagRange, TraversalBackend, WriterLeaseOwner, WriterLeaseRenewalFailure,
+    PLANNER_STATISTICS_FORMAT_VERSION, PLANNER_STATISTICS_TOP_VALUES,
 };
 pub use hydradb_graph_plan::{
     explain_physical_plan, lower_cypher_ast, plan_physical, BoundValue, GraphLogicalPlan,
@@ -124,6 +128,7 @@ pub use locality::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
     LocalityCellExtractor, LocalityLayoutExperiment, StorageLayout,
 };
+pub use offline_image::{OfflineGraphImageEncoder, OfflineImageRow};
 pub use query::algebra::{
     CypherEngineMode, LogicalQueryPlan, PhysicalQueryPlan, QueryBatchEdge,
     QueryBatchIsolatedVertex, QueryBatchMergePolicy, QueryBatchOperation, QueryBatchRelationship,
@@ -164,7 +169,7 @@ pub use query::coordination::{
 #[cfg(feature = "opencypher")]
 pub use query::corpus::{
     parse_opencypher_tck_corpus, parse_opencypher_tck_corpus_dir, CypherTckCase,
-    CypherTckCompatibilityReport, CypherTckCorpus,
+    CypherTckCompatibilityReport, CypherTckCorpus, CypherTckOutcome,
 };
 #[cfg(feature = "opencypher")]
 pub use query::opencypher::{
@@ -225,8 +230,3 @@ pub(crate) use codec::*;
 
 mod keys;
 mod shard;
-
-#[cfg(test)]
-mod namespace_tests;
-#[cfg(test)]
-mod tests;

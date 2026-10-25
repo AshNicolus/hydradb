@@ -110,6 +110,24 @@ impl GraphShard {
         &self,
         operation: impl Future<Output = Result<T>>,
     ) -> Result<T> {
+        self.run_write_pipeline_with(operation, false).await
+    }
+
+    /// For families whose local guard skips the manifest read: a committing
+    /// operation is fenced by its create-only WAL upload, and one that commits
+    /// nothing refreshes the writer fence after the permit is released.
+    pub(crate) async fn run_write_pipeline_fencing_noops<T>(
+        &self,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        self.run_write_pipeline_with(operation, true).await
+    }
+
+    async fn run_write_pipeline_with<T>(
+        &self,
+        operation: impl Future<Output = Result<T>>,
+        fence_noops: bool,
+    ) -> Result<T> {
         if !self.await_durable_writes {
             return operation.await;
         }
@@ -117,7 +135,14 @@ impl GraphShard {
             current().filter(|context| context.path == self.db.store_path().as_ref())
         {
             context.validate_writer(self)?;
-            return operation.await;
+            let result = operation.await;
+            // A sibling in this context may commit while this call runs, so an
+            // advanced sequence does not prove this call committed. Fence every
+            // success; no caller nests a fencing family today.
+            if fence_noops && result.is_ok() {
+                self.db.refresh_writer_fence().await?;
+            }
+            return result;
         }
         let waiting = MemoryDiagnosticGuard::new(
             MemoryStage::ShardWritePipelineWait,
@@ -138,8 +163,10 @@ impl GraphShard {
                 permit = acquire => permit,
             },
             None => acquire.await,
-        }.map_err(|error| GraphError::CorruptValue {
-            key: "write_pipeline/admission".into(), reason: error.to_string(),
+        }
+        .map_err(|error| GraphError::CorruptValue {
+            key: "write_pipeline/admission".into(),
+            reason: error.to_string(),
         })?;
         drop(waiting);
         let writer = self.db.writer()?;
@@ -161,6 +188,14 @@ impl GraphShard {
             _admission: admission,
         });
         let result = PIPELINE.scope(Arc::clone(&context), operation).await;
+        // A no-op wrote no WAL, so no create-only upload fences it: check the
+        // manifest now, after the permit is released, before acknowledging.
+        if fence_noops
+            && result.is_ok()
+            && context.required_sequence.load(Ordering::Acquire) == sequence
+        {
+            self.db.refresh_writer_fence().await?;
+        }
         // All local guards and the graph admission permit have dropped here.
         // No-op and replay responses also wait for the state they observed.
         let required = context
@@ -194,14 +229,23 @@ impl GraphShard {
         // Legacy/maintenance transactions still read Remote. Drain predecessors
         // under their local guard so they never base a new sequence on old data.
         let writer = self.db.writer()?;
+        let mut draining = None;
         let result = async {
             let sequence = writer.snapshot().await?.seq();
+            // Record only a real drain; an already durable writer waits for nothing.
+            if writer.status().durable_seq < sequence {
+                draining = Some(MemoryDiagnosticGuard::new(
+                    MemoryStage::ShardWritePriorDurability,
+                    0,
+                ));
+            }
             wait_durable(&writer, sequence).await
         }
         .await;
         if result.is_err() {
             self.db.refresh_writer_fence().await?;
         }
+        drop(draining);
         result
     }
 }

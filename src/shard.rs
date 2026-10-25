@@ -1,5 +1,7 @@
 use super::*;
 
+#[cfg(feature = "opencypher")]
+mod degree_procedure;
 #[cfg(feature = "experimental-cypher-engine")]
 mod experimental_cypher;
 #[cfg(feature = "opencypher")]
@@ -16,4 +18,8 @@ mod write;
 pub(crate) mod write_pipeline;
 pub(crate) mod xlog;
 
+#[cfg(feature = "experimental-cypher-engine")]
+pub(crate) use experimental_cypher::{
+    PlannerStatisticsCache, PlannerStatisticsHintFailure, PlannerStatisticsHints,
+};
 pub(crate) use query::QueryBudget;

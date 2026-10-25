@@ -15,9 +15,7 @@ const EDGE_TYPE: &str = "USER_FOLLOWS_USER";
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 5 {
-        eprintln!(
-            "usage: fence_worker <incumbent|takeover|reader> <env-file|local:PATH|-> <base-path> <signal-dir>"
-        );
+        eprintln!("usage: fence_worker <incumbent|takeover|reader> <env-file|local:PATH|-> <base-path> <signal-dir>");
         std::process::exit(2);
     }
 
@@ -101,9 +99,7 @@ async fn reader(object_store: Arc<dyn ObjectStore>, data_path: &str) -> Result<(
     if !incumbent_visible || !takeover_visible || stale_visible {
         return Err(GraphError::CorruptValue {
             key: "fence/reader".to_string(),
-            reason: format!(
-                "unexpected visibility incumbent={incumbent_visible} takeover={takeover_visible} stale={stale_visible}"
-            ),
+            reason: format!("unexpected visibility incumbent={incumbent_visible} takeover={takeover_visible} stale={stale_visible}"),
         });
     }
     shard.close().await?;

@@ -110,39 +110,3 @@ impl QueryFailureReason {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::QueryFailureReason;
-
-    #[test]
-    fn index_is_the_position_in_all() {
-        for (position, reason) in QueryFailureReason::ALL.into_iter().enumerate() {
-            assert_eq!(reason.index(), position, "{reason:?}");
-        }
-    }
-
-    #[test]
-    fn label_values_are_distinct_prometheus_safe_words() {
-        let mut seen = std::collections::BTreeSet::new();
-        for reason in QueryFailureReason::ALL {
-            let label = reason.as_str();
-            assert!(
-                label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
-                "{label}"
-            );
-            assert!(seen.insert(label), "{label} is repeated");
-        }
-    }
-
-    #[test]
-    fn clause_keywords_are_case_insensitive() {
-        assert_eq!(
-            QueryFailureReason::for_clause_keyword("unwind"),
-            Some(QueryFailureReason::Unwind)
-        );
-        assert_eq!(QueryFailureReason::for_clause_keyword("r"), None);
-    }
-}

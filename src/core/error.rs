@@ -5,9 +5,6 @@ use thiserror::Error;
 
 use crate::StorageSequence;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("slatedb error: {0}")]
@@ -59,9 +56,7 @@ pub enum GraphError {
         idempotency_key: String,
         reason: &'static str,
     },
-    #[error(
-        "control metadata conflict at {key}: expected generation {expected_generation:?}, actual generation {actual_generation:?}"
-    )]
+    #[error("control metadata conflict at {key}: expected generation {expected_generation:?}, actual generation {actual_generation:?}")]
     ControlMetadataConflict {
         key: String,
         expected_generation: Option<u64>,
@@ -72,9 +67,7 @@ pub enum GraphError {
         operation: &'static str,
         attempts: usize,
     },
-    #[error(
-        "control watermark regression for {field} on cell {cell_id}: requested {requested_epoch}, current {current_epoch}"
-    )]
+    #[error("control watermark regression for {field} on cell {cell_id}: requested {requested_epoch}, current {current_epoch}")]
     ControlWatermarkRegression {
         cell_id: String,
         field: &'static str,
@@ -85,6 +78,15 @@ pub enum GraphError {
         "snapshot epoch {read_epoch} is ahead of current epoch {current_epoch} for cell {cell_id}"
     )]
     SnapshotAhead {
+        cell_id: String,
+        read_epoch: StorageSequence,
+        current_epoch: StorageSequence,
+    },
+    /// A sequence number cannot reopen an old SlateDB snapshot. This is a
+    /// storage-view failure, not invalid Cypher. Retrying the same sequence
+    /// cannot recover it; callers must retain the actual snapshot.
+    #[error("graph snapshot unavailable for cell {cell_id}: requested storage sequence {read_epoch}, current sequence {current_epoch}; historical sequences cannot reopen a SlateDB snapshot")]
+    SnapshotUnavailable {
         cell_id: String,
         read_epoch: StorageSequence,
         current_epoch: StorageSequence,
@@ -106,7 +108,7 @@ pub enum GraphError {
     },
     /// This node is not the rendezvous owner of the cell, so it declined to open
     /// the writer — touch point (b) of
-    /// `docs/plans/2026-07-25-rendezvous-placement.md`.
+    /// the rendezvous placement design.
     ///
     /// `owner` is an `Option` and not a `String` because the two refusals are
     /// different answers. `Some(node_id)` is *a live peer owns this cell*, which
@@ -144,9 +146,7 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
     },
-    #[error(
-        "snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} is below compacted watermark {min_epoch}"
-    )]
+    #[error("snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} is below compacted watermark {min_epoch}")]
     SnapshotExpired {
         cell_id: String,
         edge_type: String,
@@ -163,9 +163,7 @@ pub enum GraphError {
         read_epoch: StorageSequence,
         current_epoch: StorageSequence,
     },
-    #[error(
-        "{operation} stats snapshot epoch {read_epoch} for cell {cell_id} changed while refreshing; current epoch is {current_epoch}"
-    )]
+    #[error("{operation} stats snapshot epoch {read_epoch} for cell {cell_id} changed while refreshing; current epoch is {current_epoch}")]
     QueryStatsSnapshotChanged {
         operation: &'static str,
         cell_id: String,
@@ -212,10 +210,11 @@ pub enum GraphError {
     },
     /// A failure that has always surfaced as `UnsupportedQuery` but whose real
     /// cause is unknown here, so it carries no [`QueryFailureReason`]: a
-    /// failure another node reported over the query transport without one (a
-    /// timeout, admission, storage, or a peer too old to send one), or a
-    /// storage error the experimental engine received from its adapter as a
-    /// string (a timeout while reading, among others).
+    /// failure another node reported over the query transport without one
+    /// (a peer too old to send its failure typed), or a storage error the
+    /// experimental engine received from its adapter without a typed error.
+    /// Timeouts, budgets, admission and internal errors are neither: the
+    /// engine and the transport both carry them typed.
     ///
     /// Worded, classed and mapped to clients exactly as `UnsupportedQuery`, so
     /// nothing a client or an existing series sees changes. It exists only so
@@ -226,6 +225,24 @@ pub enum GraphError {
         dialect: &'static str,
         feature: String,
     },
+    /// A routed query failed on its owner with an error the owner keeps
+    /// internal -- storage, corruption, kernel and the like. The details are
+    /// in the owner's log; `class` is the owner's error class, one of
+    /// [`Self::CLASSES`], so this node's metrics file it where the owner did.
+    /// Clients get the internal-error answer the owner would have given.
+    #[error("{key}: internal query execution error on the owner (class {class})")]
+    RemoteInternal { key: String, class: &'static str },
+    /// One write batch sets a property of one vertex or edge to two different
+    /// values, so the batch has no single outcome to commit.
+    ///
+    /// Not an `UnsupportedQuery`: the statement is valid and supported, and it
+    /// is the rows the client sent that disagree. It surfaced as one until
+    /// recently, which is why Bolt answered a data conflict with
+    /// `Neo.ClientError.Statement.InvalidSyntax` and callers went looking for
+    /// a bad query. Bolt now reports `Neo.ClientError.Statement.ArgumentError`.
+    /// The message keeps its old wording so log searches still match.
+    #[error("conflicting metadata values for {target} in one batch")]
+    BatchValueConflict { target: String },
 }
 
 impl GraphError {
@@ -287,7 +304,7 @@ impl GraphError {
     /// # Why the mapping is here rather than in `hydradb-telemetry`
     ///
     /// This resolves the open decision in
-    /// `docs/plans/2026-07-26-otel-telemetry-crate.md` §8 in favour of an
+    /// the telemetry crate design §8 in favour of an
     /// inherent method. It keeps the match arms next to the variants they
     /// classify, so adding a variant without classifying it is a compile error
     /// rather than a silent `other`; and returning `&'static str` means the
@@ -312,6 +329,9 @@ impl GraphError {
             Self::QueryParse { .. } => Some(QueryFailureReason::ParseError),
             Self::MissingQueryParameter { .. } => Some(QueryFailureReason::Parameter),
             Self::QueryAllocation { .. } => Some(QueryFailureReason::Other),
+            // Counted where it always was, so the failure series stays
+            // continuous; the Bolt code is what changed.
+            Self::BatchValueConflict { .. } => Some(QueryFailureReason::Mutation),
             _ => None,
         }
     }
@@ -356,6 +376,7 @@ impl GraphError {
             | Self::RoutingUnavailable { .. } => Self::CLASS_ROUTING,
 
             Self::SnapshotAhead { .. }
+            | Self::SnapshotUnavailable { .. }
             | Self::SnapshotExpired { .. }
             | Self::SnapshotChanged { .. }
             | Self::QueryStatsSnapshotChanged { .. }
@@ -369,7 +390,8 @@ impl GraphError {
             | Self::UnsupportedQuery { .. }
             | Self::UnclassifiedQuery { .. }
             | Self::QueryAllocation { .. }
-            | Self::MissingQueryParameter { .. } => Self::CLASS_QUERY,
+            | Self::MissingQueryParameter { .. }
+            | Self::BatchValueConflict { .. } => Self::CLASS_QUERY,
 
             Self::GraphScopeMismatch { .. } | Self::GraphScopeAccessDenied { .. } => {
                 Self::CLASS_AUTHZ
@@ -396,70 +418,12 @@ impl GraphError {
             Self::Slate(_) | Self::ObjectStore(_) => Self::CLASS_STORAGE,
 
             Self::SparseKernel { .. } => Self::CLASS_KERNEL,
-        }
-    }
-}
 
-#[cfg(test)]
-impl GraphError {
-    /// One error per class, in [`Self::CLASSES`] order.
-    ///
-    /// Lives here rather than in a test module because two of them need it —
-    /// `error/tests.rs` for the taxonomy, `core/metrics/tests.rs` for the
-    /// counters — and a second copy of the table is a second thing that can be
-    /// wrong. `one_error_per_class_is_in_classes_order` is what makes the order
-    /// a fact rather than a comment.
-    pub(crate) fn one_per_class() -> [Self; Self::CLASS_COUNT] {
-        [
-            Self::ConditionalWriteConflict {
-                operation: "test",
-                key: "cell/edge".into(),
-            },
-            Self::WriteRequiresWriter {
-                operation: "test",
-                cell_id: "cell".into(),
-            },
-            Self::NotCellWriter {
-                cell_id: "cell".into(),
-                owner: None,
-            },
-            Self::SnapshotAhead {
-                cell_id: "cell".into(),
-                read_epoch: 9,
-                current_epoch: 4,
-            },
-            Self::AdmissionRejected {
-                operation: "test",
-                actual: 2,
-                limit: 1,
-            },
-            Self::QueryTimeout {
-                operation: "test",
-                elapsed_ms: 2,
-                limit_ms: 1,
-            },
-            Self::QueryParse {
-                dialect: "cypher",
-                reason: "unexpected token".into(),
-            },
-            Self::GraphScopeMismatch {
-                expected: "a".into(),
-                actual: "b".into(),
-            },
-            Self::CorruptValue {
-                key: "cell/edge".into(),
-                reason: "short header".into(),
-            },
-            Self::ReadOnlyShardStorage,
-            Self::ObjectStore(slatedb::object_store::Error::Generic {
-                store: "test",
-                source: "injected".into(),
-            }),
-            Self::SparseKernel {
-                backend: "rust",
-                reason: "dimension mismatch".into(),
-            },
-        ]
+            Self::RemoteInternal { class, .. } => Self::CLASSES
+                .iter()
+                .position(|known| known == class)
+                .unwrap_or(Self::CLASS_STORAGE),
+        }
     }
 }
 

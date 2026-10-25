@@ -46,6 +46,5 @@ easy to read.
 
 ## Build and test
 
-For setup, see [`README.md`](README.md). For the workflow, see
-[`DEVELOPMENT.md`](DEVELOPMENT.md). Run tasks with the `justfile`
+For setup, see [`README.md`](README.md). Run tasks with the `justfile`
 (`just --list`), not with `cargo` directly.

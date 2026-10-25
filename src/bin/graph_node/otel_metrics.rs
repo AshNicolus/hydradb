@@ -13,7 +13,7 @@
 //! [`tests::every_histogram_field_reaches_both_exports`] and
 //! [`tests::every_counter_field_reaches_both_exports`] fail the build if a field
 //! the kernel enumerates is missing from either. That is the property §1.6 of
-//! `docs/plans/2026-07-26-otel-metrics-span-links-and-alerting.md` asks for:
+//! the metrics span-links and alerting design asks for:
 //! adding a metric cannot silently reach one export and not the other.
 //!
 //! # One counter snapshot reaches the meter; the other two reach `/metrics` only
@@ -125,30 +125,12 @@
 
 #[path = "otel_metrics/memory_diagnostics.rs"]
 pub(crate) mod memory_diagnostics;
+#[path = "otel_metrics/planner_statistics.rs"]
+pub(crate) mod planner_statistics;
 
 // Only the recording half names a snapshot, and that half is behind `otlp`.
 #[cfg(feature = "otlp")]
 use hydradb::DurationHistogramSnapshot;
-
-/// The export proof, in its own file because a stand-in collector is a hundred
-/// lines that have nothing to say about metric names.
-///
-/// Gated on `otlp` as well as on `test`, because everything it touches is: there
-/// is no [`NodeCounters`] to register without the feature. That also means no
-/// `just` recipe runs it — `check-all-features` compiles it and stops — which is
-/// why the properties that can be checked without a meter are checked in
-/// [`tests`] instead, and this file is confined to the one claim that genuinely
-/// needs a socket.
-///
-/// The `#[path]` is not decoration. This module is itself declared with a `#[path]`
-/// in `graph-node.rs`, and a child of such a module resolves against the
-/// *directory of that path* — `src/bin/graph_node/` — rather than against
-/// `…/otel_metrics/`. Without the attribute rustc looks for
-/// `graph_node/otlp_export_tests.rs`, which would put a child of this module beside
-/// its parent.
-#[cfg(all(test, feature = "otlp"))]
-#[path = "otel_metrics/otlp_export_tests.rs"]
-mod otlp_export_tests;
 
 /// The unit an exported histogram's bounds and sum are **rendered** in.
 ///
@@ -341,7 +323,7 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
     // causal-consistency wait, and the one stable database histogram
     // (`db.client.operation.duration`) is already claimed above by the two
     // rows that genuinely mean it. Change 4 of
-    // `docs/plans/2026-08-21-cell-affine-read-routing.md`.
+    // the cell-affine read-routing design.
     OtelHistogram {
         field: "bookmark_wait_latency",
         name: "hydradb.client.bookmark_wait.duration",
@@ -418,6 +400,90 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         field: "reserve_edge_delete_noops_batch_latency",
         name: "hydradb.write.reserve_edge_delete_noops_batch.duration",
         description: "End-to-end reserve-edge-delete-noops-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "set_edge_metadata_latency",
+        name: "hydradb.write.set_edge_metadata.duration",
+        description: "End-to-end set-edge-metadata execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "set_edge_metadata_batch_latency",
+        name: "hydradb.write.set_edge_metadata_batch.duration",
+        description: "End-to-end set-edge-metadata-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "write_edge_latency",
+        name: "hydradb.write.write_edge.duration",
+        description: "End-to-end write-edge execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "write_edge_mutations_batch_latency",
+        name: "hydradb.write.write_edge_mutations_batch.duration",
+        description: "End-to-end write-edge-mutations-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "create_relationship_latency",
+        name: "hydradb.write.create_relationship.duration",
+        description: "End-to-end create-relationship execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "import_vertex_metadata_batch_latency",
+        name: "hydradb.write.import_vertex_metadata_batch.duration",
+        description: "End-to-end import-vertex-metadata-batch execution",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    // `hydradb.query.*`, not `hydradb.shard.query.*`: the shard prefix is
+    // already taken by the `...access.<source>.duration.sum` counters, and a
+    // histogram sharing their stem would collide with them once a backend
+    // translates the counter's `.sum` into a Prometheus suffix.
+    OtelHistogram {
+        field: "query_experimental_access_statistics_latency",
+        name: "hydradb.query.experimental.access.statistics.duration",
+        description: "Experimental row-query execution whose access path statistics chose",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "query_experimental_access_probe_latency",
+        name: "hydradb.query.experimental.access.probe.duration",
+        description: "Experimental row-query execution whose access path the runtime probe chose",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "query_experimental_access_guard_latency",
+        name: "hydradb.query.experimental.access.guard.duration",
+        description: "Experimental row-query execution in which a statistics-chosen access declined at its guard",
+        unit: ExportUnit::Microseconds,
+        operation: None,
+        source: FieldSource::GraphNode,
+    },
+    OtelHistogram {
+        field: "query_experimental_access_default_latency",
+        name: "hydradb.query.experimental.access.default.duration",
+        description: "Experimental row-query execution whose access path neither statistics nor the probe chose",
         unit: ExportUnit::Microseconds,
         operation: None,
         source: FieldSource::GraphNode,
@@ -1157,6 +1223,118 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     },
     OtelCounter {
         source: CounterSource::Shard,
+        field: "query_experimental_access_statistics_requests",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.statistics.requests",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_statistics_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.statistics.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_probe_requests",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.probe.requests",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_probe_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.probe.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_guard_requests",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.guard.requests",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_guard_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.guard.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_default_requests",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.default.requests",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_default_us",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.default.duration.sum",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_guard_stops",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.guard_stops"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_planned_without_statistics",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.planned_without_statistics",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "planner_statistics_reloads",
+        export: OtelCounterExport::PerCell("hydradb.shard.planner_statistics.reloads"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "planner_statistics_load_failures",
+        export: OtelCounterExport::PerCell("hydradb.shard.planner_statistics.load_failures"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "planner_statistics_corrupt_ignored",
+        export: OtelCounterExport::PerCell("hydradb.shard.planner_statistics.corrupt_ignored"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "planner_statistics_hints_sent",
+        export: OtelCounterExport::PerCell("hydradb.shard.planner_statistics.hints_sent"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_rows_estimated",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.rows_estimated",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_rows_actual",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.rows_actual"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_underestimates",
+        export: OtelCounterExport::PerCell(
+            "hydradb.shard.query.experimental.access.underestimates",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_experimental_access_overestimates",
+        export: OtelCounterExport::PerCell("hydradb.shard.query.experimental.access.overestimates"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
         field: "query_route_legacy_requests",
         export: OtelCounterExport::PerCell("hydradb.shard.query.route.legacy.requests"),
     },
@@ -1406,8 +1584,8 @@ pub fn otel_counter(source: CounterSource, field: &str) -> Option<&'static OtelC
 /// [`CounterSource::Client`] registers eleven more instruments and needs a
 /// `record_client_counters` beside [`NodeCounters::record_shard_totals`] fed from
 /// `ClientQueryService::metrics()`, which `collect_once` already holds; adding
-/// [`CounterSource::ShardCache`] registers nineteen and needs the same over
-/// `metrics.shard.cache`, off the slice `collect_once` already has. Neither is a
+/// [`CounterSource::ShardCache`] registers nineteen and must read
+/// `node.graph_cache_metrics()` so scope closure cannot reduce a counter. Neither is a
 /// design question any more, which is exactly why the stopping point is a value
 /// here rather than a sentence somewhere.
 ///
@@ -1450,17 +1628,20 @@ pub fn otel_counter_instruments() -> Vec<&'static OtelCounter> {
         .collect()
 }
 
-/// Every shard's operational counters, summed by `cell_id`.
+/// Every cell's operational counters, flattened into the rows the recording
+/// loop publishes.
 ///
-/// [`OtelCounterExport::PerCell`] reads "one sum per `hydradb.cell_id`, summed
-/// over every scope open on the node", and this is where the summing happens.
-/// Publishing per scope instead would not duplicate and would not warn: the series
-/// identity is the label set, so the last scope recorded in an interval would
-/// simply *replace* the others and the counter would report one tenant's traffic
-/// as the cell's. The same arithmetic on the `/metrics` side is
-/// `admin::append_per_cell_counters`, and it is there for a sharper version of the
-/// same reason — two identical series in one scrape is an outright rejection
-/// rather than a plausible undercount.
+/// [`OtelCounterExport::PerCell`] reads "one sum per `hydradb.cell_id`", and
+/// the sum is the runtime's
+/// (`ScopedRoutedGraphCluster::cell_operational_counter_totals`): every scope
+/// open on the node plus the final values of every scope that has closed.
+/// Summing only the open scopes, as this once did, makes the series fall when a
+/// scope closes, and a cumulative OTLP counter that falls is read downstream as
+/// a reset — the whole remaining sum is then counted again as new increase.
+/// Publishing per scope instead would not duplicate and would not
+/// warn: the series identity is the label set, so the last scope recorded in an
+/// interval would simply *replace* the others. The same totals feed
+/// `admin::append_per_cell_counters`.
 ///
 /// Outside the `otlp` cfg on purpose. This is the half of
 /// [`NodeCounters::record_shard_totals`] that a name table cannot check and that no
@@ -1473,23 +1654,12 @@ pub fn otel_counter_instruments() -> Vec<&'static OtelCounter> {
 /// but a deterministic order is what lets a test assert on the whole return value
 /// instead of searching it.
 pub fn shard_counter_totals(
-    shards: &[hydradb::ScopedGraphShardRuntimeMetrics],
-) -> Vec<(&str, Vec<(&'static str, u64)>)> {
-    let mut totals: std::collections::BTreeMap<&str, Vec<(&'static str, u64)>> =
-        std::collections::BTreeMap::new();
-    for shard in shards {
-        let cell = totals.entry(shard.shard.cell_id.as_str()).or_default();
-        for (field, value) in shard.shard.operational.counter_fields() {
-            match cell.iter_mut().find(|(name, _)| *name == field) {
-                // Saturating for the reason `admin::accumulate` gives: these are
-                // `u64` counters only a decades-long uptime could overflow, and a
-                // wrapped total on a metrics series is a phantom incident.
-                Some(slot) => slot.1 = slot.1.saturating_add(value),
-                None => cell.push((field, value)),
-            }
-        }
-    }
-    totals.into_iter().collect()
+    totals: &std::collections::BTreeMap<String, hydradb::CellOperationalCounterTotals>,
+) -> Vec<(&str, &[(&'static str, u64)])> {
+    totals
+        .iter()
+        .map(|(cell_id, cell)| (cell_id.as_str(), cell.counters.as_slice()))
+        .collect()
 }
 
 /// The instrumentation scope every instrument registered here belongs to.
@@ -1768,13 +1938,14 @@ impl NodeCounters {
         counter.record(labels, value)
     }
 
-    /// Every shard's operational counters, labelled by `cell_id` alone.
+    /// Every cell's operational counters, labelled by `cell_id` alone.
     ///
-    /// Takes the whole slice rather than one shard at a time, and that is
-    /// [`shard_counter_totals`]'s doing rather than a convenience: a per-cell
-    /// series is a sum over the scopes on that cell, and a method that saw one
-    /// scope could not compute it. `NodeHistograms::record_shard` is per shard
-    /// because its own signature predates the question.
+    /// Takes the runtime's per-cell totals rather than shard snapshots, and that
+    /// is [`shard_counter_totals`]'s doing rather than a convenience: a per-cell
+    /// series is a sum over every scope that has hosted that cell, closed ones
+    /// included, and a method that saw only open shards could not compute it.
+    /// `NodeHistograms::record_shard` is per shard because its own signature
+    /// predates the question.
     ///
     /// Never `scope`, which `/metrics` does carry on three families — that
     /// divergence is §1.4 and is the reason both exports exist. Never
@@ -1784,35 +1955,16 @@ impl NodeCounters {
     /// in the registry at all.
     pub fn record_shard_totals(
         &self,
-        shards: &[hydradb::ScopedGraphShardRuntimeMetrics],
+        totals: &std::collections::BTreeMap<String, hydradb::CellOperationalCounterTotals>,
     ) -> Result<(), hydradb_telemetry::meter::CounterError> {
         use hydradb_telemetry::semconv::L_CELL_ID;
 
-        for (cell_id, fields) in shard_counter_totals(shards) {
-            for (field, value) in fields {
+        for (cell_id, fields) in shard_counter_totals(totals) {
+            for &(field, value) in fields {
                 self.record(CounterSource::Shard, field, &[(L_CELL_ID, cell_id)], value)?;
             }
         }
         Ok(())
-    }
-
-    /// Every series each registered instrument is currently reporting.
-    ///
-    /// The published totals, read back through the same accessor the SDK's
-    /// callback uses. It exists because the export proof asserts on a protobuf
-    /// frame, where an instrument name is a literal substring and a value is a
-    /// varint: the socket is what proves the series *left the process*, and this is
-    /// what proves the number in it was the sum and not one scope's share.
-    #[cfg(test)]
-    fn observations(
-        &self,
-        source: CounterSource,
-        field: &'static str,
-    ) -> Vec<hydradb_telemetry::meter::Observation<u64>> {
-        self.registered
-            .get(&(source, field))
-            .map(hydradb_telemetry::meter::ObservableCounter::observations)
-            .unwrap_or_default()
     }
 }
 
@@ -1888,6 +2040,7 @@ impl MetricCollection {
             memory,
             histograms,
             counters: NodeCounters::register(providers),
+            planner_statistics: planner_statistics::Gauges::register(providers),
         });
 
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -1947,6 +2100,7 @@ struct NodeInstruments {
     memory: memory_diagnostics::Instruments,
     histograms: NodeHistograms,
     counters: NodeCounters,
+    planner_statistics: planner_statistics::Gauges,
 }
 
 /// One pass: publish the client histograms, then every shard's, then the shard
@@ -1957,9 +2111,10 @@ struct NodeInstruments {
 /// shard snapshot takes twelve cache mutexes per cell. Recording the cheap half
 /// first means a shard that cannot be sampled costs only the shard series.
 ///
-/// The counters come last and take the whole slice at once, because a per-cell
-/// counter is a sum over the scopes on that cell and the histograms' per-shard
-/// loop has no place to put it. See [`shard_counter_totals`].
+/// The counters come last and read the runtime's per-cell totals, because a
+/// per-cell counter is a sum over every scope that has hosted that cell —
+/// closed ones included — and the histograms' per-shard loop has no place to
+/// put it. See [`shard_counter_totals`].
 #[cfg(feature = "otlp")]
 async fn collect_once(
     instruments: &NodeInstruments,
@@ -1971,6 +2126,7 @@ async fn collect_once(
         histograms,
         counters,
         memory,
+        planner_statistics,
     } = instruments;
     memory.record();
     if let Err(error) = histograms.record_client(&query.metrics()) {
@@ -2000,14 +2156,17 @@ async fn collect_once(
                     );
                 }
             }
-            if let Err(error) = counters.record_shard_totals(&shards) {
-                tracing::warn!(error = %error, "shard counters were not published");
-            }
+            planner_statistics.record(&shards);
         }
         Err(_) => tracing::warn!(
             budget_ms = shard_budget.as_millis() as u64,
             "shard metric collection exceeded its budget; last interval's series stay published"
         ),
+    }
+    // Outside the budget: the runtime's totals are atomics read under one
+    // mutex, include closed scopes, and never wait on a shard.
+    if let Err(error) = counters.record_shard_totals(&node.cell_operational_counter_totals()) {
+        tracing::warn!(error = %error, "shard counters were not published");
     }
 }
 
@@ -2048,937 +2207,5 @@ async fn collect_forever(
             }
             () = tokio::time::sleep(interval) => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use hydradb::{
-        ClientQueryMetricsSnapshot, GraphCacheMetricsSnapshot, GraphId,
-        GraphOperationalMetricsSnapshot, GraphScope, GraphShardRuntimeMetrics, NamespaceId,
-        QueryTransportMetricsSnapshot, ScopedGraphShardRuntimeMetrics, DURATION_BUCKET_BOUNDS_US,
-        DURATION_BUCKET_COUNT,
-    };
-
-    use super::*;
-    use crate::admin::{
-        prometheus_counter, prometheus_histogram, PrometheusCounterExport,
-        PROMETHEUS_CLASS_COUNTERS, PROMETHEUS_COUNTERS, PROMETHEUS_FAILURE_COUNTERS,
-        PROMETHEUS_HISTOGRAMS,
-    };
-
-    /// Every histogram field the kernel enumerates, from every snapshot type
-    /// that has one. This is the enumeration both exports are derived from, so
-    /// it is also the only list this test may consult.
-    fn enumerated_fields() -> Vec<&'static str> {
-        let client = ClientQueryMetricsSnapshot::default();
-        let operational = GraphOperationalMetricsSnapshot::default();
-        let transport = QueryTransportMetricsSnapshot::default();
-        client
-            .histogram_fields()
-            .map(|(field, _)| field)
-            .chain(operational.histogram_fields().map(|(field, _)| field))
-            .chain(transport.histogram_fields().map(|(field, _)| field))
-            .collect()
-    }
-
-    /// §1.6: "the two must not disagree about names". A histogram that reaches
-    /// one export and not the other is the failure mode that section is most
-    /// worried about producing in a year, and this is the cheap test it asks
-    /// for — extended to the reverse direction, because a name table row for a
-    /// field nobody records is dead weight that reads like a missing recording
-    /// site.
-    #[test]
-    fn every_histogram_field_reaches_both_exports() {
-        let enumerated = enumerated_fields();
-        assert!(
-            !enumerated.is_empty(),
-            "the kernel enumerates no histograms at all"
-        );
-
-        for field in &enumerated {
-            assert!(
-                otel_histogram(field).is_some(),
-                "{field} is recorded by the kernel but has no OTel name in OTEL_HISTOGRAMS"
-            );
-            assert!(
-                prometheus_histogram(field).is_some(),
-                "{field} is recorded by the kernel but has no Prometheus name in PROMETHEUS_HISTOGRAMS"
-            );
-        }
-
-        for export in OTEL_HISTOGRAMS {
-            assert!(
-                enumerated.contains(&export.field),
-                "OTEL_HISTOGRAMS names {}, which no snapshot enumerates",
-                export.field
-            );
-        }
-        for export in PROMETHEUS_HISTOGRAMS {
-            assert!(
-                enumerated.contains(&export.field),
-                "PROMETHEUS_HISTOGRAMS names {}, which no snapshot enumerates",
-                export.field
-            );
-        }
-    }
-
-    /// Every counter field the kernel enumerates, from every snapshot type this
-    /// binary can obtain, tagged with the snapshot it came from.
-    ///
-    /// Scalar counters and per-class counters in one list, because a name table
-    /// row is a name table row and the two tables are searched together. The
-    /// class rows arrive flattened — one per field per class — and are collapsed
-    /// with a consecutive `dedup`, which is enough because
-    /// `class_counter_fields` groups by field.
-    ///
-    /// `QueryTransportMetricsSnapshot` is absent on purpose; see
-    /// [`CounterSource`].
-    fn enumerated_counter_fields() -> Vec<(CounterSource, &'static str)> {
-        let client = ClientQueryMetricsSnapshot::default();
-        let operational = GraphOperationalMetricsSnapshot::default();
-        let cache = GraphCacheMetricsSnapshot::default();
-        let mut fields: Vec<(CounterSource, &'static str)> = Vec::new();
-        fields.extend(
-            client
-                .counter_fields()
-                .map(|(field, _)| (CounterSource::Client, field)),
-        );
-        fields.extend(
-            client
-                .class_counter_fields()
-                .map(|(field, _, _)| (CounterSource::Client, field)),
-        );
-        fields.extend(
-            client
-                .failure_counter_fields()
-                .map(|(field, ..)| (CounterSource::Client, field)),
-        );
-        fields.extend(
-            operational
-                .counter_fields()
-                .map(|(field, _)| (CounterSource::Shard, field)),
-        );
-        fields.extend(
-            operational
-                .class_counter_fields()
-                .map(|(field, _, _)| (CounterSource::Shard, field)),
-        );
-        fields.extend(
-            cache
-                .counter_fields()
-                .map(|(field, _)| (CounterSource::ShardCache, field)),
-        );
-        fields.dedup();
-        fields
-    }
-
-    /// §1.6, for counters. The same property
-    /// [`every_histogram_field_reaches_both_exports`] holds for the five
-    /// duration histograms, over the sixty-nine operational counters that are
-    /// part of the actual
-    /// gap: `/metrics` exported eight of them before M2.
-    ///
-    /// The reverse direction matters more here than it did for histograms. A
-    /// name table can grow a row for a field that was
-    /// renamed or deleted and nothing else will ever notice, and a dead row
-    /// reads exactly like a live counter whose recording site is missing.
-    #[test]
-    fn every_counter_field_reaches_both_exports() {
-        let enumerated = enumerated_counter_fields();
-        assert_eq!(
-            enumerated.len(),
-            128,
-            "86 operational + 19 cache + 19 client counters, plus the two \
-             error-class breakdowns and the two failure-reason breakdowns, one \
-             per engine: {enumerated:#?}"
-        );
-
-        for (source, field) in &enumerated {
-            assert!(
-                otel_counter(*source, field).is_some(),
-                "{source:?}::{field} is recorded by the kernel but has no OTel name"
-            );
-            assert!(
-                prometheus_counter(*source, field).is_some(),
-                "{source:?}::{field} is recorded by the kernel but has no Prometheus name"
-            );
-        }
-
-        for export in OTEL_COUNTERS
-            .iter()
-            .chain(OTEL_CLASS_COUNTERS)
-            .chain(OTEL_FAILURE_COUNTERS)
-        {
-            assert!(
-                enumerated.contains(&(export.source, export.field)),
-                "OTEL_COUNTERS names {:?}::{}, which no snapshot enumerates",
-                export.source,
-                export.field
-            );
-        }
-        for export in PROMETHEUS_COUNTERS
-            .iter()
-            .chain(PROMETHEUS_CLASS_COUNTERS)
-            .chain(PROMETHEUS_FAILURE_COUNTERS)
-        {
-            assert!(
-                enumerated.contains(&(export.source, export.field)),
-                "PROMETHEUS_COUNTERS names {:?}::{}, which no snapshot enumerates",
-                export.source,
-                export.field
-            );
-        }
-    }
-
-    /// The `PROMETHEUS_HISTOGRAMS`-names-five-when-three-have-sources
-    /// reconciliation, as an assertion rather than a paragraph.
-    ///
-    /// Three properties in one test because they are one claim:
-    ///
-    /// 1. Exactly the fields `QueryTransportMetricsSnapshot` enumerates are
-    ///    declared [`FieldSource::TransportOnly`], in **both** tables. Flip one
-    ///    row either way and this fails.
-    /// 2. The two tables agree per field, so a future round cannot decide the
-    ///    transport is reachable for `/metrics` and not for the meter.
-    /// 3. The count of `graph-node`-sourced rows equals the number of histograms
-    ///    the two snapshots this binary *does* hold enumerate — derived from the
-    ///    kernel, not written as `3`, so it stays true when H3 adds a family.
-    #[test]
-    fn only_the_transport_histograms_declare_no_graph_node_source() {
-        let transport: Vec<&str> = QueryTransportMetricsSnapshot::default()
-            .histogram_fields()
-            .map(|(field, _)| field)
-            .collect();
-        assert_eq!(
-            transport,
-            vec!["rpc_latency", "serve_latency"],
-            "the transport snapshot's histograms changed; reclassify the rows"
-        );
-
-        let expected = |field: &str| {
-            if transport.contains(&field) {
-                FieldSource::TransportOnly
-            } else {
-                FieldSource::GraphNode
-            }
-        };
-        for export in OTEL_HISTOGRAMS {
-            assert_eq!(
-                export.source,
-                expected(export.field),
-                "OTEL_HISTOGRAMS misclassifies {}",
-                export.field
-            );
-        }
-        for export in PROMETHEUS_HISTOGRAMS {
-            assert_eq!(
-                export.source,
-                expected(export.field),
-                "PROMETHEUS_HISTOGRAMS misclassifies {}",
-                export.field
-            );
-            let otel = otel_histogram(export.field).expect("named for OTel");
-            assert_eq!(
-                export.source, otel.source,
-                "{} has a source in one export and not the other",
-                export.field
-            );
-        }
-
-        let node_sourced = ClientQueryMetricsSnapshot::default()
-            .histogram_fields()
-            .count()
-            + GraphOperationalMetricsSnapshot::default()
-                .histogram_fields()
-                .count();
-        for table in [
-            PROMETHEUS_HISTOGRAMS
-                .iter()
-                .filter(|row| row.source == FieldSource::GraphNode)
-                .count(),
-            OTEL_HISTOGRAMS
-                .iter()
-                .filter(|row| row.source == FieldSource::GraphNode)
-                .count(),
-        ] {
-            assert_eq!(
-                table, node_sourced,
-                "a name table claims a live family this binary has no snapshot for"
-            );
-        }
-    }
-
-    /// The twenty-three counters that reach neither export, pinned.
-    ///
-    /// This is the test that makes the absence structural. Three directions:
-    ///
-    /// - The kernel's own enumeration equals [`TRANSPORT_ONLY_COUNTERS`], so a
-    ///   counter added to `QueryTransportMetricsSnapshot` fails here instead of
-    ///   joining a silent gap — and a counter *removed* from it leaves a dead
-    ///   entry that also fails.
-    /// - Every counter the kernel declares is accounted for: the 108 rows
-    ///   `every_counter_field_reaches_both_exports` covers plus these
-    ///   twenty-three is the whole of it, so "108 exported" is a complete
-    ///   statement rather than a count of what somebody got round to.
-    /// - Where a transport identifier *does* have a name-table row, a `graph-node`
-    ///   snapshot must also enumerate it. Otherwise the row would be exporting a
-    ///   transport number under a source that cannot produce one, which is the
-    ///   exact mistake a table keyed by `field` alone would invite —
-    ///   `auth_failures`, `cancellations` and `backpressure_waits` all take this
-    ///   branch (the last of them twice, since the shard has one too), so it is
-    ///   not vacuous.
-    #[test]
-    fn the_transport_counters_are_pinned_as_sourceless() {
-        let enumerated: Vec<&str> = QueryTransportMetricsSnapshot::default()
-            .counter_fields()
-            .map(|(field, _)| field)
-            .collect();
-        assert_eq!(
-            enumerated, TRANSPORT_ONLY_COUNTERS,
-            "the transport snapshot's counters changed; TRANSPORT_ONLY_COUNTERS is the pin"
-        );
-
-        let exported = enumerated_counter_fields();
-        assert_eq!(
-            exported.len() + TRANSPORT_ONLY_COUNTERS.len(),
-            128 + 23,
-            "every counter the kernel declares is either exported or pinned here"
-        );
-
-        let mut collided: Vec<(CounterSource, &str)> = Vec::new();
-        for field in TRANSPORT_ONLY_COUNTERS {
-            for source in CounterSource::ALL {
-                if otel_counter(*source, field).is_none() {
-                    continue;
-                }
-                collided.push((*source, field));
-                assert!(
-                    exported.contains(&(*source, *field)),
-                    "{source:?}::{field} has a name table row, but only the transport \
-                     snapshot enumerates that identifier"
-                );
-            }
-        }
-        assert_eq!(
-            collided,
-            vec![
-                (CounterSource::Client, "auth_failures"),
-                (CounterSource::Client, "cancellations"),
-                (CounterSource::Client, "backpressure_waits"),
-                (CounterSource::Shard, "backpressure_waits"),
-            ],
-            "the identifiers a transport counter shares with an exported one changed"
-        );
-    }
-
-    /// The trip-wire for the day a transport source appears.
-    ///
-    /// Vacuous today, and deliberately so: every [`CounterSource`] variant is
-    /// [`FieldSource::GraphNode`] and there is nothing else to say. What makes it
-    /// worth its lines is the *pair* — [`CounterSource::field_source`]'s
-    /// exhaustive match means a new variant does not compile until it is
-    /// classified, and a variant classified [`FieldSource::TransportOnly`] fails
-    /// here. So a future round that gives `graph-node` a transport snapshot gets a
-    /// red test naming exactly what it still owes, instead of twenty-three series
-    /// that stay missing because nobody remembered the tables.
-    #[test]
-    fn every_counter_source_has_a_graph_node_snapshot() {
-        assert_eq!(
-            CounterSource::ALL.len(),
-            3,
-            "CounterSource::ALL is out of step with the enum"
-        );
-        for source in CounterSource::ALL {
-            assert_eq!(
-                source.field_source(),
-                FieldSource::GraphNode,
-                "{source:?} has no graph-node snapshot, so its counters need name \
-                 table rows and a renderer in admin.rs before this can pass"
-            );
-        }
-    }
-
-    /// A counter that restates a histogram's sum must be marked derived on
-    /// **both** sides or on neither.
-    ///
-    /// The two exports are allowed to disagree about dimensionality (§1.4) and
-    /// about names (§1.9). They are not allowed to disagree about whether a
-    /// number is exported at all, because that is the one difference an operator
-    /// reading two dashboards would read as data.
-    #[test]
-    fn the_two_exports_agree_about_which_counters_are_derived() {
-        for (source, field) in enumerated_counter_fields() {
-            let otel = otel_counter(source, field).expect("named for OTel");
-            let prometheus = prometheus_counter(source, field).expect("named for Prometheus");
-            assert_eq!(
-                matches!(otel.export, OtelCounterExport::Derived(_)),
-                matches!(prometheus.export, PrometheusCounterExport::Derived(_)),
-                "{source:?}::{field} is derived in one export and a series in the other"
-            );
-        }
-    }
-
-    /// A derived counter has to point at a histogram family that is really
-    /// exported, or "it is already on the wire" is an unchecked claim.
-    #[test]
-    fn derived_counters_point_at_exported_histogram_families() {
-        for export in OTEL_COUNTERS {
-            let OtelCounterExport::Derived(families) = export.export else {
-                continue;
-            };
-            assert!(
-                !families.is_empty(),
-                "{} is derived from nothing",
-                export.field
-            );
-            for family in families {
-                assert!(
-                    OTEL_HISTOGRAMS.iter().any(|row| row.name == *family),
-                    "{} is derived from {family}, which no OTel histogram is named",
-                    export.field
-                );
-            }
-        }
-        for export in PROMETHEUS_COUNTERS {
-            let PrometheusCounterExport::Derived(families) = export.export else {
-                continue;
-            };
-            assert!(
-                !families.is_empty(),
-                "{} is derived from nothing",
-                export.field
-            );
-            for family in families {
-                assert!(
-                    PROMETHEUS_HISTOGRAMS.iter().any(|row| row.name == *family),
-                    "{} is derived from {family}, which no Prometheus histogram is named",
-                    export.field
-                );
-            }
-        }
-    }
-
-    /// One name, one metric — across the counter tables *and* the histogram
-    /// tables, because the collision that actually bites is between the two.
-    ///
-    /// `query_rows_duration_us` is the kernel's name for
-    /// `query_rows_latency.sum_us`, and the obvious Prometheus name for it is
-    /// `graph_query_rows_duration_microseconds` — which is already the histogram
-    /// family's stem. Two `# TYPE` lines for one name, one `counter` and one
-    /// `histogram`, is a rejected scrape rather than an extra series, so this is
-    /// the test that made [`PrometheusCounterExport::Derived`] exist.
-    #[test]
-    fn no_two_metrics_share_an_exported_name() {
-        // A histogram family may be exported by more than one field — the two
-        // engines are two series of one family, told apart by a label and not
-        // by a name — so the family names are deduplicated before the check.
-        // What this test is about is a *counter* and a *histogram* colliding,
-        // which is a rejected scrape rather than an extra series.
-        let mut histogram_names: Vec<&str> = PROMETHEUS_HISTOGRAMS
-            .iter()
-            .map(|export| export.name)
-            .collect();
-        histogram_names.sort_unstable();
-        histogram_names.dedup();
-        // Same deduplication, same reason: the failure family is one name per
-        // engine, told apart by `cypher_engine`.
-        let mut failure_names: Vec<&str> = PROMETHEUS_FAILURE_COUNTERS
-            .iter()
-            .filter_map(|export| export.export.name())
-            .collect();
-        failure_names.sort_unstable();
-        failure_names.dedup();
-        let mut prometheus: Vec<&str> = PROMETHEUS_COUNTERS
-            .iter()
-            .chain(PROMETHEUS_CLASS_COUNTERS)
-            .filter_map(|export| export.export.name())
-            .chain(failure_names)
-            .chain(histogram_names)
-            .collect();
-        let before = prometheus.len();
-        prometheus.sort_unstable();
-        prometheus.dedup();
-        assert_eq!(
-            before,
-            prometheus.len(),
-            "two Prometheus metrics share a name"
-        );
-
-        // `OTEL_HISTOGRAMS` names are deliberately not unique — read and write
-        // share `db.client.operation.duration` and are told apart by
-        // `db.operation.name` — so they are deduplicated before being joined
-        // rather than counted twice.
-        let mut histograms: Vec<&str> = OTEL_HISTOGRAMS.iter().map(|export| export.name).collect();
-        histograms.sort_unstable();
-        histograms.dedup();
-        // And the failure family is one name per engine, told apart by
-        // `hydradb.cypher_engine`.
-        let mut failures: Vec<&str> = OTEL_FAILURE_COUNTERS
-            .iter()
-            .filter_map(|export| export.export.name())
-            .collect();
-        failures.sort_unstable();
-        failures.dedup();
-        let mut otel: Vec<&str> = OTEL_COUNTERS
-            .iter()
-            .chain(OTEL_CLASS_COUNTERS)
-            .filter_map(|export| export.export.name())
-            .chain(failures)
-            .chain(histograms)
-            .collect();
-        let before = otel.len();
-        otel.sort_unstable();
-        otel.dedup();
-        assert_eq!(before, otel.len(), "two OTel metrics share a name");
-    }
-
-    /// `hydradb.scope` is unbounded per tenant, and §1.4's decision was to
-    /// leave the families that already carry it and let nothing new join them.
-    ///
-    /// "Nothing new" is three specific families, named here. On the OTel side
-    /// there is nothing to assert because there is nothing to say: no
-    /// [`OtelCounterExport`] variant carries a scope.
-    #[test]
-    fn only_the_three_pre_existing_families_are_dimensioned_by_scope() {
-        let scoped: Vec<&str> = PROMETHEUS_COUNTERS
-            .iter()
-            .chain(PROMETHEUS_CLASS_COUNTERS)
-            .filter(|export| matches!(export.export, PrometheusCounterExport::ScopePerCell(_)))
-            .map(|export| export.field)
-            .collect();
-        assert_eq!(
-            scoped,
-            vec![
-                "query_graphblas_artifact_snapshots",
-                "query_graphblas_rebuilt_snapshots",
-                "query_rust_sparse_fallbacks",
-            ],
-            "a new counter family took a scope label"
-        );
-    }
-
-    /// The names may diverge — `/metrics` keeps `graph_*` and OTLP takes
-    /// `db.*`/`hydradb.*` — but a bucket bound rendered two different ways is
-    /// a single measurement that answers two different questions.
-    #[test]
-    fn the_two_exports_agree_about_the_unit() {
-        for field in enumerated_fields() {
-            let otel = otel_histogram(field).expect("named for OTel");
-            let prometheus = prometheus_histogram(field).expect("named for Prometheus");
-            assert_eq!(
-                otel.unit, prometheus.unit,
-                "{field} is exported in two different units"
-            );
-        }
-    }
-
-    /// A Prometheus name in seconds whose unit says microseconds — or the
-    /// reverse — is a series every dashboard reads off by a factor of a
-    /// million, and nothing downstream can detect it.
-    #[test]
-    fn prometheus_names_carry_their_unit_suffix() {
-        for export in PROMETHEUS_HISTOGRAMS {
-            let expected = match export.unit {
-                ExportUnit::Seconds => "_seconds",
-                ExportUnit::Microseconds => "_microseconds",
-            };
-            assert!(
-                export.name.ends_with(expected),
-                "{} is exported in {:?} but is not named {expected}",
-                export.name,
-                export.unit
-            );
-        }
-    }
-
-    /// Two fields sharing an instrument name with nothing to tell them apart is
-    /// two populations collapsing into one series — silently, because
-    /// `ObservableHistogram` keys its series by the label set and the second
-    /// record of each interval simply overwrites the first.
-    ///
-    /// So the uniqueness this asserts is over the *series identity*, not over
-    /// the name: `(name, operation, cypher_engine)`. `db.client.operation.duration`
-    /// is deliberately four rows — read and write, each on two engines; two of
-    /// them taking the same name, operation and engine is the failure.
-    #[test]
-    fn no_two_fields_share_an_exported_series_identity() {
-        let otel: Vec<(&str, Option<&str>, Option<&str>)> = OTEL_HISTOGRAMS
-            .iter()
-            .map(|export| {
-                (
-                    export.name,
-                    export.operation,
-                    crate::admin::cypher_engine_label(export.field),
-                )
-            })
-            .collect();
-        let prometheus: Vec<(&str, Option<&str>, Option<&str>)> = PROMETHEUS_HISTOGRAMS
-            .iter()
-            .map(|export| {
-                (
-                    export.name,
-                    None,
-                    crate::admin::cypher_engine_label(export.field),
-                )
-            })
-            .collect();
-        for table in [otel, prometheus] {
-            let mut sorted = table.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            assert_eq!(
-                sorted.len(),
-                table.len(),
-                "two fields share a series identity: {table:?}"
-            );
-        }
-    }
-
-    /// The registration invariant, checked where a test can actually run it.
-    ///
-    /// `NodeHistograms::register` is behind the `otlp` feature, which no `just`
-    /// recipe *runs* — `check-all-features` compiles it and nothing executes it.
-    /// So the property that keeps it correct is asserted against
-    /// [`otel_instrument_groups`], which is the thing it iterates and is not
-    /// gated: one group is one instrument, and a group with more than one row is
-    /// exactly the case where every row must carry a distinct
-    /// `db.operation.name`.
-    #[test]
-    fn rows_sharing_a_name_are_told_apart_by_the_operation_and_engine_labels() {
-        let groups = otel_instrument_groups();
-        assert_eq!(
-            groups.len(),
-            13,
-            "read and write share one instrument; the twelve hydradb.* metrics do not: {groups:#?}"
-        );
-
-        for (name, rows) in &groups {
-            // A shared instrument has one description and one unit, because
-            // those are properties of the instrument and not of the row.
-            let first = rows.first().expect("a group has at least one row");
-            for row in rows {
-                assert_eq!(row.unit, first.unit, "{name} is registered in two units");
-                assert_eq!(
-                    row.description, first.description,
-                    "{name} is registered with two descriptions"
-                );
-            }
-
-            if rows.len() == 1 {
-                continue;
-            }
-            let mut operations: Vec<(&str, Option<&str>)> = rows
-                .iter()
-                .map(|row| {
-                    let operation = row.operation.unwrap_or_else(|| {
-                        panic!("{} shares the name {name} but carries no operation label, so its series would merge", row.field)
-                    });
-                    // The engine is the second half of the identity: the read
-                    // rows share `operation: read` and are kept apart by
-                    // `hydradb.cypher_engine` alone.
-                    (operation, crate::admin::cypher_engine_label(row.field))
-                })
-                .collect();
-            let before = operations.len();
-            operations.sort_unstable();
-            operations.dedup();
-            assert_eq!(
-                before,
-                operations.len(),
-                "{name} has two rows claiming the same operation and engine"
-            );
-        }
-
-        let client = groups
-            .iter()
-            .find(|(name, _)| *name == "db.client.operation.duration")
-            .expect("the one metric with a stable semantic convention");
-        let mut fields: Vec<&str> = client.1.iter().map(|row| row.field).collect();
-        fields.sort_unstable();
-        assert_eq!(
-            fields,
-            vec![
-                "read_latency_experimental",
-                "read_latency_legacy",
-                "write_latency_experimental",
-                "write_latency_legacy",
-            ]
-        );
-    }
-
-    /// The semconv name is the *whole* name. A suffix would make it a HydraDB
-    /// metric wearing a semconv prefix, matching no vendor's database view and
-    /// none of the queries that name is worth having for.
-    #[test]
-    fn the_client_metric_keeps_the_bare_semconv_name() {
-        for export in OTEL_HISTOGRAMS {
-            if export.field == "read_latency" || export.field == "write_latency" {
-                assert_eq!(export.name, "db.client.operation.duration");
-            }
-        }
-    }
-
-    /// The deliberate non-conformance, asserted rather than described: semconv
-    /// marks `db.namespace` required-if-applicable on `db.client.*` and it *is*
-    /// applicable — the namespace is `hydradb.scope`, the unbounded tenant root
-    /// the label registry exists to keep off metrics. Its absence is the design,
-    /// and a future row adding it back should fail here rather than in a bill.
-    #[test]
-    fn the_client_family_carries_no_namespace() {
-        assert!(
-            !hydradb_telemetry::semconv::METRIC_LABELS
-                .iter()
-                .any(|label| label.key() == "db.namespace"),
-            "db.namespace became a metric label"
-        );
-        assert!(
-            hydradb_telemetry::semconv::SPAN_ONLY_KEYS.contains(&hydradb_telemetry::semconv::SCOPE)
-        );
-    }
-
-    /// `le` is the join between the two exports. The seconds rendering is the
-    /// one that can go wrong — `0.000100000` and `0.0001` are two series.
-    #[test]
-    fn bounds_render_identically_to_the_meters_rendering() {
-        let microseconds: Vec<String> = DURATION_BUCKET_BOUNDS_US
-            .iter()
-            .map(|bound| ExportUnit::Microseconds.render_bound(*bound))
-            .collect();
-        assert_eq!(microseconds.first().map(String::as_str), Some("100"));
-        assert_eq!(microseconds.last().map(String::as_str), Some("300000000"));
-
-        let seconds: Vec<String> = DURATION_BUCKET_BOUNDS_US
-            .iter()
-            .map(|bound| ExportUnit::Seconds.render_bound(*bound))
-            .collect();
-        assert_eq!(seconds.first().map(String::as_str), Some("0.0001"));
-        assert_eq!(seconds.last().map(String::as_str), Some("300"));
-        assert_eq!(ExportUnit::Seconds.render_sum(2_500_000), "2.5");
-        assert_eq!(ExportUnit::Microseconds.render_sum(2_500_000), "2500000");
-    }
-
-    /// The ladder is exported once from the kernel precisely so nothing here
-    /// restates it. If that ever stops holding, every `le` in both exports is
-    /// off by one bucket.
-    #[test]
-    fn the_ladder_comes_from_the_kernel() {
-        assert_eq!(DURATION_BUCKET_BOUNDS_US.len() + 1, DURATION_BUCKET_COUNT);
-    }
-
-    /// Two shards on one `cell_id` under different tenants, plus a third cell.
-    ///
-    /// The shape `local_shard_runtime_metrics` returns on a node hosting two
-    /// tenants that both have work on the same cell — the case that makes the
-    /// summing in [`shard_counter_totals`] necessary rather than tidy.
-    fn two_tenants_on_one_cell_and_one_alone() -> Vec<ScopedGraphShardRuntimeMetrics> {
-        [
-            ("alpha", "cell-a", 3u64, 700u64),
-            ("beta", "cell-a", 4, 90),
-            ("alpha", "cell-b", 5, 1),
-        ]
-        .into_iter()
-        .map(
-            |(tenant, cell_id, write_attempts, gc_duration_us)| ScopedGraphShardRuntimeMetrics {
-                scope: GraphScope::tenant(
-                    NamespaceId::new(tenant).expect("a valid namespace id"),
-                    GraphId::default(),
-                ),
-                shard: GraphShardRuntimeMetrics {
-                    cell_id: cell_id.to_string(),
-                    operational: GraphOperationalMetricsSnapshot {
-                        write_attempts,
-                        gc_duration_us,
-                        ..Default::default()
-                    },
-                    cache: GraphCacheMetricsSnapshot::default(),
-                    cache_entries: Default::default(),
-                    cache_resident_bytes: Default::default(),
-                    storage: Default::default(),
-                },
-            },
-        )
-        .collect()
-    }
-
-    /// The counters `NodeCounters` registers are exactly
-    /// `GraphOperationalMetricsSnapshot`'s scalars that are not derived — total
-    /// over the kernel's own enumeration, in both directions.
-    ///
-    /// This is what stops the wiring being advisory. Before it, a shard counter
-    /// added to the kernel would get a name from
-    /// [`every_counter_field_reaches_both_exports`], reach `/metrics`, and reach
-    /// the meter only if somebody remembered — and a missing OTLP series looks
-    /// exactly like a counter at rest. The `iff` is the whole assertion: a
-    /// registered derived row would double-count a histogram's `.sum` under a
-    /// second name, and an unregistered plain row is a silent hole.
-    #[test]
-    fn every_shard_counter_is_registered_as_an_instrument() {
-        let registered: Vec<(CounterSource, &str)> = otel_counter_instruments()
-            .iter()
-            .map(|row| (row.source, row.field))
-            .collect();
-
-        let enumerated: Vec<&'static str> = GraphOperationalMetricsSnapshot::default()
-            .counter_fields()
-            .map(|(field, _)| field)
-            .collect();
-        assert_eq!(
-            enumerated.len(),
-            86,
-            "the operational snapshot's scalar counters changed: {enumerated:#?}"
-        );
-
-        let mut derived = 0;
-        for field in &enumerated {
-            let row = otel_counter(CounterSource::Shard, field).expect("named for OTel");
-            let is_derived = matches!(row.export, OtelCounterExport::Derived(_));
-            derived += usize::from(is_derived);
-            assert_eq!(
-                registered.contains(&(CounterSource::Shard, *field)),
-                !is_derived,
-                "{field} is registered as an instrument iff it is not derived"
-            );
-        }
-        assert_eq!(
-            derived, 1,
-            "query_rows_duration_us is the one shard counter that restates a histogram sum"
-        );
-        assert_eq!(
-            registered.len(),
-            enumerated.len() - derived,
-            "otel_counter_instruments names something the operational snapshot does not \
-             enumerate: {registered:#?}"
-        );
-    }
-
-    /// One snapshot is on the meter and two are not, and the stopping point is
-    /// pinned rather than described.
-    ///
-    /// Three absences, each of which would otherwise be indistinguishable from an
-    /// oversight: the two unwired sources, named so that a reader knows the gap is
-    /// bounded and knows what closing it costs; and the error-class breakdowns,
-    /// which are absent because `cell_id × error.class` is ten series per cell
-    /// instead of one and that multiplier is a §1.4 decision, not a wiring detail.
-    #[test]
-    fn only_the_shard_scalars_are_registered_this_round() {
-        assert_eq!(METERED_COUNTER_SOURCES, &[CounterSource::Shard]);
-        let unwired: Vec<CounterSource> = CounterSource::ALL
-            .iter()
-            .copied()
-            .filter(|source| !METERED_COUNTER_SOURCES.contains(source))
-            .collect();
-        assert_eq!(
-            unwired,
-            vec![CounterSource::Client, CounterSource::ShardCache],
-            "the set of counter snapshots reaching /metrics alone changed"
-        );
-
-        let instruments = otel_counter_instruments();
-        for row in OTEL_CLASS_COUNTERS.iter().chain(OTEL_FAILURE_COUNTERS) {
-            assert!(
-                !instruments
-                    .iter()
-                    .any(|instrument| instrument.source == row.source
-                        && instrument.field == row.field),
-                "{} is registered, so it now costs cell_id × error.class series",
-                row.field
-            );
-        }
-    }
-
-    /// A counter's unit is derived from its field name, so the derivation and both
-    /// name tables have to agree — in all three directions, or the derivation is
-    /// just a guess that happens to be right today.
-    ///
-    /// A microsecond total exported as a count is not a wrong number an operator
-    /// can see; it is a series whose scale has to be guessed, and guessed against
-    /// the `_microseconds` series `/metrics` renders from the same field.
-    #[test]
-    fn the_microsecond_counters_are_named_for_their_unit() {
-        let mut microseconds = 0;
-        for (source, field) in enumerated_counter_fields() {
-            let quantity = CounterQuantity::of_field(field);
-            let otel = otel_counter(source, field).expect("named for OTel");
-            let prometheus = prometheus_counter(source, field).expect("named for Prometheus");
-            // Derived rows have no name in either table, so there is nothing to
-            // cross-check them against — the field name is the only evidence and
-            // this test would be circular. Both of them are `_us`.
-            let Some(otel_name) = otel.export.name() else {
-                assert_eq!(quantity, CounterQuantity::Microseconds);
-                continue;
-            };
-            let prometheus_name = prometheus.export.name().expect("agreed to be a series");
-
-            microseconds += usize::from(quantity == CounterQuantity::Microseconds);
-            assert_eq!(
-                quantity == CounterQuantity::Microseconds,
-                otel_name.ends_with(".duration.sum"),
-                "{source:?}::{field} is a {quantity:?} counter named {otel_name}"
-            );
-            assert_eq!(
-                quantity == CounterQuantity::Microseconds,
-                prometheus_name.ends_with("_microseconds"),
-                "{source:?}::{field} is a {quantity:?} counter named {prometheus_name}"
-            );
-        }
-        assert!(
-            microseconds > 0,
-            "no counter is a microsecond total, so the derivation is untested"
-        );
-    }
-
-    /// Two tenants with work on one cell produce **one** series per counter,
-    /// carrying the sum.
-    ///
-    /// The failure this rules out is silent in a way the `/metrics` one is not.
-    /// `admin::tests::per_cell_counters_are_summed_across_scopes` guards a
-    /// duplicate series in a scrape, which Prometheus rejects outright; here the
-    /// series identity is the label set, so publishing per scope would make the
-    /// last tenant recorded *overwrite* the others and the cell would report one
-    /// tenant's traffic as its own — a plausible number, permanently low, with
-    /// nothing anywhere to say so.
-    #[test]
-    fn two_scopes_on_one_cell_sum_rather_than_overwrite() {
-        let shards = two_tenants_on_one_cell_and_one_alone();
-        let totals = shard_counter_totals(&shards);
-        let cells: Vec<&str> = totals.iter().map(|(cell_id, _)| *cell_id).collect();
-        assert_eq!(
-            cells,
-            vec!["cell-a", "cell-b"],
-            "one entry per cell, whatever the tenant count"
-        );
-
-        let value = |cell: &str, field: &str| {
-            totals
-                .iter()
-                .find(|(cell_id, _)| *cell_id == cell)
-                .and_then(|(_, fields)| fields.iter().find(|(name, _)| *name == field))
-                .map(|(_, value)| *value)
-                .unwrap_or_else(|| panic!("no {field} for {cell} in {totals:#?}"))
-        };
-        assert_eq!(value("cell-a", "write_attempts"), 7, "3 + 4, not 4");
-        assert_eq!(value("cell-a", "gc_duration_us"), 790, "700 + 90");
-        assert_eq!(value("cell-b", "write_attempts"), 5);
-
-        // Every enumerated field is present for every cell, including the ones
-        // that are zero: the recording loop drives off this, so a field dropped
-        // here is a series that silently stops rather than one that reads zero.
-        let enumerated = GraphOperationalMetricsSnapshot::default()
-            .counter_fields()
-            .count();
-        for (cell_id, fields) in &totals {
-            assert_eq!(fields.len(), enumerated, "{cell_id} lost a counter field");
-        }
-    }
-
-    /// No shard, no series — not a row of zeroes.
-    ///
-    /// A node that has opened no scope yet must publish nothing, because an
-    /// observable counter reporting a zero for a label set that does not exist is
-    /// how a dashboard grows rows for cells that were never hosted here.
-    #[test]
-    fn a_node_with_no_shards_publishes_no_counter_series() {
-        assert!(shard_counter_totals(&[]).is_empty());
     }
 }

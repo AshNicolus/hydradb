@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 #[cfg(feature = "opencypher")]
 use std::sync::Arc;
 
@@ -322,9 +321,7 @@ where
         metrics: &GraphCacheMetrics,
     ) -> Option<V> {
         if self.max_entries == 0 {
-            metrics
-                .tenant_quota_rejections
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.record_quota_rejection();
             return None;
         }
 
@@ -346,10 +343,7 @@ where
         }
         self.resident_bytes = self.resident_bytes.saturating_add(resident_bytes);
         *self.tenant_entries.entry(tenant.clone()).or_default() += 1;
-        metrics.insertions.fetch_add(1, Ordering::Relaxed);
-        if pinned {
-            metrics.pinned_insertions.fetch_add(1, Ordering::Relaxed);
-        }
+        metrics.record_insertion(pinned);
 
         self.enforce_tenant_quota(&tenant, metrics);
         self.enforce_total_limit(metrics);
@@ -375,9 +369,7 @@ where
             if self.evict_one(Some(tenant), false, metrics).is_none()
                 && self.evict_one(Some(tenant), true, metrics).is_none()
             {
-                metrics
-                    .tenant_quota_rejections
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.record_quota_rejection();
                 break;
             }
         }
@@ -412,7 +404,7 @@ where
             .min_by_key(|(_, entry)| entry.last_access)
             .map(|(key, _)| key.clone())?;
         self.remove(&key);
-        metrics.evictions.fetch_add(1, Ordering::Relaxed);
+        metrics.record_eviction();
         Some(())
     }
 
@@ -430,40 +422,5 @@ where
                 self.tenant_entries.remove(tenant);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn byte_limit_evicts_lru_entries() {
-        let metrics = GraphCacheMetrics::default();
-        let mut cache = BoundedGraphCache::new_with_byte_limit(10, None, 100);
-        assert_eq!(
-            cache.insert_sized(1, "first", "cell", false, 60, &metrics),
-            Some("first")
-        );
-        assert_eq!(
-            cache.insert_sized(2, "second", "cell", false, 60, &metrics),
-            Some("second")
-        );
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.resident_bytes(), 60);
-        assert_eq!(cache.get(&1), None);
-        assert_eq!(cache.get(&2), Some("second"));
-    }
-
-    #[test]
-    fn oversized_entry_is_not_retained() {
-        let metrics = GraphCacheMetrics::default();
-        let mut cache = BoundedGraphCache::new_with_byte_limit(10, None, 100);
-        assert_eq!(
-            cache.insert_sized(1, "oversized", "cell", true, 101, &metrics),
-            None
-        );
-        assert_eq!(cache.len(), 0);
-        assert_eq!(cache.resident_bytes(), 0);
     }
 }

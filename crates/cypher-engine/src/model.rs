@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{ExpandDirection, ScalarValue};
@@ -40,6 +41,86 @@ fn integer_float_equal(integer: i128, float: f64) -> bool {
         && (float as i128) == integer
 }
 
+pub(crate) fn scalar_value_rank(value: &ScalarValue) -> u8 {
+    match value {
+        ScalarValue::Boolean(_) => 0,
+        ScalarValue::Integer(_) | ScalarValue::Float(_) => 1,
+        ScalarValue::String(_) => 2,
+        ScalarValue::Null => u8::MAX,
+    }
+}
+
+/// The total order Cypher sorts scalar values by, and the order an ordered
+/// property index walk must produce: booleans, then numbers (integers and
+/// floats compared by value, so `1` ties `1.0` and `-0.0` ties `0.0`, with NaN
+/// above every other number), then strings; `NULL` sorts last. Comparisons in
+/// expressions use the same order, so an index bound on a stored value decides
+/// exactly what the equivalent predicate would.
+pub fn compare_property_values(left: &ScalarValue, right: &ScalarValue) -> Ordering {
+    match (left, right) {
+        (ScalarValue::Null, ScalarValue::Null) => Ordering::Equal,
+        (ScalarValue::Null, _) => Ordering::Greater,
+        (_, ScalarValue::Null) => Ordering::Less,
+        (ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left.cmp(right),
+        (ScalarValue::Integer(left), ScalarValue::Integer(right)) => left.cmp(right),
+        (ScalarValue::Float(left), ScalarValue::Float(right)) => {
+            compare_float_spellings(left, right)
+        }
+        (ScalarValue::Integer(left), ScalarValue::Float(right)) => right
+            .parse::<f64>()
+            .ok()
+            .map(|right| compare_integer_float(*left, right))
+            .unwrap_or_else(|| left.to_string().cmp(&right.to_string())),
+        (ScalarValue::Float(left), ScalarValue::Integer(right)) => left
+            .parse::<f64>()
+            .ok()
+            .map(|left| compare_integer_float(*right, left).reverse())
+            .unwrap_or_else(|| left.to_string().cmp(&right.to_string())),
+        (ScalarValue::String(left), ScalarValue::String(right)) => left.cmp(right),
+        _ => scalar_value_rank(left).cmp(&scalar_value_rank(right)),
+    }
+}
+
+fn compare_float_spellings(left: &str, right: &str) -> Ordering {
+    match (left.parse::<f64>(), right.parse::<f64>()) {
+        (Ok(left), Ok(right)) => left
+            .partial_cmp(&right)
+            .unwrap_or_else(|| left.total_cmp(&right)),
+        _ => left.cmp(right),
+    }
+}
+
+fn compare_integer_float(integer: i128, float: f64) -> Ordering {
+    const I128_INCLUSIVE_LOWER: f64 = -170141183460469231731687303715884105728.0;
+    const I128_EXCLUSIVE_UPPER: f64 = 170141183460469231731687303715884105728.0;
+    // Float-to-float comparison places NaN above every number (and a
+    // negative NaN below), as legacy does for both comparisons. Integers must
+    // agree, or the order would not be transitive.
+    if float.is_nan() {
+        return if float.is_sign_negative() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+    }
+    if float < I128_INCLUSIVE_LOWER {
+        return Ordering::Greater;
+    }
+    if float >= I128_EXCLUSIVE_UPPER {
+        return Ordering::Less;
+    }
+    let truncated = float as i128;
+    match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract().is_sign_positive() && float.fract() > 0.0 => {
+            Ordering::Less
+        }
+        Ordering::Equal if float.fract().is_sign_negative() && float.fract() < 0.0 => {
+            Ordering::Greater
+        }
+        ordering => ordering,
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ReadRequest {}
@@ -50,6 +131,20 @@ pub struct ExpandRequest {
     pub direction: ExpandDirection,
     /// Empty means every relationship type.
     pub relationship_types: Vec<String>,
+}
+
+/// One neighbour an expansion reaches, listed before any relationship record
+/// is read: `input` has at least one `relationship_type` relationship to
+/// `neighbor` in the direction of the [`ExpandRequest`] that listed it.
+///
+/// Listing neighbours is the cheap half of an expansion -- an adjacency read
+/// per input -- and reading their relationship records the expensive half.
+/// Keeping them apart is what lets a `LIMIT` stop after the records it needs.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExpandNeighbor {
+    pub input: VertexId,
+    pub neighbor: VertexId,
+    pub relationship_type: String,
 }
 
 /// One equality restriction offered to a runtime access-path probe.
@@ -65,6 +160,69 @@ pub struct PropertyEqualityCandidate {
     pub values: Vec<ScalarValue>,
 }
 
+/// Which kind of access a statistics-chosen operator ran.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessPathKind {
+    Equality,
+    Range,
+    LabelScan,
+}
+
+impl AccessPathKind {
+    /// A closed vocabulary, safe as a span attribute or metric label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Equality => "equality",
+            Self::Range => "range",
+            Self::LabelScan => "label_scan",
+        }
+    }
+}
+
+/// What one statistics-chosen access did, as reported to
+/// [`crate::GraphRead::record_statistics_access`]. Names a property, never a
+/// value, so it may reach a span.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsAccessReport {
+    pub kind: AccessPathKind,
+    pub property: Option<String>,
+    /// The planner's estimate for the chosen candidate.
+    pub estimated_rows: u64,
+    /// Index entries the access really read before it finished or declined.
+    pub entries_read: u64,
+    /// The access read past its limit and handed over to its fallback.
+    pub declined: bool,
+}
+
+/// What a guarded access returned: its vertices, or `None` once it declined,
+/// with the index entries it really read either way. A backend may decline
+/// without reading anything, and that must not be reported as a full read.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BoundedVertexIds {
+    pub ids: Option<Vec<VertexId>>,
+    pub index_entries: u64,
+}
+
+impl BoundedVertexIds {
+    /// A decline after reading `index_entries` entries.
+    pub fn declined(index_entries: u64) -> Self {
+        Self {
+            ids: None,
+            index_entries,
+        }
+    }
+
+    /// `ids` read one index entry each, or a decline once there are more than
+    /// `max_index_entries` of them.
+    pub fn within(ids: Vec<VertexId>, max_index_entries: usize) -> Self {
+        let index_entries = ids.len() as u64;
+        Self {
+            ids: (ids.len() <= max_index_entries).then_some(ids),
+            index_entries,
+        }
+    }
+}
+
 /// One side of a range restriction on an ordered property scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PropertyBound {
@@ -76,16 +234,19 @@ pub struct PropertyBound {
 ///
 /// The index orders entries by `(value, vertex_id)`, so both are needed: many
 /// vertices share a value, and a page may end part-way through them. `value`
-/// is the property's own string, never a backend's key encoding of it: the
-/// engine compares it with the values on the rows it holds.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// is the property's own stored value, never a backend's key encoding of it:
+/// the engine compares it with the values on the rows it holds, under
+/// [`compare_property_values`]. Values of different types are ordered by that
+/// same function, so a position is meaningful across the whole index, not
+/// only within one type's run.
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrderedScanPosition {
-    pub value: String,
+    pub value: ScalarValue,
     pub vertex_id: VertexId,
 }
 
 /// One page of a bounded, ordered walk over a vertex property index.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct OrderedPropertyScanPage {
     pub vertices: Vec<VertexRecord>,
     /// The last entry this page reached, to resume after.
@@ -96,21 +257,30 @@ pub struct OrderedPropertyScanPage {
     /// either loops forever or silently returns fewer rows than were asked
     /// for.
     pub exhausted: bool,
+    /// Index entries the page read to produce its rows, entries of other
+    /// labels and outside the restrictions included, when the backend counts
+    /// them. A bounded read declines on this, not on the rows returned: a
+    /// property shared by many labels can cost far more than it yields.
+    pub index_entries: Option<u64>,
 }
 
 /// A bounded, ordered walk over one vertex property index.
 ///
-/// The backend must return only vertices that carry every label in `labels`,
-/// whose stored `property` is a string satisfying `prefix`, `lower` and
-/// `upper`, ordered by that string (`ascending`) and then by vertex ID, using
-/// `ascending` for the property and `id_ascending` for ties. It may return a
-/// superset; the engine defensively sorts and truncates.
+/// The backend must return only vertices that carry every label in `labels`
+/// and whose stored `property` is a non-null value satisfying `prefix`,
+/// `lower` and `upper` (see [`OrderedPropertyScanRequest::accepts`]).
+///
+/// Index order is the property value under [`compare_property_values`] --
+/// booleans, then integers and floats merged by value, then strings -- in the
+/// `ascending` direction, then the vertex ID, using `id_ascending` for ties.
+/// Values that compare equal, such as `1` and `1.0`, are one tie. It may
+/// return a superset; the engine defensively sorts and truncates.
 ///
 /// `required` is a page size, not an answer size. The caller applies a
 /// residual the backend knows nothing about, so it cannot say how many of the
 /// rows it returns will survive -- it returns that many and reports whether
 /// more exist. The caller resumes with `after` until enough rows survive.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrderedPropertyScanRequest {
     pub property: String,
     pub labels: Vec<String>,
@@ -138,50 +308,136 @@ pub struct OrderedPropertyScanRequest {
     /// at `required` and `after` resumes inside the run; the caller reads the
     /// run in pages and keeps only what its window needs.
     pub index_order: bool,
+    /// Sorted vertex IDs the caller will accept. A backend may skip any other
+    /// entry without loading it; ignoring this is still correct.
+    pub allowed: Option<std::sync::Arc<Vec<VertexId>>>,
+    /// End the page, not exhausted, once it has judged this many index
+    /// entries, whether or not they qualified. `None` bounds the page by
+    /// `required` rows alone. A backend that ignores it stays correct but
+    /// lets a bounded read cost more than its limit.
+    ///
+    /// A caller that sets it bounds the whole read by the `index_entries`
+    /// each page reports, so a backend need not also charge those entries to
+    /// a query-wide allowance: the read declines past its own limit instead
+    /// of failing, and what it leaves on such an allowance would be taken
+    /// from whatever runs after the decline.
+    pub max_index_entries: Option<usize>,
 }
 
 impl OrderedPropertyScanRequest {
-    /// Whether a stored string value satisfies every restriction carried by
-    /// this request. Backends without a native seek can filter with it.
-    pub fn accepts(&self, value: &str) -> bool {
-        if self
-            .prefix
-            .as_deref()
-            .is_some_and(|prefix| !value.starts_with(prefix))
-        {
-            return false;
-        }
-        if let Some(lower) = &self.lower {
-            let ScalarValue::String(bound) = &lower.value else {
-                return false;
-            };
-            let ok = if lower.inclusive {
-                value >= bound.as_ref()
-            } else {
-                value > bound.as_ref()
-            };
-            if !ok {
-                return false;
-            }
-        }
-        if let Some(upper) = &self.upper {
-            let ScalarValue::String(bound) = &upper.value else {
-                return false;
-            };
-            let ok = if upper.inclusive {
-                value <= bound.as_ref()
-            } else {
-                value < bound.as_ref()
-            };
-            if !ok {
-                return false;
-            }
-        }
-        true
+    /// Whether a stored, non-null value satisfies every restriction carried
+    /// by this request, under [`compare_property_values`]. A prefix admits
+    /// only strings. Backends without a native seek can filter with it.
+    pub fn accepts(&self, value: &ScalarValue) -> bool {
+        restrictions_accept(
+            self.prefix.as_deref(),
+            self.lower.as_ref(),
+            self.upper.as_ref(),
+            value,
+        )
     }
 }
 
+fn restrictions_accept(
+    prefix: Option<&str>,
+    lower: Option<&PropertyBound>,
+    upper: Option<&PropertyBound>,
+    value: &ScalarValue,
+) -> bool {
+    if matches!(value, ScalarValue::Null) {
+        return false;
+    }
+    if let Some(prefix) = prefix {
+        if !matches!(value, ScalarValue::String(value) if value.starts_with(prefix)) {
+            return false;
+        }
+    }
+    if let Some(lower) = lower {
+        let ordering = compare_property_values(value, &lower.value);
+        if ordering.is_lt() || (ordering.is_eq() && !lower.inclusive) {
+            return false;
+        }
+    }
+    if let Some(upper) = upper {
+        let ordering = compare_property_values(value, &upper.value);
+        if ordering.is_gt() || (ordering.is_eq() && !upper.inclusive) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One page of an ordered walk over one relationship property index: the
+/// relationship counterpart of [`OrderedPropertyScanRequest`].
+///
+/// The backend returns, in index order, relationships of `relationship_type`
+/// whose stored `property` is a non-null value satisfying `prefix`, `lower`
+/// and `upper` (see [`Self::accepts`]), with the same properties expansion
+/// would report for them. Index order is the property value under
+/// [`compare_property_values`] in the `ascending` direction, then the
+/// relationship's `(source, target)` in the same direction; the order of
+/// parallel relationships sharing a value and both endpoints is the backend's,
+/// but must be the same on every page. A page holds the relationships of at
+/// most `required` index entries (one entry may carry several parallel
+/// relationships), may hold fewer, including none, while `next` is set, and
+/// the engine keeps pulling pages until its window is decided.
+///
+/// Restrictions are sound, not complete, exactly as for vertex walks: the
+/// engine re-checks every row and evaluates any residual predicate. A backend
+/// that cannot honour a restriction, or has no ordered relationship property
+/// index at all, must fail the request rather than return a wider walk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderedRelationshipPropertyScanRequest {
+    pub relationship_type: String,
+    pub property: String,
+    pub ascending: bool,
+    pub prefix: Option<String>,
+    pub lower: Option<PropertyBound>,
+    pub upper: Option<PropertyBound>,
+    /// Maximum index entries in this page.
+    pub required: usize,
+    /// Resume strictly after this cursor. `None` starts at the window's
+    /// beginning.
+    pub after: Option<OrderedScanCursor>,
+}
+
+impl OrderedRelationshipPropertyScanRequest {
+    /// Whether a stored, non-null value satisfies every restriction carried
+    /// by this request; see [`OrderedPropertyScanRequest::accepts`].
+    pub fn accepts(&self, value: &ScalarValue) -> bool {
+        restrictions_accept(
+            self.prefix.as_deref(),
+            self.lower.as_ref(),
+            self.upper.as_ref(),
+            value,
+        )
+    }
+}
+
+/// An opaque continuation for an ordered relationship walk.
+///
+/// Unlike [`OrderedScanPosition`], nothing in the engine reads this: the
+/// relationship walk settles its boundary tie from the rows a page returns and
+/// hands the cursor straight back to the backend. Keeping it opaque is what
+/// lets the backend record which of the two relationship indexes it was
+/// reading, which a value-and-ID position could not express.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderedScanCursor(pub Vec<u8>);
+
+/// One page of an ordered relationship property scan.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OrderedRelationshipPropertyScanPage {
+    /// Relationships in index order; see
+    /// [`OrderedRelationshipPropertyScanRequest`].
+    pub relationships: Vec<RelationshipRecord>,
+    /// The last entry this page reached, to resume after.
+    pub last: Option<OrderedScanCursor>,
+    /// The index holds nothing further within the window, reported for the
+    /// same reason [`OrderedPropertyScanPage::exhausted`] is.
+    pub exhausted: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct VertexRecord {
     pub id: VertexId,
     pub labels: BTreeSet<String>,
@@ -208,7 +464,7 @@ impl VertexRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RelationshipRecord {
     pub id: RelationshipId,
     /// Canonical stored direction, independent of the query pattern direction.
@@ -245,7 +501,12 @@ pub struct QueryColumn {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Result values compare and hash structurally: `1` and `1.0` are different
+/// values, as are `0.0` and `-0.0`, while two `NaN`s with the same spelling
+/// and two `NULL`s are the same value. This preserves typed result assertions.
+/// DISTINCT, UNION and grouping instead use Cypher semantic keys in the
+/// executor: numeric representations compare by value, recursively in lists.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum QueryValue {
     Null,
     VertexId(VertexId),
@@ -255,7 +516,7 @@ pub enum QueryValue {
     List(Vec<QueryValue>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct QueryRow {
     pub values: Vec<QueryValue>,
 }

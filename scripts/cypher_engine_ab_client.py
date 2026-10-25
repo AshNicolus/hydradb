@@ -52,9 +52,177 @@ CORPUS = (
         "columns": ["id"],
         "expected": [["gamma"], ["beta"]],
     },
+    # PRO-2069: ordered windows whose predicate the string index cannot prove.
+    # The index supplies order and a seek hint; the residual decides each row.
+    {
+        "name": "residual_window",
+        "query": "MATCH (e:Event) WHERE e.created_at STARTS WITH '' AND e.kind <> 'drop' "
+        "RETURN e.name AS name ORDER BY e.created_at, e.id LIMIT 3",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [["e100"], ["e102"], ["e104"]],
+    },
+    {
+        "name": "residual_window_descending_tie",
+        "query": "MATCH (e:Event) WHERE e.created_at STARTS WITH '' AND e.kind <> 'drop' "
+        "RETURN e.name AS name ORDER BY e.created_at DESC, e.id ASC LIMIT 3",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [["e107"], ["e104"], ["e105"]],
+    },
+    {
+        "name": "keyset_window_two_column",
+        "query": "MATCH (e:Event) WHERE e.created_at STARTS WITH '' "
+        "AND (e.created_at > $after_created_at "
+        "OR (e.created_at = $after_created_at AND e.id > $after_id)) "
+        "RETURN e.name AS name ORDER BY e.created_at, e.id LIMIT 3",
+        "parameters": {"after_created_at": "2026-01-02", "after_id": 102},
+        "columns": ["name"],
+        "expected": [["e103"], ["e104"], ["e105"]],
+    },
+    {
+        "name": "residual_window_empty",
+        "query": "MATCH (e:Event) WHERE e.created_at STARTS WITH '' AND e.kind > 'zzz' "
+        "RETURN e.name AS name ORDER BY e.created_at, e.id LIMIT 3",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [],
+    },
+    {
+        "name": "residual_window_multi_label",
+        "query": "MATCH (e:Event:Tagged) WHERE e.created_at STARTS WITH '' AND e.kind <> 'x' "
+        "RETURN e.name AS name ORDER BY e.created_at DESC, e.id LIMIT 2",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [["e106"], ["e104"]],
+    },
+    # PRO-2069: ordered windows on numeric keys. Integers and floats tie by
+    # value (2, 2.0; 0, 0.0) and break ties by id; negatives and a float
+    # keyset cursor exercise every numeric index stream.
+    {
+        "name": "numeric_window",
+        "query": "MATCH (e:Event) WHERE e.score >= 0 "
+        "RETURN e.name AS name ORDER BY e.score, e.id LIMIT 4",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [["e104"], ["e105"], ["e101"], ["e100"]],
+    },
+    {
+        "name": "numeric_window_descending_residual",
+        "query": "MATCH (e:Event) WHERE e.score < 7 AND e.kind <> 'drop' "
+        "RETURN e.name AS name ORDER BY e.score DESC, e.id LIMIT 3",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [["e100"], ["e107"], ["e104"]],
+    },
+    {
+        "name": "numeric_keyset_window",
+        "query": "MATCH (e:Event) WHERE e.score > $after_score "
+        "OR (e.score = $after_score AND e.id > $after_id) "
+        "RETURN e.name AS name ORDER BY e.score, e.id LIMIT 3",
+        "parameters": {"after_score": 2.0, "after_id": 100},
+        "columns": ["name"],
+        "expected": [["e103"], ["e107"], ["e106"]],
+    },
+    # PRO-2069: two-column keyset pages. The second key is another property,
+    # ranked inside each leading-value run; a missing value sorts as null.
+    {
+        "name": "keyset_window_property_tie",
+        "query": "MATCH (e:Event) WHERE e.created_at STARTS WITH '' "
+        "AND (e.created_at > $after_created_at "
+        "OR (e.created_at = $after_created_at AND e.name > $after_name)) "
+        "RETURN e.name AS name ORDER BY e.created_at, e.name LIMIT 3",
+        "parameters": {"after_created_at": "2026-01-02", "after_name": "e101"},
+        "columns": ["name"],
+        "expected": [["e102"], ["e103"], ["e104"]],
+    },
+    {
+        "name": "window_property_tie_nulls_descending",
+        "query": "MATCH (e:Event) WHERE e.created_at STARTS WITH '' "
+        "RETURN e.name AS name ORDER BY e.created_at DESC, e.kind, e.id LIMIT 6",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [["e107"], ["e106"], ["e104"], ["e105"], ["e101"], ["e102"]],
+    },
+    # PRO-2069: a sort the index cannot provide, under SKIP + LIMIT. The window
+    # edge falls inside the run of 'keep' rows, and the null kind sorts first
+    # descending, so the bounded top-K must agree with a full sort on both.
+    {
+        "name": "top_k_window",
+        "query": "MATCH (e:Event) RETURN e.name AS name ORDER BY e.kind DESC, e.name SKIP 1 LIMIT 3",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [["e100"], ["e102"], ["e104"]],
+    },
+    # PRO-2069: hash dedup. The DISTINCT window counts distinct rows (it used
+    # to cut the binding rows first and return one), and UNION deduplicates
+    # its first arm as well as the rows later arms add.
+    {
+        "name": "distinct_window",
+        "query": "MATCH (e:Event) RETURN DISTINCT e.kind AS kind ORDER BY kind LIMIT 2",
+        "parameters": {},
+        "columns": ["kind"],
+        "expected": [["drop"], ["keep"]],
+    },
+    {
+        "name": "union_dedups_first_arm",
+        "query": "MATCH (e:Event) RETURN e.kind AS kind UNION MATCH (p:Person) RETURN p.name AS kind",
+        "parameters": {},
+        "columns": ["kind"],
+        "expected": [["keep"], ["drop"], [None], ["Bea"], ["Bo"], ["Gia"]],
+    },
+    # PRO-2069: a correlated join back through the same vertices. The second
+    # MATCH re-reaches every b and c the first one hydrated, which the
+    # per-request hydration identity map now serves without a second read.
+    {
+        "name": "join_rehydrates_nothing",
+        "query": "MATCH (a:Entity)-[:KNOWS]->(b:Person) MATCH (b)<-[:KNOWS]-(c:Entity) "
+        "RETURN a.entity_id AS a, b.name AS b, c.entity_id AS c ORDER BY a",
+        "parameters": {},
+        "columns": ["a", "b", "c"],
+        "expected": [["alpha", "Bea", "alpha"], ["beta", "Bo", "beta"], ["gamma", "Gia", "gamma"]],
+    },
+    # PRO-2069: ordered windows over a relationship property. NEXT weights are
+    # 3, 1.5, 7 and 3, so descending windows tie at 3 and a keyset cursor
+    # lands inside that tie.
+    {
+        "name": "relationship_property_window",
+        "query": "MATCH (a:Event)-[r:NEXT]->(b:Event) WHERE r.weight >= 0 "
+        "RETURN a.name AS a, r.weight AS weight ORDER BY r.weight DESC, a.name LIMIT 3",
+        "parameters": {},
+        "columns": ["a", "weight"],
+        "expected": [["e104", 7], ["e100", 3], ["e106", 3]],
+    },
+    {
+        "name": "relationship_property_keyset_window",
+        "query": "MATCH (a:Event)-[r:NEXT]->(b:Event) "
+        "WHERE r.weight < $after_weight OR (r.weight = $after_weight AND a.name > $after_name) "
+        "RETURN a.name AS a, b.name AS b, r.weight AS weight ORDER BY r.weight DESC, a.name LIMIT 2",
+        "parameters": {"after_weight": 3, "after_name": "e100"},
+        "columns": ["a", "b", "weight"],
+        "expected": [["e106", "e107", 3], ["e102", "e103", 1.5]],
+    },
+    # Intentional difference, declared in INTENTIONAL_DIFFERENCES below.
+    # `expected` is the experimental result; the legacy result lives there.
+    {
+        "name": "not_on_missing_property",
+        "query": "MATCH (e:Event) WHERE NOT e.kind = 'drop' RETURN e.name AS name ORDER BY name",
+        "parameters": {},
+        "columns": ["name"],
+        "expected": [["e100"], ["e102"], ["e104"], ["e105"], ["e107"]],
+    },
 )
 
 EXPLAIN_QUERY = "EXPLAIN " + CORPUS[1]["query"]
+# The residual window must plan as a bounded ordered walk: no Sort or Filter
+# above the scan, which would mean hydrating and sorting the whole label.
+WINDOW_EXPLAIN_CASES = ("residual_window", "numeric_window")
+WINDOW_EXPLAIN_OPERATORS = ("OrderedVertexPropertyScan", "residual=")
+WINDOW_EXPLAIN_FORBIDDEN = ("SortExec", "FilterExec")
+# Relationship-property windows must plan as an ordered relationship index
+# walk, with no expansion and no sort above it.
+RELATIONSHIP_WINDOW_EXPLAIN_CASES = ("relationship_property_window", "relationship_property_keyset_window")
+RELATIONSHIP_WINDOW_EXPLAIN_FORBIDDEN = ("SortExec", "ExpandExec")
 EXPLAIN_OPERATORS = (
     "VertexPropertyMultiSeek",
     "FilterExec",
@@ -267,6 +435,17 @@ def seed(bolt: str, token: str) -> None:
         "(b:Person {id: 5, name: 'Bo'})",
         "CREATE (a:Entity {id: 4, entity_id: 'gamma', rank: 1})-[:KNOWS]->"
         "(b:Person {id: 6, name: 'Gia'})",
+        # Duplicate sort keys, a missing residual property (null), and a
+        # second label on some rows. Legacy CREATE executes only one-hop edge
+        # patterns, so the events are seeded in linked pairs.
+        "CREATE (:Event {id: 100, name: 'e100', created_at: '2026-01-01', kind: 'keep', score: 2})-[:NEXT {weight: 3}]->"
+        "(:Event {id: 101, name: 'e101', created_at: '2026-01-02', kind: 'drop', score: 1.5})",
+        "CREATE (:Event:Tagged {id: 102, name: 'e102', created_at: '2026-01-02', kind: 'keep', score: -1})-[:NEXT {weight: 1.5}]->"
+        "(:Event {id: 103, name: 'e103', created_at: '2026-01-02', score: 2.0})",
+        "CREATE (:Event:Tagged {id: 104, name: 'e104', created_at: '2026-01-03', kind: 'keep', score: 0})-[:NEXT {weight: 7}]->"
+        "(:Event {id: 105, name: 'e105', created_at: '2026-01-03', kind: 'keep', score: 0.0})",
+        "CREATE (:Event:Tagged {id: 106, name: 'e106', created_at: '2026-01-04', kind: 'drop', score: 7})-[:NEXT {weight: 3}]->"
+        "(:Event {id: 107, name: 'e107', created_at: '2026-01-05', kind: 'keep', score: 2})",
     )
     with GraphDatabase.driver(bolt, auth=("neo4j", token)) as driver:
         driver.verify_connectivity()
@@ -288,6 +467,35 @@ def explain(bolt: str, http: str, token: str) -> dict[str, Any]:
             missing = [operator for operator in EXPLAIN_OPERATORS if operator not in plan["value"]]
             assert not missing, (transport, missing, plan["value"])
             output["plans"][transport] = plan["value"]
+
+            for name in WINDOW_EXPLAIN_CASES:
+                window_case = next(case for case in CORPUS if case["name"] == name)
+                result = client.request("EXPLAIN " + window_case["query"], window_case["parameters"])
+                assert result["error"] is None, (transport, name, result["error"])
+                window_plan = result["rows"][0][0]["value"]
+                missing = [
+                    operator for operator in WINDOW_EXPLAIN_OPERATORS if operator not in window_plan
+                ]
+                assert not missing, (transport, name, missing, window_plan)
+                present = [
+                    operator for operator in WINDOW_EXPLAIN_FORBIDDEN if operator in window_plan
+                ]
+                assert not present, (transport, name, present, window_plan)
+                output.setdefault("window_plans", {}).setdefault(transport, {})[name] = window_plan
+
+            for name in RELATIONSHIP_WINDOW_EXPLAIN_CASES:
+                window_case = next(case for case in CORPUS if case["name"] == name)
+                result = client.request("EXPLAIN " + window_case["query"], window_case["parameters"])
+                assert result["error"] is None, (transport, name, result["error"])
+                window_plan = result["rows"][0][0]["value"]
+                assert "OrderedRelationshipPropertyScan" in window_plan, (transport, name, window_plan)
+                present = [
+                    operator
+                    for operator in RELATIONSHIP_WINDOW_EXPLAIN_FORBIDDEN
+                    if operator in window_plan
+                ]
+                assert not present, (transport, name, present, window_plan)
+                output.setdefault("window_plans", {}).setdefault(transport, {})[name] = window_plan
     return output
 
 
@@ -347,6 +555,23 @@ def self_test() -> None:
         "or_property_multiseek",
         "one_hop_expand",
         "ordered_window",
+        "residual_window",
+        "residual_window_descending_tie",
+        "keyset_window_two_column",
+        "residual_window_empty",
+        "residual_window_multi_label",
+        "numeric_window",
+        "numeric_window_descending_residual",
+        "numeric_keyset_window",
+        "keyset_window_property_tie",
+        "window_property_tie_nulls_descending",
+        "top_k_window",
+        "distinct_window",
+        "union_dedups_first_arm",
+        "join_rehydrates_nothing",
+        "relationship_property_window",
+        "relationship_property_keyset_window",
+        "not_on_missing_property",
     ]
     def document(mode: str) -> dict[str, Any]:
         results = []

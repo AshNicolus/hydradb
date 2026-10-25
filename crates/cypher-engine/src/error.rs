@@ -6,16 +6,56 @@ use crate::GraphPlanError;
 pub type EngineResult<T> = Result<T, EngineError>;
 pub type StorageResult<T> = Result<T, StorageError>;
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+/// A failure a storage backend reported while the engine was reading.
+///
+/// A backend may attach its own typed error. The engine never inspects it;
+/// it rides along so the backend's caller can take it back with
+/// [`EngineError::into_backend_error`] and answer with the error it would
+/// have raised itself -- a timeout, an exhausted budget, a corrupt record --
+/// rather than a gap in the query language, which is what a bare message
+/// would otherwise be reported as.
+#[derive(Debug, Error)]
 #[error("graph storage error: {message}")]
 pub struct StorageError {
     message: String,
+    #[source]
+    backend: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
 impl StorageError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            backend: None,
+        }
+    }
+
+    /// A failure carrying the backend's own error, displayed as its message.
+    pub fn from_backend<E: std::error::Error + Send + Sync + 'static>(error: E) -> Self {
+        Self {
+            message: error.to_string(),
+            backend: Some(Box::new(error)),
+        }
+    }
+
+    /// The backend's own error, when it attached one of type `E`.
+    pub fn backend_error<E: std::error::Error + 'static>(&self) -> Option<&E> {
+        self.backend
+            .as_deref()
+            .and_then(|error| error.downcast_ref::<E>())
+    }
+
+    /// Take the backend's own error back, when it attached one of type `E`.
+    pub fn into_backend_error<E: std::error::Error + 'static>(self) -> Result<E, Self> {
+        match self.backend {
+            Some(backend) => match backend.downcast::<E>() {
+                Ok(error) => Ok(*error),
+                Err(backend) => Err(Self {
+                    message: self.message,
+                    backend: Some(backend),
+                }),
+            },
+            None => Err(self),
         }
     }
 }
@@ -39,15 +79,24 @@ impl EngineError {
     /// failure that is not the query's.
     ///
     /// Storage failures reach the engine only because the adapter reports
-    /// them through it, as strings: a timeout while reading looks the same as
-    /// a missing record. They are not a gap in the query language, so they get
-    /// no reason rather than a guess.
+    /// them through it. They are not a gap in the query language, so they get
+    /// no reason rather than a guess; the backend's own error, when it
+    /// attached one, says what they are -- see [`Self::into_backend_error`].
     pub fn failure_reason(&self) -> Option<QueryFailureReason> {
         match self {
             Self::Parse(_) => Some(QueryFailureReason::ParseError),
             Self::Plan(error) => Some(error.failure_reason()),
             Self::UnsupportedPlan(reason, _) => Some(*reason),
             Self::Storage(_) | Self::InvalidStorageResponse(_) => None,
+        }
+    }
+
+    /// The storage backend's own error of type `E`, when a storage failure
+    /// carrying one is what failed the query; otherwise the error unchanged.
+    pub fn into_backend_error<E: std::error::Error + 'static>(self) -> Result<E, Self> {
+        match self {
+            Self::Storage(error) => error.into_backend_error().map_err(Self::Storage),
+            other => Err(other),
         }
     }
 }

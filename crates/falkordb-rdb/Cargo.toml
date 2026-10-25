@@ -1,0 +1,14 @@
+[package]
+name = "falkordb-rdb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+zstd = "0.13"
+

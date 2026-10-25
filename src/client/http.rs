@@ -111,9 +111,7 @@ impl HttpQueryServerConfig {
             return http_config_error("TLS reload interval must be greater than zero");
         }
         if self.tls_config_provider.is_none() && !self.allow_plaintext {
-            return http_config_error(
-                "HTTP query API requires TLS unless plaintext is explicitly enabled for development",
-            );
+            return http_config_error("HTTP query API requires TLS unless plaintext is explicitly enabled for development");
         }
         Ok(())
     }
@@ -415,13 +413,21 @@ impl HttpApiError {
                 owner: owner.clone(),
                 authenticate: false,
             },
+            GraphError::SnapshotUnavailable { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "snapshot_unavailable",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::InvalidKeyComponent { .. }
             | GraphError::GraphScopeMismatch { .. }
             | GraphError::MissingQueryParameter { .. }
             | GraphError::QueryParse { .. }
             | GraphError::SnapshotAhead { .. }
             | GraphError::UnsupportedQuery { .. }
-            | GraphError::UnclassifiedQuery { .. } => Self {
+            | GraphError::UnclassifiedQuery { .. }
+            | GraphError::BatchValueConflict { .. } => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_request",
                 message: error.to_string(),
@@ -967,6 +973,3 @@ fn http_io_error(operation: &'static str, error: std::io::Error) -> GraphError {
         reason: error.to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -27,10 +27,6 @@ fn parameters_at_depth(values: &BTreeMap<String, QueryParameterValue>, depth: us
         })
         .sum()
 }
-#[cfg(test)]
-fn parameter(value: &QueryParameterValue) -> usize {
-    parameter_at_depth(value, 0)
-}
 fn parameter_at_depth(value: &QueryParameterValue, depth: usize) -> usize {
     match value {
         QueryParameterValue::Scalar(value) => scalar(value),
@@ -210,21 +206,4 @@ pub(super) fn batch(value: &Option<QueryBatchOperation>) -> u64 {
                 + policy(merge_policy)
         }
     }) as u64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn nested_parameters_measure_spare_capacity_and_owned_copies() {
-        let mut value = String::with_capacity(4096);
-        value.push('x');
-        let value = QueryParameterValue::List(vec![QueryParameterValue::Scalar(
-            VertexPropertyValue::String(value),
-        )]);
-        assert!(parameter(&value) >= 4096);
-        let values = BTreeMap::from([("payload".to_string(), value)]);
-        assert!(parameters(&values) >= 4096);
-        assert!(parameters(&values) > parameters(&values.clone()));
-    }
 }

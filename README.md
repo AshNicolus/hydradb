@@ -382,10 +382,6 @@ SuiteSparse GraphBLAS.
 | `just check-all-features` | Checks every target with every Cargo feature |
 | `just check-client-api`, `just check-bolt-server` | Checks shared client code and standalone Bolt independently |
 | `just check-examples`, `just check-examples-native`, `just check-examples-chaos` | Checks example targets under their supported feature sets |
-| `just test [cargo test args]` | Runs default library tests and forwards optional arguments |
-| `just test-opencypher`, `just test-native`, `just test-client-protocols`, `just test-chaos` | Runs the major library and public-protocol test matrices |
-| `just test-server-runtime`, `just test-indexer`, `just test-node-otlp` | Runs graph-node, indexer, and OTLP binary tests |
-| `just test-placement`, `just test-telemetry` | Lints and tests the two workspace crates |
 | `just ci` | Runs the complete local CI-equivalent sequence; a clean feature-matrix run can take tens of minutes (25m 41s in the verification run for this README) |
 
 `scripts/ci_local.sh` is a compatibility entry point that sets a shared Cargo
@@ -412,7 +408,6 @@ variables for a small development sample.
 |---|---|
 | `just minio-smoke` | Runs the object-store smoke flow against an ephemeral MinIO container |
 | `just minio-query-correctness` | Runs exact query checks against MinIO |
-| `just minio-query-bench` | Runs the query benchmark against MinIO |
 | `just minio-chaos` | Pauses, restarts, and recovers MinIO during graph operations |
 | `just minio-fence` | Runs writer takeover against MinIO |
 | `just minio-mbt` | Replays the formal MBT adapters against MinIO; unavailable in this checkout because the referenced `tests/formal_mbt*.rs` targets are absent |
@@ -473,7 +468,6 @@ documented above.
 | [OpenCypher subset](cypher-compat.md) | What the engine accepts today, and what it rejects at parse time |
 | [Helm chart guide](charts/hydradb/README.md) | Kubernetes configuration, TLS, authentication, upgrades, and verification |
 | [Agent notes](AGENTS.md) | How to build, run, and not trip over `RUST_MIN_STACK` |
-| [Development](DEVELOPMENT.md) | Verification recipes and local harnesses |
 
 ## Contributing
 

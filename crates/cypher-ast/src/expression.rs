@@ -142,6 +142,14 @@ pub enum Expression {
     },
     List(Vec<Expression>),
     Map(Vec<(Identifier, Expression)>),
+    /// `CASE [operand] WHEN w THEN t ... [ELSE e] END`. With an operand each
+    /// `WHEN` is a value compared to it (the simple form); without, each is a
+    /// condition (the searched form).
+    Case {
+        operand: Option<Box<Expression>>,
+        branches: Vec<(Expression, Expression)>,
+        default: Option<Box<Expression>>,
+    },
     Syntax(SyntaxFragment),
 }
 

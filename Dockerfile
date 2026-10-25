@@ -1,6 +1,6 @@
 FROM ubuntu:24.04 AS chef
 
-ARG RUST_VERSION=1.98.0
+ARG RUST_VERSION=1.99.0
 ARG CARGO_CHEF_VERSION=0.1.77
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/usr/local/cargo \
@@ -55,7 +55,11 @@ ENV GIT_SHA=${GIT_SHA} \
 RUN cargo build --locked --release \
       --features server-runtime,indexer-runtime,experimental-cypher-engine,otlp \
       --bin graph-node --bin graph-indexer && \
-    strip target/release/graph-node target/release/graph-indexer
+    cargo build --locked --release \
+      -p falkor-dump-import --bin import && \
+    strip target/release/graph-node \
+      target/release/graph-indexer \
+      target/release/import
 
 FROM ubuntu:24.04 AS runtime-base
 
@@ -81,6 +85,7 @@ LABEL org.opencontainers.image.revision="${GIT_SHA}"
 
 COPY --from=builder /workspace/target/release/graph-node /usr/local/bin/graph-node
 COPY --from=builder /workspace/target/release/graph-indexer /usr/local/bin/graph-indexer
+COPY --from=builder /workspace/target/release/import /usr/local/bin/falkor-dump-import
 
 USER 10001:10001
 EXPOSE 7687 8443 9090 9443

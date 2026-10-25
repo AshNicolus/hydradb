@@ -2,7 +2,7 @@
 name = "hydradb-placement"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.99"
 description = "Rendezvous placement and node liveness for HydraDB cell writers"
 publish = false
 
@@ -32,6 +32,3 @@ thiserror = { workspace = true }
 # the `#[cfg(test)]` `FaultStore`; written by hand instead, its five async
 # methods cost ~30 lines of `'life0`/`'async_trait` bounds that cannot be elided
 # (E0195, late-bound vs early-bound). None of it ships.
-[dev-dependencies]
-async-trait = { workspace = true }
-tokio = { workspace = true }

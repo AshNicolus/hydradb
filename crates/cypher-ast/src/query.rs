@@ -36,8 +36,49 @@ pub struct UnionArm {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Clause {
     Match(MatchClause),
+    With(WithClause),
+    Unwind(UnwindClause),
+    Let(LetClause),
+    Filter(FilterClause),
     Return(ReturnClause),
     Syntax(SyntaxFragment),
+}
+
+/// A `WITH` clause: a projection that is also a scope boundary.
+///
+/// Carries everything [`ReturnClause`] does, because `WITH` projects the same
+/// way `RETURN` does, plus the `WHERE` that may follow it - which `RETURN` has
+/// no form of. `group_by` is GQL's explicit grouping; without it, grouping
+/// follows from the aggregates among `items`, as it does for `RETURN`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WithClause {
+    pub quantifier: Option<SetQuantifier>,
+    pub items: ProjectionItems,
+    pub group_by: Vec<Expression>,
+    pub order_by: Vec<SortItem>,
+    pub skip: Option<Expression>,
+    pub limit: Option<Expression>,
+    pub predicate: Option<Expression>,
+}
+
+/// GQL's `LET a = <expression>, ...`: new names for the rest of the query,
+/// each computed from what was in scope before the clause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LetClause {
+    pub bindings: Vec<(Identifier, Expression)>,
+}
+
+/// GQL's `FILTER [WHERE] <predicate>`: keep the rows the predicate holds for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterClause {
+    pub predicate: Expression,
+}
+
+/// `UNWIND <expression> AS <variable>`: one row per element of a list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnwindClause {
+    pub expression: Expression,
+    pub variable: Identifier,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -110,7 +151,9 @@ pub enum SetQuantifier {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProjectionItems {
-    All,
+    /// `*`, then any further items: `WITH *, n.score * 10 AS scaled`. The
+    /// star stands for every name in scope, which only lowering knows.
+    All(Vec<Projection>),
     Items(Vec<Projection>),
 }
 

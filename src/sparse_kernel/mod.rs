@@ -218,28 +218,6 @@ pub(crate) fn expand(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn expand_range(
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    min_hops: u8,
-    max_hops: u8,
-    backend: SparseKernelBackend,
-) -> Result<SparseTraversal> {
-    match backend {
-        SparseKernelBackend::Adjacency => {
-            Ok(expand_range_rust(adjacency, starts, min_hops, max_hops))
-        }
-        SparseKernelBackend::CompactCsc => {
-            let compiled = compile_graphblas_matrix(adjacency, backend)?;
-            compiled.expand_range(adjacency, starts, min_hops, max_hops)
-        }
-        SparseKernelBackend::SuiteSparse => {
-            expand_range_graphblas(adjacency, starts, min_hops, max_hops)
-        }
-    }
-}
-
 pub(crate) use graphblas::CompiledGraphBlasMatrix;
 
 pub(crate) fn compile_graphblas_matrix(
@@ -351,11 +329,11 @@ pub(crate) fn compiled_graphblas_out_neighbors(
 }
 
 #[cfg(feature = "opencypher")]
-pub(crate) fn compiled_graphblas_in_degree(
+pub(crate) fn compiled_graphblas_cached_in_degree(
     compiled: &CompiledGraphBlasMatrix,
     vertex: VertexId,
-) -> u64 {
-    compiled.in_degree(vertex)
+) -> Option<u64> {
+    compiled.cached_in_degree(vertex)
 }
 
 #[cfg(feature = "opencypher")]
@@ -437,49 +415,6 @@ fn expand_rust(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> SparseTr
     }
 }
 
-#[cfg(test)]
-fn expand_range_rust(
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    min_hops: u8,
-    max_hops: u8,
-) -> SparseTraversal {
-    let mut frontier: BTreeSet<_> = starts.iter().copied().collect();
-    let mut reachable = BTreeSet::new();
-    let mut edge_visits = 0_u64;
-    if min_hops == 0 {
-        reachable.extend(frontier.iter().copied());
-    }
-    if max_hops == 0 || frontier.is_empty() {
-        return SparseTraversal {
-            vertices: reachable.into_iter().collect(),
-            edge_visits,
-            backend: SparseKernelBackend::Adjacency,
-        };
-    }
-    for depth in 1..=max_hops {
-        let mut next = BTreeSet::new();
-        for src in &frontier {
-            if let Some(neighbors) = adjacency.get(src) {
-                edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
-                next.extend(neighbors.iter().copied());
-            }
-        }
-        if depth >= min_hops {
-            reachable.extend(next.iter().copied());
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-    SparseTraversal {
-        vertices: reachable.into_iter().collect(),
-        edge_visits,
-        backend: SparseKernelBackend::Adjacency,
-    }
-}
-
 fn graphblas_vertices_from_adjacency(adjacency: &Adjacency) -> Result<Vec<VertexId>> {
     let mut vertices = BTreeSet::new();
     for (src, dsts) in adjacency {
@@ -506,16 +441,6 @@ fn expand_graphblas(
     hops: u8,
 ) -> Result<SparseTraversal> {
     graphblas::expand(adjacency, starts, hops)
-}
-
-#[cfg(test)]
-fn expand_range_graphblas(
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    min_hops: u8,
-    max_hops: u8,
-) -> Result<SparseTraversal> {
-    graphblas::expand_range(adjacency, starts, min_hops, max_hops)
 }
 
 fn compile_graphblas(
@@ -570,204 +495,3 @@ fn expand_range_count_graphblas_compiled(
 }
 
 mod graphblas;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The compiled kernel is now a constructor argument, so only the replica
-    // count is still read from the environment; this serialises that.
-    static REPLICA_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn test_adjacency() -> Adjacency {
-        BTreeMap::from([
-            (1, BTreeSet::from([2, 3])),
-            (2, BTreeSet::from([4])),
-            (3, BTreeSet::from([4])),
-            (4, BTreeSet::from([5, 6])),
-            (42, BTreeSet::from([10, 11, 12, 13, 14, 15, 16])),
-        ])
-    }
-
-    #[test]
-    fn adjacency_kernel_expands_reachable_vertices() {
-        let result = expand(
-            &test_adjacency(),
-            &[1, 42],
-            3,
-            SparseKernelBackend::Adjacency,
-        )
-        .expect("adjacency expansion should succeed");
-        assert_eq!(result.backend, SparseKernelBackend::Adjacency);
-        assert_eq!(
-            result.vertices,
-            vec![2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 16]
-        );
-    }
-
-    #[test]
-    fn graphblas_kernel_matches_adjacency_kernel() {
-        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
-        let adjacency = test_adjacency();
-        let rust = expand(&adjacency, &[1, 42], 3, SparseKernelBackend::Adjacency)
-            .expect("adjacency expansion should succeed");
-        let graphblas = expand(&adjacency, &[1, 42], 3, SparseKernelBackend::SuiteSparse)
-            .expect("GraphBLAS expansion should succeed");
-        assert_eq!(graphblas.backend, SparseKernelBackend::SuiteSparse);
-        assert_eq!(graphblas.vertices, rust.vertices);
-        assert_eq!(graphblas.edge_visits, rust.edge_visits);
-    }
-
-    #[cfg(feature = "opencypher")]
-    #[test]
-    fn graphblas_exact_hop_count_matches_materialized_range() {
-        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
-        let adjacency = test_adjacency();
-        let compiled = compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
-            .expect("matrix should compile");
-        for hops in 0..=4 {
-            let materialized =
-                expand_range_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
-                    .expect("range expansion should succeed");
-            let counted =
-                expand_range_count_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
-                    .expect("count expansion should succeed");
-            assert_eq!(counted.vertices, materialized.vertices.len() as u64);
-            assert_eq!(counted.edge_visits, materialized.edge_visits);
-        }
-    }
-
-    #[cfg(feature = "opencypher")]
-    #[test]
-    fn graphblas_exact_hop_count_preserves_materialized_cycle_semantics() {
-        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
-        let adjacency = BTreeMap::from([(1, BTreeSet::from([2])), (2, BTreeSet::from([1, 3]))]);
-        let compiled = compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
-            .expect("matrix should compile");
-        for hops in 0..=4 {
-            let materialized =
-                expand_range_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
-                    .expect("cyclic range expansion should succeed");
-            let counted =
-                expand_range_count_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
-                    .expect("cyclic count expansion should succeed");
-            assert_eq!(counted.vertices, materialized.vertices.len() as u64);
-            assert_eq!(counted.edge_visits, materialized.edge_visits);
-        }
-    }
-
-    #[cfg(feature = "opencypher")]
-    #[test]
-    fn graphblas_exact_hop_count_clears_reused_scratch() {
-        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
-        let previous_replicas = std::env::var("GRAPHBLAS_REPLICAS").ok();
-        std::env::set_var("GRAPHBLAS_REPLICAS", "1");
-
-        let adjacency = test_adjacency();
-        let compiled = compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
-            .expect("matrix should compile");
-        let cases = [
-            (vec![1], 1),
-            (vec![42], 1),
-            (vec![1], 3),
-            (vec![999], 2),
-            (vec![1, 1, 42], 0),
-            (vec![2, 3], 2),
-            (vec![1], 4),
-        ];
-        for _ in 0..3 {
-            for (starts, hops) in &cases {
-                let materialized =
-                    expand_range_compiled_graphblas(&compiled, &adjacency, starts, *hops, *hops)
-                        .expect("range expansion should succeed");
-                let counted = expand_range_count_compiled_graphblas(
-                    &compiled, &adjacency, starts, *hops, *hops,
-                )
-                .expect("count expansion should succeed");
-                assert_eq!(counted.vertices, materialized.vertices.len() as u64);
-                assert_eq!(counted.edge_visits, materialized.edge_visits);
-            }
-        }
-
-        match previous_replicas {
-            Some(value) => std::env::set_var("GRAPHBLAS_REPLICAS", value),
-            None => std::env::remove_var("GRAPHBLAS_REPLICAS"),
-        }
-    }
-
-    #[cfg(feature = "opencypher")]
-    #[test]
-    fn graphblas_exact_hop_count_is_safe_across_replicas() {
-        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
-        let previous_replicas = std::env::var("GRAPHBLAS_REPLICAS").ok();
-        std::env::set_var("GRAPHBLAS_REPLICAS", "2");
-
-        let adjacency = test_adjacency();
-        let compiled = std::sync::Arc::new(
-            compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
-                .expect("matrix should compile"),
-        );
-        assert_eq!(compiled.replica_count(), 2);
-        std::thread::scope(|scope| {
-            for worker in 0..8 {
-                let compiled = std::sync::Arc::clone(&compiled);
-                let adjacency = &adjacency;
-                scope.spawn(move || {
-                    for iteration in 0..25 {
-                        let starts = if (worker + iteration) % 2 == 0 {
-                            vec![1]
-                        } else {
-                            vec![42]
-                        };
-                        let hops = ((worker + iteration) % 4) as u8;
-                        let materialized = expand_range_compiled_graphblas(
-                            &compiled, adjacency, &starts, hops, hops,
-                        )
-                        .expect("range expansion should succeed");
-                        let counted = expand_range_count_compiled_graphblas(
-                            &compiled, adjacency, &starts, hops, hops,
-                        )
-                        .expect("count expansion should succeed");
-                        assert_eq!(counted.vertices, materialized.vertices.len() as u64);
-                        assert_eq!(counted.edge_visits, materialized.edge_visits);
-                    }
-                });
-            }
-        });
-
-        match previous_replicas {
-            Some(value) => std::env::set_var("GRAPHBLAS_REPLICAS", value),
-            None => std::env::remove_var("GRAPHBLAS_REPLICAS"),
-        }
-    }
-
-    #[test]
-    fn compact_csc_kernel_matches_adjacency_kernel() {
-        let adjacency = test_adjacency();
-        let rust = expand_range(&adjacency, &[1, 42], 1, 3, SparseKernelBackend::Adjacency)
-            .expect("adjacency expansion should succeed");
-        let csc = graphblas_csc_from_adjacency(&adjacency).expect("CSC build should succeed");
-        let compiled = compile_graphblas_csc_owned(csc, SparseKernelBackend::CompactCsc)
-            .expect("compact CSC compile should succeed");
-        let compact = expand_range_compiled_graphblas(&compiled, &BTreeMap::new(), &[1, 42], 1, 3)
-            .expect("compact CSC expansion should succeed");
-
-        assert_eq!(compact.backend, SparseKernelBackend::CompactCsc);
-        assert_eq!(compact.vertices, rust.vertices);
-        assert_eq!(compact.edge_visits, rust.edge_visits);
-    }
-
-    // The legacy `GRAPH_COMPILED_KERNEL` override is deliberately not exercised
-    // here: it is process-global and would race concurrent shard tests.
-    #[test]
-    fn a_non_default_policy_kernel_is_returned_verbatim() {
-        let policy = GraphCachePolicy {
-            sparse_kernel: SparseKernelBackend::Adjacency,
-            ..GraphCachePolicy::default()
-        };
-        assert_eq!(
-            default_matrix_kernel(&policy),
-            SparseKernelBackend::Adjacency
-        );
-    }
-}

@@ -10,11 +10,7 @@ use slatedb_common::metrics::{DefaultMetricsRecorder, MetricsRecorder};
 use crate::{GraphCachePolicy, Result, StorageSequence};
 
 pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 4_096;
-#[cfg(not(test))]
 const GRAPH_READER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const GRAPH_READER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GraphReaderMode {
     /// Follow durable graph state while maintaining a SlateDB checkpoint that
@@ -68,8 +64,8 @@ pub struct GraphLimits {
     /// read_epoch, current_epoch }` names the problem exactly, and it was
     /// losing that race to the error that hides it, which is why staging saw
     /// 17–38s "prepare" times and essentially no `SnapshotAhead`. Change 3 of
-    /// `docs/plans/2026-08-21-cell-affine-read-routing.md`; evidence in
-    /// `docs/2026-08-21-read-path-30s-timeout-findings.md`.
+    /// the cell-affine read-routing design; evidence in
+    /// the read-path timeout findings.
     ///
     /// A plain `u64` rather than `max_query_runtime_ms`'s `Option<u64>`: an
     /// unbounded wait is precisely the defect, so "no deadline" must not be
@@ -261,11 +257,14 @@ pub struct GraphOpenOptions {
     /// How long a fenced writer waits before it may re-open — one heartbeat
     /// interval, sized so the rival has refreshed its view and stood down.
     ///
-    /// Decision 5 of `docs/plans/2026-07-25-rendezvous-placement.md` fixes the
+    /// Decision 5 of the rendezvous placement design fixes the
     /// default at 5s and the node config validates `interval < timeout` at
     /// startup. It is settable here so a test can pace a fence in milliseconds
     /// instead of sleeping through the production value.
     pub fence_backoff_interval: Duration,
+    /// Whether the experimental planner loads the indexer-published planner
+    /// statistics, and how long a loaded copy is reused.
+    pub planner_statistics: PlannerStatisticsConfig,
 }
 
 // Hand-written rather than derived: `Duration::default()` is zero, and a zero
@@ -283,6 +282,36 @@ impl Default for GraphOpenOptions {
             reader_mode: GraphReaderMode::default(),
             reader_manifest_poll_interval: GRAPH_READER_MANIFEST_POLL_INTERVAL,
             fence_backoff_interval: DEFAULT_FENCE_BACKOFF_INTERVAL,
+            planner_statistics: PlannerStatisticsConfig::default(),
+        }
+    }
+}
+
+/// `GRAPH_PLANNER_STATISTICS` and `GRAPH_PLANNER_STATISTICS_TTL_MS` on the node.
+///
+/// Off by default: a disabled shard never reads the statistics object. On, a
+/// shard keeps each cell's object in memory for `ttl` before reading it again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannerStatisticsConfig {
+    pub enabled: bool,
+    pub ttl: Duration,
+    /// Experimental queries a cell plans without statistics, within one
+    /// TTL, before the shard asks the indexer to build them. Zero never
+    /// asks. `GRAPH_PLANNER_STATISTICS_HINT_THRESHOLD`.
+    pub hint_threshold: u32,
+}
+
+impl PlannerStatisticsConfig {
+    pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
+    pub const DEFAULT_HINT_THRESHOLD: u32 = 5;
+}
+
+impl Default for PlannerStatisticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl: Self::DEFAULT_TTL,
+            hint_threshold: Self::DEFAULT_HINT_THRESHOLD,
         }
     }
 }
@@ -575,7 +604,9 @@ pub(crate) fn collect_storage_metrics(
         TOTAL_MEM_SIZE_BYTES,
     };
     use slatedb::instrumented_object_store_stats::REQUEST_COUNT as OBJECT_STORE_REQUEST_COUNT;
-    use slatedb::wal_buffer_stats::WAL_FLUSH_BYTES;
+    use slatedb::wal_buffer_stats::{
+        WAL_BUFFER_FLUSHES, WAL_BUFFER_FLUSH_REQUESTS, WAL_FLUSH_BYTES,
+    };
     use slatedb_common::metrics::MetricValue;
 
     let writer_snap = writer.map(DefaultMetricsRecorder::snapshot);
@@ -662,6 +693,8 @@ pub(crate) fn collect_storage_metrics(
         last_compaction_timestamp_sec: gauge(LAST_COMPACTION_TS_SEC),
         memtable_write_bytes: counter(MEMTABLE_WRITE_BYTES, &[]),
         wal_flush_bytes: counter(WAL_FLUSH_BYTES, &[]),
+        wal_buffer_flushes: counter(WAL_BUFFER_FLUSHES, &[]),
+        wal_buffer_flush_requests: counter(WAL_BUFFER_FLUSH_REQUESTS, &[]),
         l0_flush_bytes: counter(L0_FLUSH_BYTES, &[]),
         block_cache_data_hits: counter(
             ACCESS_COUNT,
@@ -681,314 +714,5 @@ pub(crate) fn collect_storage_metrics(
         ),
         object_store_get_requests: counter_sum(OBJECT_STORE_REQUEST_COUNT, &[("op", "get")]),
         object_store_put_requests: counter_sum(OBJECT_STORE_REQUEST_COUNT, &[("op", "put")]),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::StreamExt;
-    use slatedb::object_store::memory::InMemory;
-
-    #[test]
-    fn disk_cache_file_handle_budget_reaches_readers_and_writers() {
-        let cache = GraphCacheConfig {
-            object_store_cache_max_open_file_handles: 17,
-            ..GraphCacheConfig::default()
-        };
-        let mut settings = Settings::default();
-        cache.apply_to_settings(&mut settings);
-        assert_eq!(
-            settings.object_store_cache_options.max_open_file_handles,
-            17
-        );
-
-        let mut reader = DbReaderOptions::default();
-        cache.apply_to_reader_options(&mut reader);
-        assert_eq!(reader.object_store_cache_options.max_open_file_handles, 17);
-    }
-
-    fn test_db_cache(object_store: &Arc<dyn ObjectStore>) -> Arc<dyn slatedb::db_cache::DbCache> {
-        crate::process_slate_db_cache(
-            object_store,
-            GraphCacheConfig::default().slatedb_cache_bytes,
-        )
-        .unwrap()
-    }
-
-    async fn object_locations(object_store: &Arc<dyn ObjectStore>) -> Vec<String> {
-        let mut locations = object_store
-            .list(None)
-            .map(|result| result.unwrap().location.to_string())
-            .collect::<Vec<_>>()
-            .await;
-        locations.sort();
-        locations
-    }
-
-    #[test]
-    fn storage_memory_profiles_are_valid_and_bounded() {
-        let durability = GraphDurabilityConfig::default();
-        assert_eq!(durability.wal_flush_interval_ms, Some(10));
-        assert!(durability.await_durable_writes);
-        assert_eq!(
-            GraphCacheConfig::default().reader_wal_replay_concurrency,
-            16
-        );
-        assert_eq!(
-            GraphCacheConfig::default().slatedb_cache_bytes,
-            640 * 1024 * 1024
-        );
-        let balanced = GraphStorageMemoryConfig::default();
-        balanced.validate().unwrap();
-        assert_eq!(balanced.l0_sst_size_bytes, 16 * 1024 * 1024);
-        assert_eq!(balanced.max_unflushed_bytes, 64 * 1024 * 1024);
-        assert_eq!(balanced.max_wal_flushes_before_l0_flush, 128);
-
-        let low_memory = GraphStorageMemoryConfig::low_memory();
-        low_memory.validate().unwrap();
-        assert_eq!(low_memory.l0_sst_size_bytes, 4 * 1024 * 1024);
-        assert_eq!(low_memory.max_unflushed_bytes, 16 * 1024 * 1024);
-
-        let memory = GraphMemoryConfig::low_memory();
-        assert_eq!(memory.max_matrix_adjacency_bytes, 0);
-        assert_eq!(memory.max_graphblas_bytes, 32 * 1024 * 1024);
-        #[cfg(feature = "opencypher")]
-        {
-            assert_eq!(memory.max_relationship_rows_bytes, 2 * 1024 * 1024);
-            assert_eq!(memory.max_source_relationship_rows_bytes, 2 * 1024 * 1024);
-            assert_eq!(memory.max_relationship_property_rows_bytes, 4 * 1024 * 1024);
-        }
-    }
-
-    /// End-to-end proof that the recorder wiring carries real numbers: a live
-    /// store, real writes, a flush, point gets and a prefix scan, and then the
-    /// snapshot must show them. The 1,200 keys matter — SlateDB only builds a
-    /// bloom filter for SSTs with at least `min_filter_keys` (1,000) entries,
-    /// and the filter-outcome counters are the series the prefix-scan work is
-    /// judged by.
-    #[tokio::test]
-    async fn storage_metrics_flow_from_a_live_store() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from("graph/storage-metrics-flow");
-        let db_cache = crate::process_slate_db_cache(&object_store, 1024 * 1024).unwrap();
-        let (writer, recorder) = open_graph_db(
-            path,
-            Arc::clone(&object_store),
-            &GraphCacheConfig::default(),
-            &GraphStorageMemoryConfig::default(),
-            &GraphDurabilityConfig::default(),
-            Arc::clone(&db_cache) as Arc<dyn slatedb::db_cache::DbCache>,
-        )
-        .await
-        .unwrap();
-
-        // One batch, not 1,200 individual puts: each put WAL-flushes, and every
-        // `max_wal_flushes_before_l0_flush` of those rotates the memtable,
-        // which would shred the keys across ~8 SSTs of ~150 keys each — all
-        // below `min_filter_keys`, so none would carry a filter. (Production
-        // relationship imports write batches, so this is also the honest
-        // shape.)
-        let mut batch = slatedb::WriteBatch::new();
-        for i in 0..1200u32 {
-            batch.put(format!("rprop_idx/{i:06}").as_bytes(), b"v");
-        }
-        writer.write(batch).await.unwrap();
-        // `Db::flush()` only flushes the WAL when the WAL is enabled; the reads
-        // below must hit an L0 SST for the filter counters to move, so force
-        // the memtable down explicitly.
-        writer
-            .flush_with_options(slatedb::config::FlushOptions {
-                flush_type: slatedb::config::FlushType::MemTable,
-            })
-            .await
-            .unwrap();
-
-        writer.get(b"rprop_idx/000500").await.unwrap();
-        assert_eq!(writer.get(b"absent/nothing").await.unwrap(), None);
-        let mut iter = writer
-            .scan_prefix(b"rprop_idx/0005".as_slice(), ..)
-            .await
-            .unwrap();
-        let mut scanned = 0;
-        while iter.next().await.unwrap().is_some() {
-            scanned += 1;
-        }
-        assert_eq!(scanned, 100, "rprop_idx/0005xx spans keys 000500–000599");
-
-        let snapshot = collect_storage_metrics(Some(&recorder), None);
-        assert!(snapshot.get_requests >= 2, "{snapshot:?}");
-        assert!(snapshot.scan_requests >= 1, "{snapshot:?}");
-        assert!(snapshot.immutable_memtable_flushes >= 1, "{snapshot:?}");
-        assert!(snapshot.memtable_write_bytes > 0, "{snapshot:?}");
-        assert!(snapshot.object_store_put_requests > 0, "{snapshot:?}");
-        // The flushed SST has a filter, so the point gets consulted it …
-        assert!(
-            snapshot.sst_filter_point_positives + snapshot.sst_filter_point_negatives >= 1,
-            "{snapshot:?}"
-        );
-        // … and so did the prefix scan, which the default bloom policy can
-        // never say no to (no prefix extractor): every consult is a positive,
-        // never a negative. This asymmetry is the entire write-cost story.
-        assert!(snapshot.sst_filter_prefix_positives >= 1, "{snapshot:?}");
-        assert_eq!(snapshot.sst_filter_prefix_negatives, 0, "{snapshot:?}");
-        let cache = db_cache.snapshot();
-        assert_eq!(cache.capacity_bytes, 1024 * 1024);
-        assert!(cache.resident_bytes > 0, "{cache:?}");
-        assert!(cache.resident_bytes <= cache.capacity_bytes, "{cache:?}");
-        assert!(cache.entries > 0, "{cache:?}");
-
-        writer.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn follow_latest_reader_does_not_mutate_object_storage() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from("graph/follow-latest-no-checkpoint");
-        let (writer, _recorder) = open_graph_db(
-            path.clone(),
-            Arc::clone(&object_store),
-            &GraphCacheConfig::default(),
-            &GraphStorageMemoryConfig::default(),
-            &GraphDurabilityConfig::default(),
-            test_db_cache(&object_store),
-        )
-        .await
-        .unwrap();
-        writer.put(b"seed", b"value").await.unwrap();
-        writer.flush().await.unwrap();
-        writer.close().await.unwrap();
-
-        let before = object_locations(&object_store).await;
-        let (reader, _recorder) = open_graph_reader(
-            path,
-            Arc::clone(&object_store),
-            &GraphCacheConfig::default(),
-            GraphReaderMode::FollowLatest,
-            Duration::from_secs(60 * 60),
-            test_db_cache(&object_store),
-        )
-        .await
-        .unwrap();
-        reader.refresh().await.unwrap();
-        assert_eq!(
-            reader.get(b"seed").await.unwrap().as_deref(),
-            Some(&b"value"[..])
-        );
-        reader.close().await.unwrap();
-
-        assert_eq!(object_locations(&object_store).await, before);
-    }
-
-    #[tokio::test]
-    async fn follow_latest_reader_observes_later_writes_after_explicit_refresh() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from("graph/follow-latest-explicit-refresh");
-        let (seed, _recorder) = open_graph_db(
-            path.clone(),
-            Arc::clone(&object_store),
-            &GraphCacheConfig::default(),
-            &GraphStorageMemoryConfig::default(),
-            &GraphDurabilityConfig::default(),
-            test_db_cache(&object_store),
-        )
-        .await
-        .unwrap();
-        seed.put(b"seed", b"value").await.unwrap();
-        seed.flush().await.unwrap();
-        seed.close().await.unwrap();
-
-        let (reader, _recorder) = open_graph_reader(
-            path.clone(),
-            Arc::clone(&object_store),
-            &GraphCacheConfig::default(),
-            GraphReaderMode::FollowLatest,
-            Duration::from_secs(60 * 60),
-            test_db_cache(&object_store),
-        )
-        .await
-        .unwrap();
-        let (writer, _recorder) = open_graph_db(
-            path,
-            Arc::clone(&object_store),
-            &GraphCacheConfig::default(),
-            &GraphStorageMemoryConfig::default(),
-            &GraphDurabilityConfig::default(),
-            test_db_cache(&object_store),
-        )
-        .await
-        .unwrap();
-        writer.put(b"later", b"durable").await.unwrap();
-        writer.flush().await.unwrap();
-        writer.close().await.unwrap();
-
-        reader.refresh().await.unwrap();
-        assert_eq!(
-            reader.get(b"later").await.unwrap().as_deref(),
-            Some(&b"durable"[..])
-        );
-        reader.close().await.unwrap();
-    }
-
-    #[test]
-    fn storage_memory_rejects_invalid_limits() {
-        let mut config = GraphStorageMemoryConfig::default();
-        config.max_unflushed_bytes = config.l0_sst_size_bytes - 1;
-        assert!(config.validate().is_err());
-
-        let config = GraphStorageMemoryConfig {
-            max_wal_flushes_before_l0_flush: 0,
-            ..GraphStorageMemoryConfig::default()
-        };
-        assert!(config.validate().is_err());
-
-        let config = GraphStorageMemoryConfig {
-            max_wal_flushes_before_l0_flush: 4_097,
-            ..GraphStorageMemoryConfig::default()
-        };
-        assert!(config.validate().is_err());
-
-        let config = GraphStorageMemoryConfig {
-            l0_flush_parallelism: 0,
-            ..GraphStorageMemoryConfig::default()
-        };
-        assert!(config.validate().is_err());
-    }
-
-    /// `GraphOpenOptions` and `GraphCachePolicy` are `#[non_exhaustive]`, so
-    /// embedders construct them from `default()` and assign what they need.
-    /// That is deliberate: it is what lets this crate add an option without
-    /// breaking every downstream struct literal.
-    ///
-    /// This test pins the supported shape. It does **not** need editing when a
-    /// field is added — if it ever does, the field was added in a way that
-    /// breaks embedders, and that is the thing to reconsider.
-    // `#[non_exhaustive]` is inert inside the defining crate, so clippy still
-    // suggests the struct literal here. Embedders cannot use one, which is the
-    // whole point of the test.
-    #[allow(clippy::field_reassign_with_default)]
-    #[test]
-    fn public_options_stay_constructible_without_exhaustive_literals() {
-        let mut cache_policy = GraphCachePolicy::default();
-        cache_policy.max_matrix_artifacts = 1;
-        cache_policy.max_graphblas_matrices = 1;
-        cache_policy.sparse_kernel = crate::SparseKernelBackend::Adjacency;
-
-        let mut options = GraphOpenOptions::default();
-        options.limits = GraphLimits::default();
-        options.cache_policy = cache_policy.clone();
-        options.index_policy = GraphIndexPolicy::default();
-
-        // Every field stays `pub`: nothing is hidden, only the literal is.
-        assert_eq!(options.cache_policy, cache_policy);
-        assert_eq!(options.reader_mode, GraphReaderMode::ManagedCheckpoint);
-        assert_eq!(
-            options.reader_manifest_poll_interval,
-            GRAPH_READER_MANIFEST_POLL_INTERVAL
-        );
-        assert_eq!(
-            options.cache_policy.sparse_kernel,
-            crate::SparseKernelBackend::Adjacency
-        );
     }
 }

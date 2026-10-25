@@ -731,16 +731,105 @@ impl CompiledGraphBlasMatrix {
         self.canonical_out.neighbors(vertex)
     }
 
+    /// Read a prepared reverse degree without allocating the reverse CSC.
     #[cfg(feature = "opencypher")]
-    pub(crate) fn in_degree(&self, vertex: VertexId) -> u64 {
+    pub(crate) fn cached_in_degree(&self, vertex: VertexId) -> Option<u64> {
         self.canonical_in
-            .get_or_init(|| self.canonical_out.transpose())
-            .vertex_degree(vertex)
+            .get()
+            .map(|matrix| matrix.vertex_degree(vertex))
+    }
+
+    /// Work required to find predecessors without building a reverse matrix.
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn in_neighbor_scan_work(&self) -> u64 {
+        (self.canonical_out.vertices.len() as u64)
+            .saturating_add(self.canonical_out.indices.len() as u64)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn in_neighbors_without_reverse(
+        &self,
+        vertex: VertexId,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<Vec<VertexId>> {
+        let target = self.canonical_out.ordinal(vertex);
+        let mut neighbors = Vec::new();
+        for (ordinal, src) in self.canonical_out.vertices.iter().enumerate() {
+            check()?;
+            for index in self.canonical_out.neighbor_range(ordinal) {
+                check()?;
+                if Some(self.canonical_out.neighbor(index)) == target {
+                    neighbors.push(*src);
+                }
+            }
+        }
+        Ok(neighbors)
     }
 
     #[cfg(feature = "opencypher")]
     pub(crate) fn out_degree(&self, vertex: VertexId) -> u64 {
         self.canonical_out.vertex_degree(vertex)
+    }
+
+    /// Visit every structural edge `(src, dst)` of the forward CSC. `check`
+    /// runs once per source vertex and once per edge, so a hub's edges cannot
+    /// outrun cancellation; callers throttle it.
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn for_each_edge(
+        &self,
+        mut visit: impl FnMut(VertexId, VertexId),
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let matrix = &self.canonical_out;
+        for ordinal in 0..matrix.dimension() {
+            check()?;
+            let src = matrix.vertices[ordinal];
+            for index in matrix.neighbor_range(ordinal) {
+                check()?;
+                visit(src, matrix.vertices[matrix.neighbor(index)]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit every vertex's structural out- and/or in-degree in one pass over
+    /// the forward CSC, without building the reverse matrix. `add` may be
+    /// called more than once for a vertex (once for its out-degree, once per
+    /// incoming edge); callers sum. With `self_loops_once` and both
+    /// directions, a self-loop's incoming end is skipped, so it counts once
+    /// rather than once per direction. `check` runs once per source vertex
+    /// and once per incoming edge walked; callers throttle it.
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn accumulate_degrees(
+        &self,
+        outgoing: bool,
+        incoming: bool,
+        self_loops_once: bool,
+        mut add: impl FnMut(VertexId, u64),
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let matrix = &self.canonical_out;
+        for ordinal in 0..matrix.dimension() {
+            check()?;
+            if outgoing {
+                let degree = matrix.degree(ordinal);
+                if degree > 0 {
+                    add(matrix.vertices[ordinal], degree);
+                }
+            }
+            if incoming {
+                let skip_loop = outgoing && self_loops_once;
+                for index in matrix.neighbor_range(ordinal) {
+                    check()?;
+                    let neighbor = matrix.neighbor(index);
+                    if skip_loop && neighbor == ordinal {
+                        continue;
+                    }
+                    add(matrix.vertices[neighbor], 1);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "opencypher")]
@@ -804,12 +893,6 @@ impl CompiledGraphBlasMatrix {
                 .unwrap_or(DEFAULT_INLINE_WORK_EDGES)
         });
         self.edge_count.saturating_mul(usize::from(max_hops)) <= threshold
-    }
-
-    #[cfg(test)]
-    #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
-    pub(crate) fn replica_count(&self) -> usize {
-        self.replicas.len()
     }
 
     fn lock_available_replica(&self) -> Result<MutexGuard<'_, CompiledGraphBlasMatrixInner>> {
@@ -889,20 +972,6 @@ pub(super) fn expand(
     let csc = graphblas_csc_from_adjacency(adjacency)?;
     let compiled = build_compiled_inner(&csc)?;
     expand_with_compiled(adjacency, starts, hops, &compiled)
-}
-
-#[cfg(test)]
-pub(super) fn expand_range(
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    min_hops: u8,
-    max_hops: u8,
-) -> Result<SparseTraversal> {
-    init()?;
-
-    let csc = graphblas_csc_from_adjacency(adjacency)?;
-    let compiled = build_compiled_inner(&csc)?;
-    expand_range_with_compiled(adjacency, starts, min_hops, max_hops, &compiled)
 }
 
 fn build_compiled_inner(csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrixInner> {

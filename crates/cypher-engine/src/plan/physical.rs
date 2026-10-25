@@ -1,4 +1,7 @@
-use crate::{AggregateFunction, BoundValue, PatternDirection, ScalarValue, SortDirection, Symbol};
+use crate::{
+    AggregateFunction, BoundValue, PatternDirection, ScalarFunction, ScalarValue, SortDirection,
+    Symbol,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PhysicalBinaryOperator {
@@ -39,7 +42,19 @@ pub enum PhysicalExpression {
     Value(BoundValue),
     Aggregate {
         function: AggregateFunction,
+        distinct: bool,
         expression: Option<Box<PhysicalExpression>>,
+    },
+    Function {
+        function: ScalarFunction,
+        arguments: Vec<PhysicalExpression>,
+    },
+    /// A list value: a literal, or a list parameter bound element by element.
+    List(Vec<PhysicalExpression>),
+    Case {
+        operand: Option<Box<PhysicalExpression>>,
+        branches: Vec<(PhysicalExpression, PhysicalExpression)>,
+        default: Option<Box<PhysicalExpression>>,
     },
     Unary {
         operator: PhysicalUnaryOperator,
@@ -93,19 +108,37 @@ fn expression_name(expression: &PhysicalExpression) -> String {
         }
         PhysicalExpression::Aggregate {
             function,
+            distinct,
             expression,
         } => format!(
-            "{}({})",
-            match function {
-                AggregateFunction::Count => "count",
-                AggregateFunction::Sum => "sum",
-                AggregateFunction::Average => "avg",
-                AggregateFunction::Collect => "collect",
-            },
+            "{}({}{})",
+            function.name(),
+            if *distinct { "DISTINCT " } else { "" },
             expression
                 .as_deref()
                 .map(expression_name)
                 .unwrap_or_else(|| "*".to_string())
+        ),
+        PhysicalExpression::Case { .. } => "CASE".to_string(),
+        PhysicalExpression::List(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(expression_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        PhysicalExpression::Function {
+            function,
+            arguments,
+        } => format!(
+            "{}({})",
+            function.name(),
+            arguments
+                .iter()
+                .map(expression_name)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         PhysicalExpression::Unary {
             operator,
@@ -130,8 +163,30 @@ pub struct PhysicalSort {
     pub direction: SortDirection,
 }
 
+/// What a [`GraphPhysicalPlan::VertexGuardedAccess`] reads while its guard
+/// holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuardedAccess {
+    /// Seek the vertices whose `property` equals any of `values`.
+    PropertySeek {
+        property: Symbol,
+        values: Vec<BoundValue>,
+    },
+    /// Scan every vertex carrying `label`; the node's `labels` are checked on
+    /// the rows.
+    LabelScan { label: Symbol },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphPhysicalPlan {
+    /// See [`crate::GraphLogicalPlan::SingleRow`].
+    SingleRow,
+    /// See [`crate::GraphLogicalPlan::Unwind`].
+    Unwind {
+        input: Box<GraphPhysicalPlan>,
+        expression: PhysicalExpression,
+        binding: Symbol,
+    },
     Union {
         arms: Vec<GraphPhysicalPlan>,
         all: bool,
@@ -158,7 +213,7 @@ pub enum GraphPhysicalPlan {
         labels: Vec<Symbol>,
         property: Symbol,
     },
-    /// Bounded ordered walk of one string property index. Replaces
+    /// Bounded ordered walk of one vertex property index. Replaces
     /// `Sort(Filter(VertexPropertyScan))` beneath a constant window when the
     /// index alone proves the whole predicate and the requested order, so the
     /// executor reads only the leading `required` rows (plus the final tie)
@@ -189,6 +244,33 @@ pub enum GraphPhysicalPlan {
         /// `required`, so the scan must keep reading until that many survive.
         residual: Option<PhysicalExpression>,
     },
+    /// Bounded ordered walk of one relationship property index: the
+    /// relationship counterpart of `OrderedVertexPropertyScan`. Replaces
+    /// `Sort(Filter(Expand(NodeScan)))` beneath a constant window when the
+    /// window's leading sort key is a property of the expanded relationship,
+    /// so only the leading `required` relationships (plus the boundary tie)
+    /// are read and their endpoints hydrated.
+    ///
+    /// `residual` has the same meaning as on the vertex walk. Endpoint labels
+    /// are always checked in memory.
+    OrderedRelationshipPropertyScan {
+        from: Symbol,
+        source_labels: Vec<Symbol>,
+        relationship: Symbol,
+        relationship_type: Symbol,
+        /// Pattern direction from `from` to `to`; never undirected.
+        direction: PatternDirection,
+        to: Symbol,
+        target_labels: Vec<Symbol>,
+        property: Symbol,
+        sort_direction: SortDirection,
+        prefix: Option<BoundValue>,
+        lower: Option<(BoundValue, bool)>,
+        upper: Option<(BoundValue, bool)>,
+        required: usize,
+        items: Vec<PhysicalSort>,
+        residual: Option<PhysicalExpression>,
+    },
     VertexLabelScan {
         binding: Symbol,
         /// Label used to seed the storage scan. The planner chooses the
@@ -213,6 +295,102 @@ pub enum GraphPhysicalPlan {
         to: Symbol,
         target_labels: Vec<Symbol>,
     },
+    /// [`GraphPhysicalPlan::RelationshipPropertySeek`] for several values of
+    /// one property: `r.p = $a OR r.p = $b` or `r.p IN $list`. The union of one
+    /// index seek per distinct value, each relationship reported once however
+    /// many values matched it. Like the single seek, the `Filter` above it
+    /// still applies the whole predicate.
+    RelationshipPropertyMultiSeek {
+        from: Symbol,
+        source_labels: Vec<Symbol>,
+        relationship: Symbol,
+        relationship_type: Symbol,
+        property: Symbol,
+        values: Vec<BoundValue>,
+        direction: PatternDirection,
+        to: Symbol,
+        target_labels: Vec<Symbol>,
+    },
+    /// Try a bounded range-index probe before a label-wide expansion. The
+    /// fallback preserves the original plan when the range is too broad.
+    RelationshipPropertyRangeProbe {
+        from: Symbol,
+        source_labels: Vec<Symbol>,
+        relationship: Symbol,
+        relationship_type: Symbol,
+        property: Symbol,
+        lower: BoundValue,
+        inclusive: bool,
+        direction: PatternDirection,
+        to: Symbol,
+        target_labels: Vec<Symbol>,
+        fallback: Box<GraphPhysicalPlan>,
+    },
+    /// Bounded read of one vertex property index between optional bounds,
+    /// chosen from stored statistics because the range looked narrower than
+    /// every equality and the label. Same shape as
+    /// `RelationshipPropertyRangeProbe`: the read is a candidate superset, the
+    /// `Filter` above it still applies the whole predicate, and once it has
+    /// read more than `read_limit` index entries it declines and `fallback`
+    /// -- the plan the planner picks without statistics -- runs, with the
+    /// enclosing `Filter`'s runtime probe allowed as it is on that plan
+    /// today. See [`GraphPhysicalPlan::VertexGuardedAccess`].
+    ///
+    /// `estimated_rows` and `read_limit` are derived from statistics, so they
+    /// render redacted in a plan shape and a refresh does not churn its hash.
+    VertexPropertyRangeSeek {
+        binding: Symbol,
+        labels: Vec<Symbol>,
+        property: Symbol,
+        /// Exclusive or inclusive lower bound, when present.
+        lower: Option<(BoundValue, bool)>,
+        /// Exclusive or inclusive upper bound, when present.
+        upper: Option<(BoundValue, bool)>,
+        estimated_rows: u64,
+        read_limit: usize,
+        fallback: Box<GraphPhysicalPlan>,
+    },
+    /// An equality seek or a label scan chosen from stored statistics. The
+    /// planner is confident in it, so it runs without the runtime equality
+    /// probe; its read limit is the guard instead. Once it has read more than
+    /// `read_limit` index entries it declines and `fallback` -- the plan the
+    /// planner picks without statistics -- runs, under the enclosing `Filter`
+    /// with the probe allowed exactly as before statistics existed. A wrong
+    /// estimate therefore costs the entries read before the decline, and
+    /// after it no more than today's plan.
+    ///
+    /// Like the range seek, the read is a candidate superset: the `Filter`
+    /// above it applies the whole predicate. `estimated_rows` and
+    /// `read_limit` are derived from statistics and render redacted in a plan
+    /// shape.
+    VertexGuardedAccess {
+        binding: Symbol,
+        labels: Vec<Symbol>,
+        access: GuardedAccess,
+        estimated_rows: u64,
+        read_limit: usize,
+        fallback: Box<GraphPhysicalPlan>,
+    },
+    /// Enter the pattern through the relationship type instead of a vertex
+    /// label, for a type rare enough that reading its whole edge population
+    /// beats sweeping the anchor label to discover that most of its vertices
+    /// have no such edge.
+    ///
+    /// Selectivity is measured, not estimated: the probe walks the type's
+    /// edges under a fixed entry budget and declines when it exhausts it, so
+    /// no statistic decides this and a type that grows dense stops being
+    /// probed on its own. `fallback` is the label-anchored plan this replaced
+    /// and runs verbatim when the probe declines.
+    RelationshipTypeProbe {
+        from: Symbol,
+        source_labels: Vec<Symbol>,
+        relationship: Symbol,
+        relationship_type: Symbol,
+        direction: PatternDirection,
+        to: Symbol,
+        target_labels: Vec<Symbol>,
+        fallback: Box<GraphPhysicalPlan>,
+    },
     Expand {
         input: Box<GraphPhysicalPlan>,
         from: Symbol,
@@ -225,12 +403,17 @@ pub enum GraphPhysicalPlan {
     VariableExpand {
         input: Box<GraphPhysicalPlan>,
         from: Symbol,
+        /// `[rs:R*1..3]`: the path's relationships, in walk order, bound to
+        /// `rs` as a list value.
+        relationship: Option<Symbol>,
         relationship_types: Vec<Symbol>,
         direction: PatternDirection,
         to: Symbol,
         target_labels: Vec<Symbol>,
         min_hops: u8,
-        max_hops: u8,
+        /// `None` for an unbounded pattern (`*`, `*2..`): trail semantics end
+        /// every walk, and the query's row budgets bound how far it gets.
+        max_hops: Option<u8>,
     },
     NaturalJoin {
         left: Box<GraphPhysicalPlan>,

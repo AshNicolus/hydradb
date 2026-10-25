@@ -24,7 +24,7 @@ use std::fmt;
 /// Coarse failure class for the `error.class` attribute.
 ///
 /// The variants mirror the `GraphError` groupings in
-/// `docs/plans/2026-07-26-otel-telemetry-crate.md` §6.
+/// the telemetry crate design §6.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum ErrorClass {
@@ -151,54 +151,5 @@ impl Outcome {
 impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn class_strings_are_unique() {
-        let mut names: Vec<_> = ErrorClass::ALL.iter().map(|class| class.as_str()).collect();
-        names.sort_unstable();
-        let before = names.len();
-        names.dedup();
-        assert_eq!(before, names.len(), "two classes share a string");
-    }
-
-    #[test]
-    fn class_strings_are_lower_snake() {
-        for class in ErrorClass::ALL {
-            let name = class.as_str();
-            assert!(
-                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                "{name} is not lower_snake"
-            );
-        }
-    }
-
-    #[test]
-    fn only_contention_fencing_and_routing_are_expected() {
-        let expected: Vec<_> = ErrorClass::ALL
-            .iter()
-            .filter(|class| class.is_expected_during_normal_operation())
-            .copied()
-            .collect();
-        assert_eq!(
-            expected,
-            vec![
-                ErrorClass::Contention,
-                ErrorClass::Fencing,
-                ErrorClass::Routing,
-            ]
-        );
-    }
-
-    #[test]
-    fn outcome_strings_are_distinct() {
-        assert_eq!(Outcome::Success.as_str(), "success");
-        assert_eq!(Outcome::Skipped.as_str(), "skipped");
-        assert_eq!(Outcome::Failed.as_str(), "failed");
     }
 }

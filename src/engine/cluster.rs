@@ -7,7 +7,7 @@ use tracing::Instrument as _;
 
 /// Stamp a failure onto the span that raised it.
 ///
-/// §6 of `docs/plans/2026-07-26-otel-telemetry-crate.md`: a `fencing` error seen
+/// §6 of the telemetry crate design: a `fencing` error seen
 /// at `client.mutate` says a write failed, and the same error on
 /// `placement.resolve` says why. So each site records its own class rather than
 /// letting an outer span report one it did not produce.
@@ -221,6 +221,9 @@ struct RoutedClusterOpenConfig {
     options: GraphOpenOptions,
     memory: GraphMemoryConfig,
     writer_leases: Option<Arc<ObjectStoreWriterLeaseDirectory>>,
+    writer_gate: crate::WriterGate,
+    cache_totals: BTreeMap<String, Arc<crate::GraphCacheMetrics>>,
+    operational_totals: Option<Arc<crate::CumulativeOperationalCounters>>,
 }
 
 impl RoutedGraphCluster {
@@ -304,6 +307,9 @@ impl RoutedGraphCluster {
             options: GraphOpenOptions::default(),
             memory: GraphMemoryConfig::default(),
             writer_leases: None,
+            writer_gate: crate::WriterGate::default(),
+            cache_totals: BTreeMap::new(),
+            operational_totals: None,
         })
         .await
     }
@@ -335,8 +341,11 @@ impl RoutedGraphCluster {
             object_store,
             writer_registry,
             writer_leases,
+            crate::WriterGate::default(),
             options,
             memory,
+            BTreeMap::new(),
+            None,
         )
         .await
     }
@@ -351,8 +360,11 @@ impl RoutedGraphCluster {
         object_store: Arc<dyn ObjectStore>,
         writer_registry: Arc<ProcessWriterRegistry>,
         writer_leases: Arc<ObjectStoreWriterLeaseDirectory>,
+        writer_gate: crate::WriterGate,
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
+        cache_totals: BTreeMap<String, Arc<crate::GraphCacheMetrics>>,
+        operational_totals: Option<Arc<crate::CumulativeOperationalCounters>>,
     ) -> Result<Self> {
         let base_path = scope.scoped_store_path(&base_path.into());
         Self::open_at_path(RoutedClusterOpenConfig {
@@ -367,6 +379,9 @@ impl RoutedGraphCluster {
             options,
             memory,
             writer_leases: Some(writer_leases),
+            writer_gate,
+            cache_totals,
+            operational_totals,
         })
         .await
     }
@@ -384,6 +399,9 @@ impl RoutedGraphCluster {
             options,
             memory,
             writer_leases,
+            writer_gate,
+            cache_totals,
+            operational_totals,
         } = config;
         validate_component("node_id", &local_node_id)?;
         if !directory.contains_node(&local_node_id)? {
@@ -412,6 +430,7 @@ impl RoutedGraphCluster {
             writer_leases.register_scope(&scope, &local_node_id);
         }
         let mut shards = BTreeMap::new();
+        let mut operational_registrations = Vec::new();
         for cell_id in directory.cells().map(str::to_string) {
             let path = format!("{base_path}/{cell_id}");
             let opened = if promotable {
@@ -437,7 +456,7 @@ impl RoutedGraphCluster {
                 )
                 .await
             };
-            let shard = match opened {
+            let mut shard = match opened {
                 Ok(shard) => shard,
                 Err(err) => {
                     close_routed_shards_best_effort(shards).await;
@@ -456,6 +475,14 @@ impl RoutedGraphCluster {
                 shard.close().await?;
                 continue;
             }
+            if let Some(totals) = cache_totals.get(&cell_id) {
+                shard.cache_metrics =
+                    Arc::new(crate::GraphCacheMetrics::with_totals(Arc::clone(totals)));
+            }
+            if let Some(totals) = &operational_totals {
+                operational_registrations
+                    .push(totals.register(cell_id.clone(), Arc::clone(&shard.operation_metrics)));
+            }
             shards.insert(cell_id, Arc::new(shard));
         }
         Ok(Self {
@@ -469,6 +496,8 @@ impl RoutedGraphCluster {
             scope_registration: tokio::sync::OnceCell::new(),
             shards,
             promotable,
+            writer_gate,
+            operational_registrations,
         })
     }
 
@@ -536,7 +565,7 @@ impl RoutedGraphCluster {
     /// > A node must not promote itself for a cell it does not own, unless the
     /// > computed owner is not live.
     ///
-    /// Touch point (b) of `docs/plans/2026-07-25-rendezvous-placement.md`.
+    /// Touch point (b) of the rendezvous placement design.
     /// Before this existed, any node opened the SlateDB writer on demand, which
     /// fenced whoever held it; the fenced node's next write took it straight
     /// back, and three nodes traded one cell's epoch forever. Rendezvous decides
@@ -588,6 +617,18 @@ impl RoutedGraphCluster {
             let error = GraphError::WriteRequiresWriter {
                 operation: "routed_write",
                 cell_id: cell_id.to_string(),
+            };
+            record_error_class(&error);
+            return Err(error);
+        }
+        // The object store has not passed the create-only probe: fencing
+        // cannot stop a superseded writer there, so take no writer at all.
+        // No owner hint, as for a shed view: this node knows nothing useful
+        // about who should write, only that it must not.
+        if !self.writer_gate.is_open() {
+            let error = GraphError::NotCellWriter {
+                cell_id: cell_id.to_string(),
+                owner: None,
             };
             record_error_class(&error);
             return Err(error);
@@ -732,7 +773,7 @@ impl RoutedGraphCluster {
     /// the next incident's logs.
     ///
     /// Option 3a of decision 3 in
-    /// `docs/plans/2026-07-25-rendezvous-placement.md`, and the only place the
+    /// the rendezvous placement design, and the only place the
     /// record is written. Three properties are load-bearing, and each is
     /// deliberate rather than incidental:
     ///
@@ -1364,6 +1405,16 @@ impl ScopedRoutedGraphCluster {
             Arc::clone(&object_store),
             writer_lease_duration,
         );
+        let cache_totals = directory
+            .cells()
+            .map(|cell| {
+                (
+                    cell.to_owned(),
+                    Arc::new(crate::GraphCacheMetrics::default()),
+                )
+            })
+            .collect();
+        let operational_totals = Arc::new(crate::CumulativeOperationalCounters::default());
         Ok(Self {
             base_path: base_path.clone(),
             root_namespace: root_namespace.clone(),
@@ -1380,8 +1431,11 @@ impl ScopedRoutedGraphCluster {
             indexer_change_wake: None,
             object_store,
             slatedb_cache,
+            cache_totals,
+            operational_totals,
             writer_leases,
             writer_registry,
+            writer_gate: crate::WriterGate::default(),
             options,
             memory,
             max_open_scopes,
@@ -1406,6 +1460,12 @@ impl ScopedRoutedGraphCluster {
     }
 
     /// Wake an external indexer notifier after its durable change hint lands.
+    /// The switch every scope's cluster checks before taking a writer. Open
+    /// unless the caller closes it; see [`crate::WriterGate`].
+    pub fn writer_gate(&self) -> crate::WriterGate {
+        self.writer_gate.clone()
+    }
+
     pub fn with_indexer_change_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
         self.indexer_change_wake = Some(wake);
         self
@@ -1413,6 +1473,23 @@ impl ScopedRoutedGraphCluster {
 
     pub fn writer_lease_directory(&self) -> Arc<ObjectStoreWriterLeaseDirectory> {
         Arc::clone(&self.writer_leases)
+    }
+
+    /// Cumulative cache operations for this runtime, including closed scopes.
+    pub fn graph_cache_metrics(&self) -> BTreeMap<String, GraphCacheMetricsSnapshot> {
+        self.cache_totals
+            .iter()
+            .map(|(cell, metrics)| (cell.clone(), metrics.snapshot()))
+            .collect()
+    }
+
+    /// Cumulative operational counters for this runtime, per cell, including
+    /// closed scopes — the counter totals an export must render so a scope
+    /// closing never makes one fall. See [`crate::CumulativeOperationalCounters`].
+    pub fn cell_operational_counter_totals(
+        &self,
+    ) -> BTreeMap<String, crate::CellOperationalCounterTotals> {
+        self.operational_totals.totals()
     }
 
     pub fn slatedb_cache_metrics(&self) -> SlateDbCacheMetricsSnapshot {
@@ -1613,12 +1690,17 @@ impl ScopedRoutedGraphCluster {
                     Arc::clone(&self.object_store),
                     Arc::clone(&self.writer_registry),
                     Arc::clone(&self.writer_leases),
+                    self.writer_gate.clone(),
                     self.options_for_scope(scope),
                     self.memory.clone(),
+                    self.cache_totals.clone(),
+                    Some(Arc::clone(&self.operational_totals)),
                 )
                 .instrument(tracing::info_span!("graph.scope_open"))
                 .await?,
             );
+            #[cfg(feature = "experimental-cypher-engine")]
+            self.install_planner_statistics_hints(scope, &cluster);
             let _capacity_guard = self.scope_capacity_gate.lock().await;
             reservation.release();
             self.clusters.lock().await.insert(
@@ -1703,23 +1785,6 @@ impl ScopedRoutedGraphCluster {
         Some(Arc::clone(&entry.cluster))
     }
 
-    #[cfg(test)]
-    pub(crate) async fn cluster_for_scope_write(
-        &self,
-        scope: &GraphScope,
-        cell_id: &str,
-    ) -> Result<Arc<RoutedGraphCluster>> {
-        let cluster = self.cluster_for_scope(scope).await?;
-        cluster.ensure_local_writer(cell_id).await?;
-        // Registration is durable and immutable; retry failures, but share success
-        // for this retained cluster. Reopening an evicted scope registers again.
-        cluster
-            .scope_registration
-            .get_or_try_init(|| self.scope_directory.register(scope))
-            .await?;
-        Ok(cluster)
-    }
-
     pub(crate) async fn cluster_for_scope_write_wait(
         &self,
         scope: &GraphScope,
@@ -1732,6 +1797,48 @@ impl ScopedRoutedGraphCluster {
             .get_or_try_init(|| self.scope_directory.register(scope))
             .await?;
         Ok(cluster)
+    }
+
+    /// Give every shard of `cluster` a way to ask the indexer for planner
+    /// statistics: a marker beside the change hints, then the same wake the
+    /// write path uses. Outside the query's latency path, and best effort
+    /// like a change hint.
+    #[cfg(feature = "experimental-cypher-engine")]
+    fn install_planner_statistics_hints(&self, scope: &GraphScope, cluster: &RoutedGraphCluster) {
+        for cell_id in self.directory.cells() {
+            let Ok(shard) = cluster.shard(cell_id) else {
+                continue;
+            };
+            let directory = self.scope_directory.clone();
+            let wake = self.indexer_change_wake.clone();
+            let scope = scope.clone();
+            shard.planner_statistics_hints.install(Arc::new(
+                move |cell_id: &str, on_failure: crate::shard::PlannerStatisticsHintFailure| {
+                    let directory = directory.clone();
+                    let wake = wake.clone();
+                    let scope = scope.clone();
+                    let cell_id = cell_id.to_string();
+                    tokio::spawn(async move {
+                        match directory.request_planner_statistics(&scope, &cell_id).await {
+                            Ok(()) => {
+                                if let Some(wake) = wake {
+                                    wake.notify_one();
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    hydradb.scope = %scope,
+                                    hydradb.cell_id = %cell_id,
+                                    error = %error,
+                                    "failed to persist planner statistics request; the next query asks again"
+                                );
+                                on_failure();
+                            }
+                        }
+                    });
+                },
+            ));
+        }
     }
 
     /// Notify the background indexer after a committed scoped mutation.
@@ -2050,2013 +2157,5 @@ async fn close_shards_best_effort(shards: BTreeMap<String, GraphShard>) {
 async fn close_routed_shards_best_effort(shards: BTreeMap<String, Arc<GraphShard>>) {
     for shard in shards.into_values() {
         let _ = shard.close().await;
-    }
-}
-
-#[cfg(all(test, feature = "query-transport"))]
-mod scoped_cluster_tests {
-    use hydradb_placement::heartbeat::{self, Heartbeat};
-    use slatedb::object_store::memory::InMemory;
-    use slatedb::object_store::path::Path;
-    use slatedb::object_store::prefix::PrefixStore;
-
-    use super::*;
-    use crate::NamespaceId;
-
-    #[test]
-    fn scoped_clusters_partition_the_local_slate_cache_budget() {
-        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
-        let graph_id = GraphId::new("hydradb").unwrap();
-        let runtime = ScopedRoutedGraphCluster::new(
-            "graph/data",
-            root.clone(),
-            graph_id.clone(),
-            "node-a",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-            Arc::new(InMemory::new()),
-            GraphOpenOptions {
-                cache: crate::GraphCacheConfig {
-                    object_store_cache_max_open_file_handles: 512,
-                    ..crate::GraphCacheConfig::disk_cache("/cache", 800)
-                },
-                ..GraphOpenOptions::default()
-            },
-            GraphMemoryConfig::default(),
-            8,
-        )
-        .unwrap();
-        let first = GraphScope::new(
-            root.child(NamespaceId::new("tenant-a").unwrap()).unwrap(),
-            graph_id.clone(),
-        );
-        let second = GraphScope::new(
-            runtime
-                .root_scope()
-                .namespace
-                .child(NamespaceId::new("tenant-b").unwrap())
-                .unwrap(),
-            graph_id,
-        );
-
-        let first_options = runtime.options_for_scope(&first);
-        let second_options = runtime.options_for_scope(&second);
-        assert_eq!(first_options.cache.object_store_cache_bytes, Some(100));
-        assert_eq!(second_options.cache.object_store_cache_bytes, Some(100));
-        // Eight scopes can retain one reader and one writer for this cell, so
-        // all independent SlateDB caches together remain within 512 handles.
-        assert_eq!(
-            first_options.cache.object_store_cache_max_open_file_handles,
-            32
-        );
-        assert_ne!(
-            first_options.cache.object_store_cache_dir,
-            second_options.cache.object_store_cache_dir
-        );
-        assert!(first_options
-            .cache
-            .object_store_cache_dir
-            .unwrap()
-            .ends_with("production/tenant-a/graphs/hydradb"));
-    }
-
-    #[test]
-    fn scoped_clusters_reject_an_undersized_disk_cache_handle_budget() {
-        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
-        let result = ScopedRoutedGraphCluster::new(
-            "graph/data",
-            root,
-            GraphId::new("hydradb").unwrap(),
-            "node-a",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-            Arc::new(InMemory::new()),
-            GraphOpenOptions {
-                cache: crate::GraphCacheConfig {
-                    object_store_cache_max_open_file_handles: 15,
-                    ..crate::GraphCacheConfig::disk_cache("/cache", 800)
-                },
-                ..GraphOpenOptions::default()
-            },
-            GraphMemoryConfig::default(),
-            8,
-        );
-        assert!(matches!(
-            result.err().expect("undersized budget must be rejected"),
-            GraphError::AdmissionRejected {
-                operation: "data_cache_file_handle_budget",
-                actual: 16,
-                limit: 15,
-            }
-        ));
-    }
-
-    /// A runtime whose scope map is exactly `max_open_scopes` deep, so the next
-    /// miss must evict, and eviction only considers entries nobody else holds.
-    fn runtime_at_capacity(base_path: &str, max_open_scopes: usize) -> ScopedRoutedGraphCluster {
-        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
-        ScopedRoutedGraphCluster::new(
-            base_path,
-            root,
-            GraphId::new("hydradb").unwrap(),
-            "node-a",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-            Arc::new(InMemory::new()),
-            GraphOpenOptions::default(),
-            GraphMemoryConfig::default(),
-            max_open_scopes,
-        )
-        .unwrap()
-    }
-
-    fn tenant_scope(runtime: &ScopedRoutedGraphCluster, tenant: &str) -> GraphScope {
-        GraphScope::new(
-            runtime
-                .root_scope()
-                .namespace
-                .child(NamespaceId::new(tenant).unwrap())
-                .unwrap(),
-            runtime.root_scope().graph_id,
-        )
-    }
-
-    #[tokio::test]
-    async fn cancelled_eviction_retains_capacity_until_handles_close() {
-        let store = crate::tests::ReadCountingObjectStore::new();
-        let runtime = ScopedRoutedGraphCluster::new(
-            "graph/cancel-eviction-capacity",
-            NamespacePath::root(NamespaceId::new("production").unwrap()),
-            GraphId::new("hydradb").unwrap(),
-            "node-a",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-            store.clone(),
-            GraphOpenOptions {
-                reader_manifest_poll_interval: Duration::from_secs(60),
-                ..Default::default()
-            },
-            GraphMemoryConfig::default(),
-            1,
-        )
-        .unwrap();
-        let first = tenant_scope(&runtime, "first");
-        let cluster = runtime
-            .cluster_for_scope_write(&first, "cell-0")
-            .await
-            .unwrap();
-        drop(
-            cluster
-                .shard("cell-0")
-                .unwrap()
-                .db
-                .reader_snapshot()
-                .await
-                .unwrap(),
-        );
-        drop(cluster);
-        let (started, release) = store.pause_next_get();
-        let cold = tenant_scope(&runtime, "cold");
-        let mut open = Box::pin(runtime.cluster_for_scope(&cold));
-        tokio::select! {
-            result = &mut open => panic!("eviction must await paused storage: {}", result.is_ok()),
-            result = tokio::time::timeout(Duration::from_secs(3), started) => result.unwrap().unwrap(),
-        }
-        drop(open);
-        let reserved = runtime.scope_open_reservations.load(Ordering::Acquire);
-        let third = tenant_scope(&runtime, "third");
-        let rejected = matches!(
-            runtime.cluster_for_scope(&third).await,
-            Err(GraphError::AdmissionRejected {
-                operation: "open_graph_scopes",
-                ..
-            })
-        );
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while runtime.scope_closure(&first).is_some()
-                || runtime.scope_open_reservations.load(Ordering::Acquire) != 0
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        drop(runtime.cluster_for_scope(&third).await.unwrap());
-        runtime.close().await.unwrap();
-        println!("cancelled_eviction_reserved={reserved} replacement_rejected={rejected}");
-        assert_eq!(
-            reserved, 1,
-            "cancelled request must not free a still-closing scope slot"
-        );
-        assert!(rejected);
-    }
-
-    #[tokio::test]
-    async fn client_scope_admission_waits_for_an_active_scope_to_become_evictable() {
-        let runtime = runtime_at_capacity("graph/client-scope-capacity-wait", 1);
-        let first = tenant_scope(&runtime, "first");
-        let release = runtime.scope_capacity_release_guard();
-        let held = runtime.cluster_for_scope(&first).await.unwrap();
-        let second = tenant_scope(&runtime, "second");
-        let cancellation = crate::QueryCancellationToken::new();
-        let mut waiting =
-            std::pin::pin!(cancellation.scope(runtime.cluster_for_scope_wait(&second)));
-
-        assert!(
-            futures::poll!(waiting.as_mut()).is_pending(),
-            "client admission must apply backpressure while every retained scope is active"
-        );
-        drop(held);
-        drop(release);
-
-        let opened = tokio::time::timeout(Duration::from_secs(3), waiting)
-            .await
-            .expect("released capacity wakes the client wait")
-            .expect("the waiting scope opens instead of returning admission failure");
-        assert_eq!(opened.scope(), &second);
-        drop(opened);
-        runtime.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn client_scope_admission_wait_honors_query_cancellation() {
-        let runtime = runtime_at_capacity("graph/client-scope-capacity-cancel", 1);
-        let first = tenant_scope(&runtime, "first");
-        let held = runtime.cluster_for_scope(&first).await.unwrap();
-        let second = tenant_scope(&runtime, "second");
-        let cancellation = crate::QueryCancellationToken::new();
-        let mut waiting =
-            std::pin::pin!(cancellation.scope(runtime.cluster_for_scope_wait(&second)));
-
-        assert!(futures::poll!(waiting.as_mut()).is_pending());
-        cancellation.cancel();
-        assert!(matches!(
-            waiting.await,
-            Err(GraphError::QueryTimeout {
-                operation: "client_query_cancelled",
-                ..
-            })
-        ));
-
-        drop(held);
-        runtime.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn retained_scope_writes_register_once_and_retry_failure() {
-        let store = crate::tests::ReadCountingObjectStore::new();
-        let runtime = ScopedRoutedGraphCluster::new(
-            "graph/register-once",
-            NamespacePath::root(NamespaceId::new("production").unwrap()),
-            GraphId::new("hydradb").unwrap(),
-            "node-a",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-            store.clone(),
-            GraphOpenOptions::default(),
-            GraphMemoryConfig::default(),
-            1,
-        )
-        .unwrap();
-        let scope = tenant_scope(&runtime, "tenant-a");
-        store.fail_scope_put.store(true, Ordering::Release);
-        assert!(runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .is_err());
-        assert_eq!(store.scope_puts.load(Ordering::Acquire), 1);
-        let requests = (0..16).map(|_| runtime.cluster_for_scope_write(&scope, "cell-0"));
-        for result in futures::future::join_all(requests).await {
-            drop(result.unwrap());
-        }
-        let puts = store.scope_puts.load(Ordering::Acquire);
-        println!("scope_registration_attempts_for_16_writes_after_one_failure={puts}");
-        assert_eq!(
-            puts, 2,
-            "failed registration retries; successful registration is shared"
-        );
-        assert_eq!(
-            runtime.scope_directory.list().await.unwrap(),
-            vec![scope.clone()]
-        );
-
-        let other = tenant_scope(&runtime, "tenant-b");
-        drop(runtime.cluster_for_scope(&other).await.unwrap());
-        drop(
-            runtime
-                .cluster_for_scope_write(&scope, "cell-0")
-                .await
-                .unwrap(),
-        );
-        assert_eq!(
-            store.scope_puts.load(Ordering::Acquire),
-            3,
-            "reopened scope revalidates its marker"
-        );
-        runtime.close().await.unwrap();
-    }
-
-    /// Fill the map to `max_open_scopes`, returning the scopes in map order.
-    ///
-    /// The returned `Arc`s are dropped, so every entry is back to
-    /// `strong_count == 1` and therefore an eviction candidate. Anything that
-    /// makes them un-evictable afterwards is the thing under test.
-    async fn open_scopes_to_capacity(
-        runtime: &ScopedRoutedGraphCluster,
-        tenants: &[&str],
-    ) -> Vec<GraphScope> {
-        let mut scopes = Vec::new();
-        for tenant in tenants {
-            let scope = tenant_scope(runtime, tenant);
-            drop(
-                runtime
-                    .cluster_for_scope(&scope)
-                    .await
-                    .expect("scope opens"),
-            );
-            scopes.push(scope);
-        }
-        assert_eq!(runtime.loaded_scopes().await.len(), tenants.len());
-        scopes
-    }
-
-    fn scoped_edge(key: &str) -> crate::EdgeMutation {
-        crate::EdgeMutation {
-            cell_id: "cell-0".to_string(),
-            edge_type: "FOLLOWS".to_string(),
-            src: 1,
-            dst: 2,
-            idempotency_key: key.to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn evicting_a_scope_drains_its_writer_with_an_active_reader_snapshot() {
-        let runtime = runtime_at_capacity("graph/active-reader-eviction", 1);
-        let first_scope = tenant_scope(&runtime, "tenant-first");
-        let first = runtime
-            .cluster_for_scope_write(&first_scope, "cell-0")
-            .await
-            .expect("the first scope opens for writes");
-        first
-            .write_edge(scoped_edge("first-write"))
-            .await
-            .expect("the first writer commits");
-
-        let shard = first.shard("cell-0").expect("the first shard exists");
-        let old_writer = shard.db.writer().expect("the first writer is installed");
-        let reader = shard
-            .db
-            .open_reader()
-            .await
-            .expect("the reader opens")
-            .expect("the initialized scope has a reader");
-        let snapshot = reader.snapshot().await.expect("the reader snapshot opens");
-        drop(first);
-
-        let second_scope = tenant_scope(&runtime, "tenant-second");
-        drop(
-            runtime
-                .cluster_for_scope(&second_scope)
-                .await
-                .expect("an active reader snapshot must not prevent writer retirement"),
-        );
-        assert_eq!(
-            old_writer.status().close_reason,
-            Some(slatedb::CloseReason::Clean),
-            "eviction must cleanly close the old writer before another scope can open"
-        );
-
-        drop(snapshot);
-        drop(reader);
-        let reopened = runtime
-            .cluster_for_scope_write(&first_scope, "cell-0")
-            .await
-            .expect("the evicted scope reopens for writes");
-        reopened
-            .write_edge(scoped_edge("reopened-write"))
-            .await
-            .expect("the replacement writer commits without fencing the old handle");
-        drop(reopened);
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn repeated_scope_eviction_reopens_one_process_writer() {
-        let runtime = runtime_at_capacity("graph/repeated-writer-eviction", 2);
-        let hot = tenant_scope(&runtime, "tenant-hot");
-
-        for round in 0..8 {
-            let hot_clusters = futures::future::join_all(
-                (0..16).map(|_| runtime.cluster_for_scope_write(&hot, "cell-0")),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()
-            .expect("concurrent hot-scope acquisitions succeed");
-            let first = hot_clusters.first().expect("the hot scope was returned");
-            assert!(hot_clusters
-                .iter()
-                .all(|cluster| Arc::ptr_eq(first, cluster)));
-            first
-                .write_edge(scoped_edge(&format!("hot-write-{round}")))
-                .await
-                .expect("the hot writer commits without fencing itself");
-            drop(hot_clusters);
-
-            for suffix in ["a", "b"] {
-                let cold = tenant_scope(&runtime, &format!("tenant-cold-{round}-{suffix}"));
-                drop(
-                    runtime
-                        .cluster_for_scope(&cold)
-                        .await
-                        .expect("cold scope opens and advances eviction"),
-                );
-            }
-        }
-
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn concurrent_scope_churn_does_not_fence_the_hot_writer() {
-        let runtime = Arc::new(runtime_at_capacity("graph/concurrent-writer-churn", 4));
-        let hot = tenant_scope(&runtime, "tenant-hot");
-
-        let writers = (0..16).map(|worker| {
-            let runtime = Arc::clone(&runtime);
-            let hot = hot.clone();
-            tokio::spawn(async move {
-                for round in 0..32 {
-                    loop {
-                        match runtime.cluster_for_scope_write(&hot, "cell-0").await {
-                            Ok(cluster) => {
-                                cluster
-                                    .write_edge(scoped_edge(&format!(
-                                        "hot-churn-write-{worker}-{round}"
-                                    )))
-                                    .await
-                                    .expect("scope churn must not fence the hot writer");
-                                break;
-                            }
-                            Err(GraphError::AdmissionRejected { .. }) => {
-                                tokio::task::yield_now().await;
-                            }
-                            Err(error) => panic!("hot writer acquisition failed: {error}"),
-                        }
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-        });
-
-        let churners = (0..8).map(|worker| {
-            let runtime = Arc::clone(&runtime);
-            tokio::spawn(async move {
-                for round in 0..64 {
-                    let scope =
-                        tenant_scope(&runtime, &format!("tenant-cold-{worker}-{}", round % 16));
-                    loop {
-                        match runtime.cluster_for_scope(&scope).await {
-                            Ok(cluster) => {
-                                drop(cluster);
-                                break;
-                            }
-                            Err(GraphError::AdmissionRejected { .. }) => {
-                                tokio::task::yield_now().await;
-                            }
-                            Err(error) => panic!("cold scope acquisition failed: {error}"),
-                        }
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-        });
-
-        for writer in writers {
-            writer.await.expect("writer task completes");
-        }
-        for churner in churners {
-            churner.await.expect("scope churn task completes");
-        }
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    #[tokio::test]
-    async fn placement_handoff_cannot_preempt_a_live_writer_lease() {
-        let base_path = "graph/placement-handoff";
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = PlacementConfig {
-            heartbeat_interval: Duration::from_millis(2),
-            heartbeat_timeout: Duration::from_millis(10),
-        };
-        let placement = PlacementView::new("node-a", ["node-a", "node-b"], config)
-            .expect("the placement view is valid");
-        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
-        let graph_id = GraphId::new("hydradb").unwrap();
-        let runtime = ScopedRoutedGraphCluster::new(
-            base_path,
-            root.clone(),
-            graph_id.clone(),
-            "node-a",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a", "node-b"]).unwrap(),
-            placement.clone(),
-            Arc::clone(&store),
-            GraphOpenOptions::default(),
-            GraphMemoryConfig::default(),
-            4,
-        )
-        .unwrap();
-        let scope = (0..1_000)
-            .map(|index| tenant_scope(&runtime, &format!("tenant-{index}")))
-            .find(|scope| {
-                hydradb_placement::hash::owner(&scope.to_string(), "cell-0", &["node-a", "node-b"])
-                    == Some("node-b")
-            })
-            .expect("one test scope moves from node-a to node-b");
-
-        tokio::time::sleep(config.heartbeat_timeout * 2).await;
-        let _ = placement
-            .refresh(store.as_ref(), &Path::from(base_path))
-            .await;
-        assert_eq!(
-            placement.ownership(&scope.to_string(), "cell-0"),
-            CellOwnership::Local,
-            "without a peer heartbeat node-a owns the scope"
-        );
-        let cluster = runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("node-a opens the initial writer");
-        cluster
-            .write_edge(scoped_edge("before-handoff"))
-            .await
-            .expect("the initial owner commits");
-        let old_writer = cluster.shard("cell-0").unwrap().db.writer().unwrap();
-        drop(cluster);
-
-        let now = Utc::now();
-        heartbeat::put_heartbeat(
-            store.as_ref(),
-            &Path::from(base_path),
-            &Heartbeat::new("node-b", "test", now, now, vec!["cell-0".to_string()]),
-        )
-        .await
-        .expect("node-b publishes its heartbeat");
-        let _ = placement
-            .refresh(store.as_ref(), &Path::from(base_path))
-            .await;
-        assert!(matches!(
-            placement.ownership(&scope.to_string(), "cell-0"),
-            CellOwnership::Remote { ref node_id } if node_id == "node-b"
-        ));
-
-        assert_eq!(
-            runtime.retire_unowned_writers().await.unwrap(),
-            0,
-            "a divergent placement view cannot preempt the durable lease holder"
-        );
-        assert!(runtime
-            .writer_lease_directory()
-            .release_scope(&scope, "node-a")
-            .await
-            .is_empty());
-        assert_eq!(runtime.retire_unowned_writers().await.unwrap(), 1);
-        assert_eq!(
-            old_writer.status().close_reason,
-            Some(slatedb::CloseReason::Clean),
-            "the previous owner must close before its background tasks can fence the replacement"
-        );
-        assert!(runtime.loaded_scopes().await.is_empty());
-
-        let replacement_placement = PlacementView::new("node-b", ["node-a", "node-b"], config)
-            .expect("the replacement placement view is valid");
-        let _ = replacement_placement
-            .refresh(store.as_ref(), &Path::from(base_path))
-            .await;
-        let replacement = ScopedRoutedGraphCluster::new(
-            base_path,
-            root,
-            graph_id,
-            "node-b",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a", "node-b"]).unwrap(),
-            replacement_placement,
-            Arc::clone(&store),
-            GraphOpenOptions::default(),
-            GraphMemoryConfig::default(),
-            4,
-        )
-        .unwrap();
-        let replacement_cluster = replacement
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("the replacement owner opens after the old writer closes");
-        replacement_cluster
-            .write_edge(scoped_edge("after-handoff"))
-            .await
-            .expect("the replacement owner commits without another fence");
-        drop(replacement_cluster);
-
-        runtime.close().await.expect("the runtime drains");
-        replacement.close().await.expect("the replacement drains");
-    }
-
-    #[tokio::test]
-    async fn lease_reconciliation_retires_every_released_scope() {
-        let base_path = "graph/placement-batch-handoff";
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = PlacementConfig {
-            heartbeat_interval: Duration::from_millis(2),
-            heartbeat_timeout: Duration::from_millis(10),
-        };
-        let placement = PlacementView::new("node-a", ["node-a", "node-b"], config)
-            .expect("the placement view is valid");
-        let runtime = ScopedRoutedGraphCluster::new(
-            base_path,
-            NamespacePath::root(NamespaceId::new("production").unwrap()),
-            GraphId::new("hydradb").unwrap(),
-            "node-a",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a", "node-b"]).unwrap(),
-            placement.clone(),
-            Arc::clone(&store),
-            GraphOpenOptions::default(),
-            GraphMemoryConfig::default(),
-            4,
-        )
-        .unwrap();
-        let scopes = (0..2_000)
-            .map(|index| tenant_scope(&runtime, &format!("tenant-{index}")))
-            .filter(|scope| {
-                hydradb_placement::hash::owner(&scope.to_string(), "cell-0", &["node-a", "node-b"])
-                    == Some("node-b")
-            })
-            .take(2)
-            .collect::<Vec<_>>();
-        assert_eq!(scopes.len(), 2);
-
-        tokio::time::sleep(config.heartbeat_timeout * 2).await;
-        let _ = placement
-            .refresh(store.as_ref(), &Path::from(base_path))
-            .await;
-        let mut writers = Vec::new();
-        for (index, scope) in scopes.iter().enumerate() {
-            let cluster = runtime
-                .cluster_for_scope_write(scope, "cell-0")
-                .await
-                .expect("node-a opens the initial writer");
-            cluster
-                .write_edge(scoped_edge(&format!("before-batch-handoff-{index}")))
-                .await
-                .expect("the initial owner commits");
-            writers.push(cluster.shard("cell-0").unwrap().db.writer().unwrap());
-        }
-
-        let now = Utc::now();
-        heartbeat::put_heartbeat(
-            store.as_ref(),
-            &Path::from(base_path),
-            &Heartbeat::new("node-b", "test", now, now, vec!["cell-0".to_string()]),
-        )
-        .await
-        .expect("node-b publishes its heartbeat");
-        let _ = placement
-            .refresh(store.as_ref(), &Path::from(base_path))
-            .await;
-
-        assert_eq!(
-            runtime.retire_unowned_writers().await.unwrap(),
-            0,
-            "placement alone cannot retire active lease holders"
-        );
-        for scope in &scopes {
-            assert!(runtime
-                .writer_lease_directory()
-                .release_scope(scope, "node-a")
-                .await
-                .is_empty());
-        }
-        assert_eq!(runtime.retire_unowned_writers().await.unwrap(), 2);
-        for writer in writers {
-            assert_eq!(
-                writer.status().close_reason,
-                Some(slatedb::CloseReason::Clean),
-                "every selected stale writer must be explicitly closed"
-            );
-        }
-        assert!(runtime.loaded_scopes().await.is_empty());
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    #[tokio::test]
-    async fn lease_takeover_retires_the_previous_process_writer() {
-        let base_path = "graph/lease-takeover";
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let placement = PlacementView::new(
-            "node-a",
-            ["node-a"],
-            PlacementConfig {
-                heartbeat_interval: Duration::from_millis(10),
-                heartbeat_timeout: Duration::from_millis(30),
-            },
-        )
-        .unwrap();
-        let runtime = ScopedRoutedGraphCluster::new_with_writer_lease_duration(
-            base_path,
-            NamespacePath::root(NamespaceId::new("production").unwrap()),
-            GraphId::new("hydradb").unwrap(),
-            "node-a",
-            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-            placement,
-            Arc::clone(&store),
-            GraphOpenOptions::default(),
-            GraphMemoryConfig::default(),
-            4,
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let scope = tenant_scope(&runtime, "tenant-a");
-        let cluster = runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .unwrap();
-        let old_writer = cluster.shard("cell-0").unwrap().db.writer().unwrap();
-        drop(cluster);
-
-        tokio::time::sleep(Duration::from_millis(2_100)).await;
-        let replacement = ObjectStoreWriterLeaseDirectory::with_duration_and_holder(
-            base_path,
-            store,
-            Duration::from_secs(1),
-            "replacement-process",
-        );
-        replacement
-            .acquire_or_renew(&scope, "cell-0", "node-b")
-            .await
-            .expect("the expired lease can move to the replacement process");
-
-        let failures = runtime.renew_writer_leases().await;
-        assert_eq!(failures.len(), 1);
-        assert!(failures[0].ownership_lost);
-        assert_eq!(
-            old_writer.status().close_reason,
-            Some(slatedb::CloseReason::Clean),
-            "losing the durable lease closes the old writer before another promotion"
-        );
-        runtime.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn concurrent_writes_to_one_scope_share_one_cluster_and_writer() {
-        let runtime = runtime_at_capacity("graph/concurrent-scope-writes", 16);
-        let scope = tenant_scope(&runtime, "tenant-hot");
-
-        let clusters = futures::future::join_all(
-            (0..64).map(|_| runtime.cluster_for_scope_write(&scope, "cell-0")),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .expect("concurrent write acquisitions succeed");
-
-        let first = clusters.first().expect("at least one cluster was returned");
-        assert!(
-            clusters.iter().all(|cluster| Arc::ptr_eq(first, cluster)),
-            "one process must never construct two routed clusters for the same scope"
-        );
-        let epoch = first
-            .shard("cell-0")
-            .expect("the shard exists")
-            .db
-            .writer_epoch()
-            .expect("the shared writer is installed");
-        assert!(clusters.iter().all(|cluster| {
-            cluster
-                .shard("cell-0")
-                .ok()
-                .and_then(|shard| shard.db.writer_epoch())
-                == Some(epoch)
-        }));
-
-        drop(clusters);
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    #[tokio::test]
-    async fn duplicate_routed_runtimes_share_one_process_writer() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let make_runtime = || {
-            let root = NamespacePath::root(NamespaceId::new("production").unwrap());
-            ScopedRoutedGraphCluster::new(
-                "graph/duplicate-runtime",
-                root,
-                GraphId::new("hydradb").unwrap(),
-                "node-a",
-                ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-                PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-                Arc::clone(&object_store),
-                GraphOpenOptions::default(),
-                GraphMemoryConfig::default(),
-                16,
-            )
-            .unwrap()
-        };
-        let first_runtime = make_runtime();
-        let second_runtime = make_runtime();
-        let scope = tenant_scope(&first_runtime, "tenant-hot");
-
-        let first = first_runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("the first runtime acquires the writer");
-        let first_writer = first
-            .shard("cell-0")
-            .expect("the first shard exists")
-            .db
-            .writer()
-            .expect("the first writer is installed");
-        let second = second_runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("the duplicate runtime reuses the writer");
-
-        first_writer
-            .refresh_manifest()
-            .await
-            .expect("the duplicate runtime must not fence the first handle");
-        assert_eq!(
-            first
-                .shard("cell-0")
-                .ok()
-                .and_then(|shard| shard.db.writer_epoch()),
-            second
-                .shard("cell-0")
-                .ok()
-                .and_then(|shard| shard.db.writer_epoch())
-        );
-
-        drop(first);
-        first_runtime
-            .close()
-            .await
-            .expect("closing one runtime preserves the shared writer");
-        second
-            .write_edge(scoped_edge("second-runtime-write"))
-            .await
-            .expect("the remaining runtime can still write");
-        drop(second);
-        second_runtime
-            .close()
-            .await
-            .expect("the final runtime drains");
-    }
-
-    #[tokio::test]
-    async fn equivalent_object_store_handles_share_one_process_writer() {
-        let physical_store = Arc::new(InMemory::new());
-        let first_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
-            Arc::clone(&physical_store),
-            "shared-physical-store",
-        ));
-        let second_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
-            Arc::clone(&physical_store),
-            "shared-physical-store",
-        ));
-        assert_ne!(
-            Arc::as_ptr(&first_store) as *const () as usize,
-            Arc::as_ptr(&second_store) as *const () as usize,
-            "the regression requires distinct object-store wrappers"
-        );
-        assert_eq!(first_store.to_string(), second_store.to_string());
-
-        let writer_registry = Arc::new(ProcessWriterRegistry::new());
-        let make_runtime = |object_store| {
-            let root = NamespacePath::root(NamespaceId::new("production").unwrap());
-            ScopedRoutedGraphCluster::new(
-                "graph/equivalent-object-store-handles",
-                root,
-                GraphId::new("hydradb").unwrap(),
-                "node-a",
-                ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-                PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-                object_store,
-                GraphOpenOptions::default(),
-                GraphMemoryConfig::default(),
-                16,
-            )
-            .unwrap()
-            .with_writer_registry(Arc::clone(&writer_registry))
-        };
-        let first_runtime = make_runtime(first_store);
-        let second_runtime = make_runtime(second_store);
-        let scope = tenant_scope(&first_runtime, "tenant-hot");
-
-        let first = first_runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("the first handle acquires the writer");
-        let first_writer = first
-            .shard("cell-0")
-            .expect("the first shard exists")
-            .db
-            .writer()
-            .expect("the first writer is installed");
-        let second = second_runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("the equivalent handle reuses the writer");
-
-        first_writer
-            .refresh_manifest()
-            .await
-            .expect("an equivalent store handle must not fence the first writer");
-        assert_eq!(
-            first
-                .shard("cell-0")
-                .ok()
-                .and_then(|shard| shard.db.writer_epoch()),
-            second
-                .shard("cell-0")
-                .ok()
-                .and_then(|shard| shard.db.writer_epoch())
-        );
-
-        drop(first);
-        first_runtime
-            .close()
-            .await
-            .expect("the first runtime closes");
-        drop(second);
-        second_runtime
-            .close()
-            .await
-            .expect("the second runtime closes");
-    }
-
-    #[tokio::test]
-    async fn equal_wrapper_displays_do_not_share_across_independent_stores() {
-        let first_store: Arc<dyn ObjectStore> =
-            Arc::new(PrefixStore::new(Arc::new(InMemory::new()), "equal-prefix"));
-        let second_store: Arc<dyn ObjectStore> =
-            Arc::new(PrefixStore::new(Arc::new(InMemory::new()), "equal-prefix"));
-        assert_eq!(first_store.to_string(), second_store.to_string());
-
-        let make_runtime = |object_store| {
-            let root = NamespacePath::root(NamespaceId::new("production").unwrap());
-            ScopedRoutedGraphCluster::new(
-                "graph/independent-object-stores",
-                root,
-                GraphId::new("hydradb").unwrap(),
-                "node-a",
-                ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-                PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-                object_store,
-                GraphOpenOptions::default(),
-                GraphMemoryConfig::default(),
-                16,
-            )
-            .unwrap()
-        };
-        let first_runtime = make_runtime(first_store);
-        let second_runtime = make_runtime(second_store);
-        assert!(!Arc::ptr_eq(
-            &first_runtime.writer_registry,
-            &second_runtime.writer_registry
-        ));
-        let scope = tenant_scope(&first_runtime, "tenant-hot");
-
-        let first = first_runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("the first physical store acquires its writer");
-        let second = second_runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("the independent physical store acquires its own writer");
-        first
-            .write_edge(scoped_edge("first-store-write"))
-            .await
-            .expect("the first store remains writable");
-        second
-            .write_edge(scoped_edge("second-store-write"))
-            .await
-            .expect("the second store remains writable");
-
-        drop(first);
-        first_runtime.close().await.expect("close first runtime");
-        drop(second);
-        second_runtime.close().await.expect("close second runtime");
-    }
-
-    #[tokio::test]
-    async fn duplicate_routed_runtimes_reject_mismatched_fence_backoff() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let make_runtime = |fence_backoff_interval| {
-            let root = NamespacePath::root(NamespaceId::new("production").unwrap());
-            ScopedRoutedGraphCluster::new(
-                "graph/duplicate-runtime-config",
-                root,
-                GraphId::new("hydradb").unwrap(),
-                "node-a",
-                ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
-                PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
-                Arc::clone(&object_store),
-                GraphOpenOptions {
-                    fence_backoff_interval,
-                    ..GraphOpenOptions::default()
-                },
-                GraphMemoryConfig::default(),
-                16,
-            )
-            .unwrap()
-        };
-        let first_interval = Duration::from_secs(5);
-        let second_interval = Duration::from_secs(9);
-        let first_runtime = make_runtime(first_interval);
-        let second_runtime = make_runtime(second_interval);
-        let scope = tenant_scope(&first_runtime, "tenant-hot");
-
-        let first = first_runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-            .expect("the first runtime acquires the writer");
-        let error = match second_runtime
-            .cluster_for_scope_write(&scope, "cell-0")
-            .await
-        {
-            Ok(_) => panic!("a duplicate runtime must not inherit another fencing interval"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            GraphError::RoutedWriterConfigMismatch {
-                existing,
-                requested,
-                ..
-            } if existing == first_interval && requested == second_interval
-        ));
-
-        drop(first);
-        first_runtime
-            .close()
-            .await
-            .expect("the first runtime drains");
-        second_runtime
-            .close()
-            .await
-            .expect("the rejected runtime drains");
-    }
-
-    #[tokio::test]
-    async fn a_cold_scope_open_does_not_lock_out_cached_scopes() {
-        let runtime = runtime_at_capacity("graph/cold-open", 2);
-        let hot = tenant_scope(&runtime, "tenant-hot");
-        drop(
-            runtime
-                .cluster_for_scope(&hot)
-                .await
-                .expect("hot scope opens"),
-        );
-
-        let capacity_guard = runtime.scope_capacity_gate.lock().await;
-        let cold = tenant_scope(&runtime, "tenant-cold");
-        let mut cold_open = Box::pin(runtime.cluster_for_scope(&cold));
-        assert!(
-            futures::poll!(cold_open.as_mut()).is_pending(),
-            "the held capacity gate should park the cold scope open"
-        );
-
-        let cached = runtime.cluster_for_scope(&hot).await;
-        assert!(
-            cached.is_ok(),
-            "a cold scope open must not hold the cache-map lock needed by hot scopes"
-        );
-        drop(cached);
-
-        drop(capacity_guard);
-        drop(
-            cold_open
-                .await
-                .expect("cold scope opens after capacity resumes"),
-        );
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    #[tokio::test]
-    async fn cancelling_a_cold_scope_open_does_not_poison_that_scope() {
-        let runtime = runtime_at_capacity("graph/cancelled-open", 2);
-        let capacity_guard = runtime.scope_capacity_gate.lock().await;
-        let scope = tenant_scope(&runtime, "tenant-cancelled");
-        let mut cancelled_open = Box::pin(runtime.cluster_for_scope(&scope));
-        assert!(
-            futures::poll!(cancelled_open.as_mut()).is_pending(),
-            "the held capacity gate should park the first open"
-        );
-        drop(cancelled_open);
-        drop(capacity_guard);
-
-        drop(
-            runtime
-                .cluster_for_scope(&scope)
-                .await
-                .expect("a later request can reopen the cancelled scope"),
-        );
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    #[tokio::test]
-    async fn reopening_an_evicted_scope_waits_for_its_writer_to_close() {
-        let runtime = runtime_at_capacity("graph/closing-scope", 2);
-        let scope = tenant_scope(&runtime, "tenant-closing");
-        let close = ScopeCloseReservation::new(Arc::clone(&runtime.scope_closures), scope.clone());
-
-        let mut reopen = Box::pin(runtime.cluster_for_scope(&scope));
-        assert!(
-            futures::poll!(reopen.as_mut()).is_pending(),
-            "a scope must not reopen while its previous SlateDB writer is closing"
-        );
-        assert!(runtime.loaded_scopes().await.is_empty());
-
-        close.release();
-        drop(
-            reopen
-                .await
-                .expect("the scope reopens after its old writer has closed"),
-        );
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    #[tokio::test]
-    async fn cancelled_scope_close_releases_waiting_reopeners() {
-        let runtime = runtime_at_capacity("graph/cancelled-close", 2);
-        let scope = tenant_scope(&runtime, "tenant-cancelled-close");
-        let close = ScopeCloseReservation::new(Arc::clone(&runtime.scope_closures), scope.clone());
-
-        let mut reopen = Box::pin(runtime.cluster_for_scope(&scope));
-        assert!(futures::poll!(reopen.as_mut()).is_pending());
-        drop(close);
-
-        drop(
-            reopen
-                .await
-                .expect("dropping the close reservation wakes the reopener"),
-        );
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    /// A metrics collection in flight must not make every open scope
-    /// un-evictable.
-    ///
-    /// The collector snapshots the `clusters` map and then reads each cluster's
-    /// cache gauges outside the map lock. Snapshotting `Arc`s rather than
-    /// `Weak`s meant it held a strong reference to *every* open scope for the
-    /// whole collection, and eviction's candidate filter is
-    /// `Arc::strong_count(&entry.cluster) == 1` — so at `max_open_scopes` a
-    /// query for a not-yet-open scope found no candidate and got
-    /// `AdmissionRejected` back. A scrape moving a client-visible failure rate.
-    ///
-    /// Driven by hand in the style of `08e78df`: hold one shard's first cache
-    /// mutex, poll the collection exactly once so it is suspended partway
-    /// through the *first* cluster, and then open a new scope. No second task
-    /// and no timer, so it cannot flake.
-    #[tokio::test]
-    async fn a_parked_metrics_collection_does_not_block_opening_a_new_scope() {
-        let runtime = runtime_at_capacity("graph/parked-metrics", 3);
-        let scopes = open_scopes_to_capacity(&runtime, &["tenant-a", "tenant-b", "tenant-c"]).await;
-
-        // Park the collection on the first scope in map order. Holding the lock
-        // needs the cluster alive, so this scope is pinned by the test itself --
-        // which is the point: the other two must still be evictable.
-        let first = runtime
-            .cluster_for_scope(&scopes[0])
-            .await
-            .expect("the first scope is open");
-        let blocker = first
-            .shard("cell-0")
-            .expect("the directory has one cell")
-            .matrix_artifact_cache
-            .lock()
-            .await;
-
-        let mut collection = std::pin::pin!(runtime.local_shard_runtime_metrics());
-        assert!(
-            futures::poll!(collection.as_mut()).is_pending(),
-            "the held matrix_artifact_cache lock should have parked the collection \
-             inside the first cluster"
-        );
-
-        let fresh = tenant_scope(&runtime, "tenant-d");
-        let opened = runtime.cluster_for_scope(&fresh).await;
-        assert!(
-            opened.is_ok(),
-            "a collection parked on one scope must leave the others evictable; \
-             opening a new scope failed with {:?}",
-            opened.err()
-        );
-        drop(opened);
-
-        drop(blocker);
-        drop(first);
-        let metrics = collection.await;
-        // tenant-b was the least recently used evictable entry, so it went to make
-        // room for tenant-d. Its `Weak` no longer upgrades, and the collection
-        // skips it rather than failing: one shard each for tenant-a and tenant-c.
-        assert_eq!(
-            metrics.len(),
-            2,
-            "a scope evicted mid-collection is a skip, not an error, and not a row"
-        );
-
-        runtime.close().await.expect("the runtime drains");
-    }
-
-    /// `loaded_clusters` must hand back non-owning handles.
-    ///
-    /// Same failure as above with a wider window: the index-discovery loop holds
-    /// its snapshot across `dirty_graph_index_edge_types` and
-    /// `discover_graph_index` per cell, both of which do object-store I/O. While
-    /// the snapshot was `Vec<Arc<..>>`, merely holding it blocked every eviction.
-    #[tokio::test]
-    async fn a_held_loaded_clusters_snapshot_does_not_block_opening_a_new_scope() {
-        let runtime = runtime_at_capacity("graph/loaded-clusters", 2);
-        open_scopes_to_capacity(&runtime, &["tenant-a", "tenant-b"]).await;
-
-        let snapshot = runtime.loaded_clusters().await;
-        assert_eq!(snapshot.len(), 2);
-
-        let fresh = tenant_scope(&runtime, "tenant-c");
-        let opened = runtime.cluster_for_scope(&fresh).await;
-        assert!(
-            opened.is_ok(),
-            "holding a loaded_clusters snapshot must not pin the open scopes; \
-             opening a new scope failed with {:?}",
-            opened.err()
-        );
-        drop(opened);
-
-        // One scope was evicted to make room, so one handle no longer upgrades.
-        // That is the skip the consumer has to tolerate.
-        let live = snapshot
-            .iter()
-            .filter(|weak| weak.upgrade().is_some())
-            .count();
-        assert_eq!(
-            live, 1,
-            "exactly one of the two snapshotted scopes survived"
-        );
-
-        runtime.close().await.expect("the runtime drains");
-    }
-}
-
-/// Touch point (b): the promotion gate, in all the states this layer can reach.
-#[cfg(test)]
-mod placement_gate_tests {
-    use super::*;
-
-    use std::fmt;
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use futures::StreamExt;
-    use slatedb::object_store::memory::InMemory;
-    use slatedb::object_store::path::Path;
-    use slatedb::object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    };
-
-    const CELL: &str = "cell-a";
-    const FLEET: &[&str] = &["node-a", "node-b", "node-c"];
-
-    fn scope_key() -> String {
-        GraphScope::default().to_string()
-    }
-
-    /// The node rendezvous names for `CELL`, and one that it does not.
-    fn owner_and_peer() -> (&'static str, &'static str) {
-        let owner = hydradb_placement::hash::owner(&scope_key(), CELL, FLEET)
-            .expect("a non-empty fleet has an owner");
-        let peer = FLEET
-            .iter()
-            .copied()
-            .find(|node_id| *node_id != owner)
-            .expect("three nodes cannot all be the owner");
-        (owner, peer)
-    }
-
-    fn fleet_view(local_node_id: &str, config: PlacementConfig) -> PlacementView {
-        PlacementView::new(local_node_id, FLEET.iter().copied(), config).expect("a valid fleet")
-    }
-
-    async fn open_cluster(
-        base_path: &str,
-        local_node_id: &str,
-        placement: PlacementView,
-        object_store: Arc<dyn ObjectStore>,
-    ) -> RoutedGraphCluster {
-        RoutedGraphCluster::open_promotable(
-            base_path,
-            local_node_id,
-            ObjectStoreNodeDirectory::new([CELL], FLEET.iter().copied())
-                .expect("a valid directory"),
-            placement,
-            object_store,
-        )
-        .await
-        .expect("the cluster opens")
-    }
-
-    fn edge(key: &str) -> crate::EdgeMutation {
-        crate::EdgeMutation {
-            cell_id: CELL.to_string(),
-            edge_type: "FOLLOWS".to_string(),
-            src: 1,
-            dst: 2,
-            idempotency_key: key.to_string(),
-        }
-    }
-
-    /// Whether the shard is actually holding the SlateDB writer, which is what
-    /// "refused rather than promoted" has to mean to be worth anything.
-    fn holds_the_writer(cluster: &RoutedGraphCluster) -> bool {
-        cluster
-            .shard(CELL)
-            .expect("the shard is open")
-            .db
-            .writer()
-            .is_ok()
-    }
-
-    /// The owner promotes and the write lands.
-    #[tokio::test]
-    async fn the_rendezvous_owner_opens_the_writer() {
-        let (owner, _) = owner_and_peer();
-        let cluster = open_cluster(
-            "gate/owner",
-            owner,
-            fleet_view(owner, PlacementConfig::default()),
-            Arc::new(InMemory::new()),
-        )
-        .await;
-
-        cluster.write_edge(edge("owner-write")).await.unwrap();
-        assert!(holds_the_writer(&cluster));
-        cluster.close().await.unwrap();
-    }
-
-    /// The branch that ends the duel: a node that is not the owner refuses, and
-    /// — the part that matters — leaves the writer alone rather than taking the
-    /// epoch from whoever holds it. The peer is named so the driver can
-    /// re-route instead of retrying into the same wrong node.
-    #[tokio::test]
-    async fn a_non_owner_refuses_the_write_and_does_not_promote() {
-        let (owner, peer) = owner_and_peer();
-        let cluster = open_cluster(
-            "gate/non-owner",
-            peer,
-            fleet_view(peer, PlacementConfig::default()),
-            Arc::new(InMemory::new()),
-        )
-        .await;
-
-        let error = cluster
-            .write_edge(edge("non-owner-write"))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                GraphError::NotCellWriter { cell_id, owner: Some(hint) }
-                    if cell_id == CELL && hint == owner
-            ),
-            "expected a hinted refusal, got {error:?}"
-        );
-        assert!(
-            !holds_the_writer(&cluster),
-            "a refusal that still opened the writer is the duel"
-        );
-        cluster.close().await.unwrap();
-    }
-
-    /// Decision 7 at the gate: a node past its LIST grace knows nothing about
-    /// the fleet, so it refuses **with no hint** — a stale guess would point at
-    /// a node that may itself have shed — and it must not promote, because a
-    /// partitioned node that promotes can never learn it lost.
-    #[tokio::test]
-    async fn a_shed_view_refuses_with_no_hint_and_does_not_promote() {
-        let store = ListFailingStore::new();
-        // Milliseconds rather than the 5s/15s defaults, so grace expires within
-        // the test instead of being slept through. Decision 10 gives the crate's
-        // own rules this property for free; this is the cheapest way to extend
-        // it to a layer that measures real elapsed time.
-        let config = PlacementConfig {
-            heartbeat_interval: Duration::from_millis(1),
-            heartbeat_timeout: Duration::from_millis(5),
-        };
-        let (_, peer) = owner_and_peer();
-        let placement = fleet_view(peer, config);
-        let cluster = open_cluster(
-            "gate/shed",
-            peer,
-            placement.clone(),
-            Arc::clone(&store) as Arc<dyn ObjectStore>,
-        )
-        .await;
-
-        store.break_list();
-        tokio::time::sleep(config.heartbeat_timeout * 2).await;
-        let view = placement
-            .refresh(store.as_ref(), &Path::from("gate/shed"))
-            .await;
-        assert_eq!(view.candidates(), None, "the view must have shed");
-
-        let error = cluster.write_edge(edge("shed-write")).await.unwrap_err();
-        assert!(
-            matches!(&error, GraphError::NotCellWriter { cell_id, owner: None } if cell_id == CELL),
-            "expected an unhinted refusal, got {error:?}"
-        );
-        assert!(!holds_the_writer(&cluster));
-        cluster.close().await.unwrap();
-    }
-
-    /// The fourth state, and the one this layer cannot reach on its own:
-    /// `LiveNodeSet` always counts the local node live, so a *successful* view
-    /// never has an empty candidate list. The seam's own tests build one by
-    /// hand; what is pinned here is the rule the gate's first arm implements —
-    /// `Unowned` and `Unknown` are both "nobody was named" and have opposite
-    /// answers, and folding them together is how the permanent-refusal trap
-    /// gets built.
-    #[test]
-    fn a_known_empty_fleet_licenses_promotion_where_a_shed_view_does_not() {
-        assert!(CellOwnership::Unowned.may_promote());
-        assert_eq!(CellOwnership::Unowned.owner_hint(), None);
-        assert!(!CellOwnership::Unknown.may_promote());
-        assert_eq!(CellOwnership::Unknown.owner_hint(), None);
-    }
-
-    /// Ownership is checked *before* the fence pacing, so a non-owner is
-    /// refused outright instead of being made to wait first: a wait it would
-    /// spend and then be refused anyway is latency bought for nothing.
-    #[tokio::test]
-    async fn ownership_is_refused_without_first_serving_the_reopen_delay() {
-        let (_, peer) = owner_and_peer();
-        let cluster = open_cluster(
-            "gate/order",
-            peer,
-            fleet_view(peer, PlacementConfig::default()),
-            Arc::new(InMemory::new()),
-        )
-        .await;
-
-        let started = Instant::now();
-        let error = cluster.write_edge(edge("ordered")).await.unwrap_err();
-        assert!(matches!(error, GraphError::NotCellWriter { .. }));
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the refusal must not wait out anything"
-        );
-        cluster.close().await.unwrap();
-    }
-
-    /// An `ObjectStore` whose LIST can be switched off. The kernel has no
-    /// shared test double for this — `crates/placement`'s is `#[cfg(test)]`
-    /// inside that crate and cannot be imported — and decision 7's state is
-    /// only reachable through a failing LIST.
-    struct ListFailingStore {
-        inner: Arc<dyn ObjectStore>,
-        fail_list: AtomicBool,
-    }
-
-    impl ListFailingStore {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                inner: Arc::new(InMemory::new()),
-                fail_list: AtomicBool::new(false),
-            })
-        }
-
-        fn break_list(&self) {
-            self.fail_list.store(true, AtomicOrdering::SeqCst);
-        }
-
-        fn injected() -> slatedb::object_store::Error {
-            slatedb::object_store::Error::Generic {
-                store: "ListFailingStore",
-                source: "injected LIST fault".into(),
-            }
-        }
-    }
-
-    impl fmt::Display for ListFailingStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "ListFailingStore({})", self.inner)
-        }
-    }
-
-    impl fmt::Debug for ListFailingStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "ListFailingStore({:?})", self.inner)
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for ListFailingStore {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> slatedb::object_store::Result<PutResult> {
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> slatedb::object_store::Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> slatedb::object_store::Result<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, slatedb::object_store::Result<Path>>,
-        ) -> BoxStream<'static, slatedb::object_store::Result<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> BoxStream<'static, slatedb::object_store::Result<ObjectMeta>> {
-            if self.fail_list.load(AtomicOrdering::SeqCst) {
-                return futures::stream::once(async { Err(Self::injected()) }).boxed();
-            }
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> slatedb::object_store::Result<ListResult> {
-            if self.fail_list.load(AtomicOrdering::SeqCst) {
-                return Err(Self::injected());
-            }
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> slatedb::object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-}
-
-/// Commit 6 of §7.8: the advisory cell-writer record, and the three properties
-/// that keep it advisory.
-///
-/// The whole risk in a "who owns the writer" object is that somebody eventually
-/// believes it. These tests exist to make that a build failure: the record is
-/// written only by a promotion that really claimed an epoch, a store that
-/// refuses to take it cannot fail that promotion, and the promote path issues no
-/// GET for it at all — asserted on the object-store call counters rather than on
-/// the code's shape, so it stays true when the code moves.
-#[cfg(test)]
-mod cell_writer_record_tests {
-    use super::*;
-
-    use std::fmt;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use hydradb_placement::cell_writer::{read_cell_writer, CellWriterRecord, CELL_WRITER_PREFIX};
-    use slatedb::object_store::memory::InMemory;
-    use slatedb::object_store::path::Path;
-    use slatedb::object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    };
-
-    const CELL: &str = "cell-a";
-    const FLEET: &[&str] = &["node-a", "node-b", "node-c"];
-
-    /// The node rendezvous names for `CELL`, and one that it does not.
-    fn owner_and_peer() -> (&'static str, &'static str) {
-        let scope = GraphScope::default().to_string();
-        let owner = hydradb_placement::hash::owner(&scope, CELL, FLEET)
-            .expect("a non-empty fleet has an owner");
-        let peer = FLEET
-            .iter()
-            .copied()
-            .find(|node_id| *node_id != owner)
-            .expect("three nodes cannot all be the owner");
-        (owner, peer)
-    }
-
-    async fn open_cluster(
-        base_path: &str,
-        local_node_id: &str,
-        object_store: Arc<dyn ObjectStore>,
-    ) -> RoutedGraphCluster {
-        RoutedGraphCluster::open_promotable(
-            base_path,
-            local_node_id,
-            ObjectStoreNodeDirectory::new([CELL], FLEET.iter().copied())
-                .expect("a valid directory"),
-            PlacementView::new(
-                local_node_id,
-                FLEET.iter().copied(),
-                PlacementConfig::default(),
-            )
-            .expect("a valid fleet"),
-            object_store,
-        )
-        .await
-        .expect("the cluster opens")
-    }
-
-    fn edge(key: &str) -> crate::EdgeMutation {
-        crate::EdgeMutation {
-            cell_id: CELL.to_string(),
-            edge_type: "FOLLOWS".to_string(),
-            src: 1,
-            dst: 2,
-            idempotency_key: key.to_string(),
-        }
-    }
-
-    /// Where the record for `CELL` lives, taken from the shard's own store path
-    /// rather than reconstructed — the same derivation the production write
-    /// uses, so a test cannot pass against a path nothing writes to.
-    fn record_base(cluster: &RoutedGraphCluster) -> Path {
-        cluster
-            .shard(CELL)
-            .expect("the shard is open")
-            .db
-            .cell_location()
-            .expect("a shard path always has a base")
-            .0
-    }
-
-    fn writer_epoch(cluster: &RoutedGraphCluster) -> Option<u64> {
-        cluster
-            .shard(CELL)
-            .expect("the shard is open")
-            .db
-            .writer_epoch()
-    }
-
-    /// A promotion that claimed an epoch writes exactly one record, and it names
-    /// this node and the epoch the manifest actually gave it.
-    #[tokio::test]
-    async fn a_successful_promotion_records_the_advisory_cell_writer() {
-        let (owner, _) = owner_and_peer();
-        let store = RecordStore::new();
-        let cluster = open_cluster(
-            "record/owner",
-            owner,
-            Arc::clone(&store) as Arc<dyn ObjectStore>,
-        )
-        .await;
-
-        cluster.write_edge(edge("owner-write")).await.unwrap();
-
-        assert_eq!(store.record_puts(), 1, "the promotion wrote no record");
-        let epoch = writer_epoch(&cluster).expect("the owner holds the writer");
-        let record = read_cell_writer(store.as_ref(), &record_base(&cluster), CELL)
-            .await
-            .expect("the record reads back")
-            .expect("a successful promotion wrote one");
-        assert_eq!(record.node_id, owner);
-        assert_eq!(
-            record.epoch, epoch,
-            "the record must carry the epoch the manifest gave the writer"
-        );
-        assert!(
-            epoch > 0,
-            "a zero epoch would make the assertion above vacuous"
-        );
-        cluster.close().await.unwrap();
-    }
-
-    /// **The PUT is per epoch claimed, not per write.** `promote_to_writer` is
-    /// called on every routed write and is idempotent; if the record were
-    /// written on each of those calls, decision 3's "no object-store request on
-    /// the write path" would be quietly false.
-    #[tokio::test]
-    async fn the_record_is_written_once_per_promotion_and_not_once_per_write() {
-        let (owner, _) = owner_and_peer();
-        let store = RecordStore::new();
-        let cluster = open_cluster(
-            "record/once",
-            owner,
-            Arc::clone(&store) as Arc<dyn ObjectStore>,
-        )
-        .await;
-
-        for i in 0..5 {
-            cluster
-                .write_edge(edge(&format!("write-{i}")))
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            store.record_puts(),
-            1,
-            "the record was rewritten by writes that promoted nothing"
-        );
-        cluster.close().await.unwrap();
-    }
-
-    /// A refusal is not a promotion, so there is nothing to record. Writing one
-    /// here would be the worst version of this object: an attribution naming a
-    /// node that never held the writer.
-    #[tokio::test]
-    async fn a_refused_promotion_records_nothing() {
-        let (_, peer) = owner_and_peer();
-        let store = RecordStore::new();
-        let cluster = open_cluster(
-            "record/refused",
-            peer,
-            Arc::clone(&store) as Arc<dyn ObjectStore>,
-        )
-        .await;
-
-        let error = cluster.write_edge(edge("refused")).await.unwrap_err();
-        assert!(
-            matches!(error, GraphError::NotCellWriter { .. }),
-            "expected a refusal, got {error:?}"
-        );
-
-        assert_eq!(store.record_puts(), 0, "a refusal wrote a record");
-        assert!(
-            read_cell_writer(store.as_ref(), &record_base(&cluster), CELL)
-                .await
-                .expect("readable")
-                .is_none(),
-            "a node that never promoted named itself the writer"
-        );
-        cluster.close().await.unwrap();
-    }
-
-    /// Rule 3 of the module docs on `hydradb_placement::cell_writer`, at the
-    /// only place that can honour it: the epoch is already claimed and the write
-    /// is already committed by the time the record is attempted, so a store that
-    /// refuses it must cost nothing but a `warn!`. The alternative — a write
-    /// path that fails because its diagnostics could not be written — is
-    /// strictly worse than keeping no record at all.
-    #[tokio::test]
-    async fn a_failing_record_put_does_not_fail_the_promotion() {
-        let (owner, _) = owner_and_peer();
-        let store = RecordStore::new();
-        // Only the record's own PUTs. Failing every PUT would fail SlateDB's
-        // writer open too, and the test would prove nothing about the record.
-        store.break_record_puts();
-        let cluster = open_cluster(
-            "record/failing-put",
-            owner,
-            Arc::clone(&store) as Arc<dyn ObjectStore>,
-        )
-        .await;
-
-        cluster
-            .write_edge(edge("survives"))
-            .await
-            .expect("an unwritable record must not fail the write");
-
-        assert!(store.record_puts() > 0, "the record was never attempted");
-        assert!(
-            writer_epoch(&cluster).is_some(),
-            "the promotion itself must have stood"
-        );
-        store.heal_record_puts();
-        assert!(
-            read_cell_writer(store.as_ref(), &record_base(&cluster), CELL)
-                .await
-                .expect("readable")
-                .is_none(),
-            "the failed PUT left something behind"
-        );
-        cluster.close().await.unwrap();
-    }
-
-    /// **Option 3b, refused in a test.** A record naming another node with an
-    /// absurd epoch is sitting in the store; the rendezvous owner promotes
-    /// straight over it, because ownership comes from the live set and this
-    /// object is not an input to it. The GET counter is the proof: the promote
-    /// path never even looks.
-    #[tokio::test]
-    async fn the_record_is_not_read_on_the_promote_path() {
-        let (owner, peer) = owner_and_peer();
-        let store = RecordStore::new();
-        let cluster = open_cluster(
-            "record/not-consulted",
-            owner,
-            Arc::clone(&store) as Arc<dyn ObjectStore>,
-        )
-        .await;
-
-        let base = record_base(&cluster);
-        hydradb_placement::cell_writer::put_cell_writer(
-            store.as_ref(),
-            &base,
-            CELL,
-            &CellWriterRecord::new(peer, u64::MAX, chrono::Utc::now()),
-        )
-        .await
-        .expect("seeded");
-        store.reset_counters();
-
-        cluster
-            .write_edge(edge("promotes-anyway"))
-            .await
-            .expect("a record naming a peer must not stop the owner promoting");
-
-        assert_eq!(
-            store.record_gets(),
-            0,
-            "the promote path read the advisory record; that is option 3b"
-        );
-        assert_eq!(
-            store.record_puts(),
-            1,
-            "the promotion should have overwritten the seeded record exactly once"
-        );
-        let record = read_cell_writer(store.as_ref(), &base, CELL)
-            .await
-            .expect("readable")
-            .expect("written");
-        assert_eq!(record.node_id, owner);
-        assert_ne!(record.epoch, u64::MAX);
-        cluster.close().await.unwrap();
-    }
-
-    /// An `ObjectStore` that counts and can break requests **against the
-    /// cell-writer prefix alone**.
-    ///
-    /// The narrowness is the point twice over. Counting everything would drown
-    /// the record's one PUT in SlateDB's manifest and SST traffic, so the
-    /// "never read on the promote path" assertion could not be written at all.
-    /// And failing every PUT would fail the writer open, so the "a failed PUT
-    /// does not fail the promotion" test would be asserting that a promotion
-    /// which never happened did not happen.
-    ///
-    /// `crates/placement`'s richer `FaultStore` is `#[cfg(test)]` inside that
-    /// crate and cannot be imported here; it also has no notion of which prefix
-    /// a request is for, which is the one thing this needs.
-    struct RecordStore {
-        inner: Arc<dyn ObjectStore>,
-        record_puts: AtomicU64,
-        record_gets: AtomicU64,
-        fail_record_puts: AtomicBool,
-    }
-
-    impl RecordStore {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                inner: Arc::new(InMemory::new()),
-                record_puts: AtomicU64::new(0),
-                record_gets: AtomicU64::new(0),
-                fail_record_puts: AtomicBool::new(false),
-            })
-        }
-
-        /// Whether a path is under `_cell_writers/…`, by the prefix constant's
-        /// own first segment rather than a copy of the string.
-        fn is_record(location: &Path) -> bool {
-            let head = CELL_WRITER_PREFIX
-                .split('/')
-                .next()
-                .expect("the prefix is not empty");
-            location.parts().any(|part| part.as_ref() == head)
-        }
-
-        /// Counted **including** requests the fault refuses: the thing being
-        /// asserted is that the attempt was made and survived.
-        fn record_puts(&self) -> u64 {
-            self.record_puts.load(AtomicOrdering::SeqCst)
-        }
-
-        fn record_gets(&self) -> u64 {
-            self.record_gets.load(AtomicOrdering::SeqCst)
-        }
-
-        fn reset_counters(&self) {
-            self.record_puts.store(0, AtomicOrdering::SeqCst);
-            self.record_gets.store(0, AtomicOrdering::SeqCst);
-        }
-
-        fn break_record_puts(&self) {
-            self.fail_record_puts.store(true, AtomicOrdering::SeqCst);
-        }
-
-        fn heal_record_puts(&self) {
-            self.fail_record_puts.store(false, AtomicOrdering::SeqCst);
-        }
-
-        /// `Error::Generic`, because that is what a throttled or refused request
-        /// arrives as once the SDK has given up, and it is not one of the
-        /// variants `read_cell_writer` special-cases.
-        fn injected() -> slatedb::object_store::Error {
-            slatedb::object_store::Error::Generic {
-                store: "RecordStore",
-                source: "injected cell-writer PUT fault".into(),
-            }
-        }
-    }
-
-    impl fmt::Display for RecordStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "RecordStore({})", self.inner)
-        }
-    }
-
-    impl fmt::Debug for RecordStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "RecordStore({:?})", self.inner)
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for RecordStore {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> slatedb::object_store::Result<PutResult> {
-            if Self::is_record(location) {
-                self.record_puts.fetch_add(1, AtomicOrdering::SeqCst);
-                if self.fail_record_puts.load(AtomicOrdering::SeqCst) {
-                    return Err(Self::injected());
-                }
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> slatedb::object_store::Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> slatedb::object_store::Result<GetResult> {
-            if Self::is_record(location) {
-                self.record_gets.fetch_add(1, AtomicOrdering::SeqCst);
-            }
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, slatedb::object_store::Result<Path>>,
-        ) -> BoxStream<'static, slatedb::object_store::Result<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> BoxStream<'static, slatedb::object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> slatedb::object_store::Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> slatedb::object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
     }
 }

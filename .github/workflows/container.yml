@@ -55,6 +55,9 @@ jobs:
           file: Dockerfile
           target: runtime
           platforms: ${{ matrix.platform }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
           push: false
           cache-from: type=gha,scope=container-${{ matrix.pair }}
           cache-to: type=gha,mode=max,scope=container-${{ matrix.pair }}
@@ -110,6 +113,9 @@ jobs:
           file: Dockerfile
           target: runtime
           platforms: ${{ matrix.platform }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           provenance: true

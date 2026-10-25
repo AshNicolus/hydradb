@@ -172,12 +172,23 @@ pub fn relationship_count(cell_id: &str, edge_type: &str, src: VertexId, dst: Ve
     format!("cell/{cell_id}/rel_count/{edge_type}/{src:020}/{dst:020}")
 }
 
+/// Every parallel-relationship counter of one edge type in a cell.
+#[cfg(feature = "opencypher")]
+pub fn relationship_count_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/rel_count/{edge_type}/")
+}
+
 pub fn degree_out_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/cnt/out/{edge_type}/")
 }
 
 pub fn degree_in_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/cnt/in/{edge_type}/")
+}
+
+/// Every out-degree counter of a cell, across edge types.
+pub fn degree_out_cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/cnt/out/")
 }
 
 pub fn degree_out(cell_id: &str, edge_type: &str, src: VertexId) -> String {
@@ -204,6 +215,16 @@ pub fn vertex_label(cell_id: &str, label: &str, vertex_id: VertexId) -> String {
 #[cfg(feature = "opencypher")]
 pub fn vertex_label_prefix(cell_id: &str, label: &str) -> String {
     format!("cell/{cell_id}/vlabel/{label}/")
+}
+
+/// Every label index entry of a cell, across labels.
+pub fn vertex_label_cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/vlabel/")
+}
+
+/// Every vertex property index entry of a cell, across properties.
+pub fn vertex_property_index_cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/vprop_idx/")
 }
 
 pub fn vertex_property_index(
@@ -239,6 +260,16 @@ pub fn vertex_property_index_property_prefix(cell_id: &str, property: &str) -> S
     format!("cell/{cell_id}/vprop_idx/{property}/")
 }
 
+/// Every edge metadata property index entry of a cell, across edge types.
+pub fn edge_property_index_cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/eprop_idx/")
+}
+
+/// Every relationship property index entry of a cell, across edge types.
+pub fn relationship_property_index_cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/rprop_idx/")
+}
+
 pub fn edge_property_index(
     cell_id: &str,
     edge_type: &str,
@@ -259,9 +290,7 @@ pub fn relationship_property_index(
     dst: VertexId,
     relationship_id: RelationshipId,
 ) -> String {
-    format!(
-        "cell/{cell_id}/rprop_idx/{edge_type}/{property}/{encoded_value}/{src:020}/{dst:020}/{relationship_id:020}"
-    )
+    format!("cell/{cell_id}/rprop_idx/{edge_type}/{property}/{encoded_value}/{src:020}/{dst:020}/{relationship_id:020}")
 }
 
 /// The point-get counterpart of [`relationship_property_index`]: the same

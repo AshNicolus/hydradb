@@ -69,7 +69,6 @@ fails on macOS. `just --list` shows every recipe. Common ones:
 ```bash
 just native-check   # verify native libs; silent + exit 0 means pass
 just smoke          # local object-store smoke test
-just test           # library tests
 just ci             # full CI-equivalent set (long)
 just clippy         # lint the default feature set
 just fmt            # format

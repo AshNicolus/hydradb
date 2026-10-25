@@ -49,7 +49,7 @@
 //!
 //! # Status
 //!
-//! This crate is Step 1 of `docs/plans/2026-07-26-otel-telemetry-crate.md`. It
+//! This crate is Step 1 of the telemetry crate design. It
 //! is standalone and complete on its own terms: nothing in `src/` calls it yet,
 //! and wiring the two binaries is a separate change. Steps 2–5 — the read,
 //! write and indexing span trees, then cross-node propagation — instrument the

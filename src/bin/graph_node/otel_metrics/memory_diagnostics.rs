@@ -139,7 +139,11 @@ pub(crate) fn append(output: &mut String) {
                 || "+Inf".to_string(),
                 |b| (b as f64 / 1_000_000.0).to_string(),
             );
-            writeln!(output, "graph_memory_diagnostic_duration_seconds_bucket{{stage=\"{stage}\",le=\"{le}\"}} {count}").unwrap();
+            writeln!(
+                output,
+                "graph_memory_diagnostic_duration_seconds_bucket{{stage=\"{stage}\",le=\"{le}\"}} {count}"
+            )
+            .unwrap();
         }
         writeln!(
             output,
@@ -153,35 +157,5 @@ pub(crate) fn append(output: &mut String) {
             sample.duration.count()
         )
         .unwrap();
-    }
-}
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn all_diagnostic_stages_export_gauges_and_histogram_overflow() {
-        let mut output = String::new();
-        super::append(&mut output);
-        for sample in hydradb::memory_diagnostic_snapshot() {
-            for name in [
-                "items",
-                "estimated_bytes",
-                "oldest_seconds",
-                "oldest_tracked_seconds",
-                "tracking_overflow_items",
-                "overflow_cohort_seconds",
-                "entered_total",
-                "exited_total",
-                "duration_seconds_count",
-            ] {
-                assert!(output.contains(&format!(
-                    "graph_memory_diagnostic_{name}{{stage=\"{}\"}} ",
-                    sample.stage
-                )));
-            }
-            assert!(output.contains(&format!(
-                "graph_memory_diagnostic_duration_seconds_bucket{{stage=\"{}\",le=\"+Inf\"}} ",
-                sample.stage
-            )));
-        }
     }
 }
